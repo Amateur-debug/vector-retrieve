@@ -101,7 +101,7 @@ def run_batch():
     print(f"Total experiments to run: {total_experiments}")
 
     # --- 并行执行配置 ---
-    MAX_WORKERS = 32  # 设置并行数量
+    MAX_WORKERS = 48  # 设置并行数量
     print(f"Parallel Workers: {MAX_WORKERS}")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:

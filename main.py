@@ -202,6 +202,7 @@ if __name__ == "__main__":
         "k": k,
         f"avg_recall@{k}": avg_recall,
         "all_remote_transfer_cnt": all_remote_transfer_cnt,
+        "avg_remote_transfer_cnt": avg_remote_transfer_cnt,
         "avg_remote_transfer_latency_query": avg_remote_transfer_latency_query,
         "avg_remote_transfer_latency_trans": avg_remote_transfer_latency_trans,
         "recall": recall,
