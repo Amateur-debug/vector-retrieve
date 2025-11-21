@@ -161,11 +161,11 @@ class Cluster:
         stats = {
             "hnsw_params": hnsw_params,
             "cluster_params": cluster_params,
-            "remote_transfer_cnt": self.remote_transfer_cnt,
-            "remote_transfer_latency": self.remote_transfer_latency,
             "num_queries": num_queries,
             "avg_remote_transfer_latency_query": avg_remote_transfer_latency_query,
-            "avg_remote_transfer_latency_trans": avg_remote_transfer_latency_trans
+            "avg_remote_transfer_latency_trans": avg_remote_transfer_latency_trans,
+            "remote_transfer_cnt": self.remote_transfer_cnt,
+            "remote_transfer_latency": self.remote_transfer_latency,
         }
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
