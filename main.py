@@ -2,6 +2,7 @@ import os
 import time
 import argparse
 import numpy as np
+import json
 
 from hnsw import HNSWGraph
 from node import Cluster, Node
@@ -122,8 +123,7 @@ if __name__ == "__main__":
         print(f"Partitioning Time: {partition_time:.4f} seconds.")
 
     print("Performing queries...")
-    total_query_time = 0.0
-    total_correct = 0
+    recall = {}
 
     for i, query in enumerate(queries[:num_queries]):
         start_time = time.time()
@@ -132,18 +132,16 @@ if __name__ == "__main__":
         
         results = cluster.nodes[0].query(i, query, payload, k=k)
         query_time = time.time() - start_time
-        total_query_time += query_time
 
         # --- 召回率计算 ---
         # 从 groundtruth 数据中获取真实的最近邻 ID 集合
         true_ids = set(groundtruth[i][:k])
         # 计算两个集合的交集，即正确找到的邻居数量
         correct = len(results.intersection(true_ids))
-        total_correct += correct
-        recall = correct / k
+        recall[i] = correct / k
 
         print(f"\nQuery({i}) Machine time: {query_time * 1000:.4f} ms")
-        print(f"Recall@{k}: {recall:.4f}")
+        print(f"Recall@{k}({i}): {recall[i]:.4f}")
 
     # --- 保存cluster或graph状态 ---
     print("-" * 30)
@@ -151,7 +149,7 @@ if __name__ == "__main__":
         print("Saving cluster state to disk...")
         save_dir = "./save"
         os.makedirs(save_dir, exist_ok=True)
-        cluster_path = f"{save_dir}/cluster--{data_name}-node{node_num}-{partition_mode}.pkl"
+        cluster_path = f"{save_dir}/cluster-{data_name}-node{node_num}-{partition_mode}.pkl"
         cluster.save(cluster_path)
     if graph_path is None:
         print("Saving graph state to disk...")
@@ -162,7 +160,7 @@ if __name__ == "__main__":
     print("-" * 30)
 
     # --- 计算并打印最终结果 ---
-    avg_recall = total_correct / (num_queries * k)
+    avg_recall = sum(recall.values()) / (num_queries)
     avg_remote_transfer_cnt = sum(cluster.remote_transfer_cnt.values()) / num_queries
     avg_remote_transfer_latency_query = sum(cluster.remote_transfer_latency.values()) / num_queries
     avg_remote_transfer_latency_trans = sum(cluster.remote_transfer_latency.values()) / sum(cluster.remote_transfer_cnt.values()) if sum(cluster.remote_transfer_cnt.values()) > 0 else 0.0
@@ -177,8 +175,37 @@ if __name__ == "__main__":
 
     # --- 保存所有结果 ---
     print("-" * 30)
+    hnsw_params = {
+        "dim": hnsw.dim,
+        "m": hnsw.m,
+        "ef_construction": hnsw.ef_construction,
+        "ef_search": hnsw.ef_search,
+        "limited_level": hnsw.limited_level,
+        "max_level": hnsw.max_level
+    }
+    cluster_params = {
+        "node_num": cluster.node_num,
+        "bandwidth": cluster.bandwidth,
+        "redundancy_num": cluster.redundancy_num
+    }
+    stats = {
+        "hnsw_params": hnsw_params,
+        "cluster_params": cluster_params,
+        "num_queries": num_queries,
+        f"avg_recall@{k}": avg_recall,
+        "avg_remote_transfer_latency_query": avg_remote_transfer_latency_query,
+        "avg_remote_transfer_latency_trans": avg_remote_transfer_latency_trans,
+        "recall": recall,
+        "remote_transfer_cnt": cluster.remote_transfer_cnt,
+        "remote_transfer_latency": cluster.remote_transfer_latency,
+    }
+
     results_dir = "./results"
     os.makedirs(results_dir, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    results_path = f"{results_dir}/results-{data_name}-node{node_num}-{partition_mode}-{timestamp}.json"
-    cluster.save_stats(results_path)
+    results_path = (f"{results_dir}/results-{data_name}-m{m}-"
+                    f"efc{ef_construction}-efs{ef_search}-ll{limited_level}-"
+                    f"node{node_num}-{partition_mode}-{timestamp}.json")
+
+    with open(results_path, 'w') as f:
+        json.dump(stats, f, indent=4)

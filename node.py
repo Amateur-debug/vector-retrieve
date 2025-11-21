@@ -3,7 +3,6 @@ import numpy as np
 from collections import defaultdict
 from sklearn.cluster import KMeans
 import pickle
-import json
 
 from hnsw import HNSWGraph
 from payload import Payload
@@ -135,44 +134,6 @@ class Cluster:
             cluster = pickle.load(f)
         print("Cluster loaded successfully.")
         return cluster
-
-    def save_stats(self, filepath):
-        """保存统计数据 (transfer count & latency) 以及配置参数 为 JSON 格式"""
-        print(f"Saving stats to {filepath}...")
-
-        # 收集 HNSW 的配置参数
-        hnsw_params = {
-            "dim": self.hnsw.dim,
-            "m": self.hnsw.m,
-            "ef_construction": self.hnsw.ef_construction,
-            "ef_search": self.hnsw.ef_search,
-            "limited_level": self.hnsw.limited_level,
-            "max_level": self.hnsw.max_level
-        }
-        # 收集 Cluster 的配置参数
-        cluster_params = {
-            "node_num": self.node_num,
-            "bandwidth": self.bandwidth,
-            "redundancy_num": self.redundancy_num
-        }
-        num_queries = sum(node.num_queries for node in self.nodes.values())
-        avg_remote_transfer_latency_query = sum(self.remote_transfer_latency.values()) / num_queries
-        avg_remote_transfer_latency_trans = sum(self.remote_transfer_latency.values()) / sum(self.remote_transfer_cnt.values()) if sum(self.remote_transfer_cnt.values()) > 0 else 0.0
-        stats = {
-            "hnsw_params": hnsw_params,
-            "cluster_params": cluster_params,
-            "num_queries": num_queries,
-            "avg_remote_transfer_latency_query": avg_remote_transfer_latency_query,
-            "avg_remote_transfer_latency_trans": avg_remote_transfer_latency_trans,
-            "remote_transfer_cnt": self.remote_transfer_cnt,
-            "remote_transfer_latency": self.remote_transfer_latency,
-        }
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-
-        with open(filepath, 'w') as f:
-            # indent=4 使输出格式化，方便阅读
-            json.dump(stats, f, indent=4)
-        print("Stats saved successfully.")
 
 class Node:
     """
