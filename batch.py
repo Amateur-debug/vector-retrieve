@@ -18,13 +18,12 @@ DATASETS = [
         "query": "siftsmall/siftsmall_query.fvecs",
         "groundtruth": "siftsmall/siftsmall_groundtruth.ivecs",
     },
-    # 示例：添加 sift1m 数据集
-    # {
-    #     "name": "sift1m",
-    #     "base": "sift1m/sift_base.fvecs",
-    #     "query": "sift1m/sift_query.fvecs",
-    #     "groundtruth": "sift1m/sift_groundtruth.ivecs",
-    # }
+    {
+        "name": "sift",
+        "base": "sift/sift_base.fvecs",
+        "query": "sift/sift_query.fvecs",
+        "groundtruth": "sift/sift_groundtruth.ivecs",
+    }
 ]
 
 # 2. 定义参数网格

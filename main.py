@@ -94,18 +94,12 @@ if __name__ == "__main__":
     else:
         print("Loading data...")
         data = read_fvecs(data_path)
-        queries = read_fvecs(query_path)
-        groundtruth = read_ivecs(groundtruth_path)
+        
         print(f"Data shape: {data.shape}")
-        print(f"Queries shape: {queries.shape}")
-        print(f"Groundtruth shape: {groundtruth.shape}")
-
+    
         dim = data.shape[1]
         max_num_elements = data.shape[0]
-        max_num_queries = queries.shape[0]
-
         num_elements = max_num_elements
-        num_queries = max_num_queries
 
         print("Building HNSW index...")
         hnsw = HNSWGraph(dim=dim, m=m, ef_construction=ef_construction, ef_search=ef_search, limited_level=limited_level)
@@ -121,6 +115,13 @@ if __name__ == "__main__":
         cluster.partition(mode=partition_mode, redundancy=redundancy)
         partition_time = time.time() - start_time
         print(f"Partitioning Time: {partition_time:.4f} seconds.")
+
+    queries = read_fvecs(query_path)
+    groundtruth = read_ivecs(groundtruth_path)
+    print(f"Queries shape: {queries.shape}")
+    print(f"Groundtruth shape: {groundtruth.shape}")
+    max_num_queries = queries.shape[0]
+    num_queries = max_num_queries
 
     print("Performing queries...")
     recall = {}
@@ -192,6 +193,7 @@ if __name__ == "__main__":
         "hnsw_params": hnsw_params,
         "cluster_params": cluster_params,
         "num_queries": num_queries,
+        "k": k,
         f"avg_recall@{k}": avg_recall,
         "avg_remote_transfer_latency_query": avg_remote_transfer_latency_query,
         "avg_remote_transfer_latency_trans": avg_remote_transfer_latency_trans,
