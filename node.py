@@ -206,10 +206,8 @@ class Cluster:
 
     def transfer_to_remote(self, query_id, query_vector, payload: Payload, k):
 
-        print("Transferring payload to remote node...")
         self.remote_transfer_cnt[query_id] = self.remote_transfer_cnt.get(query_id, 0) + 1
         self.remote_transfer_latency[query_id] = self.remote_transfer_latency.get(query_id, 0) + payload.size_bits / (self.bandwidth * 1e3) # 单位为 ms
-        print(f"Remote transfer count: {self.remote_transfer_cnt[query_id]}")
 
         require_id = payload.require_id
         target_node_id = self.vector_node_map[require_id]
