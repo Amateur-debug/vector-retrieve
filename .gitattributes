@@ -1,0 +1,6 @@
+dataset/siftsmall.tar.gz filter=lfs diff=lfs merge=lfs -text
+dataset/sift.tar.gz filter=lfs diff=lfs merge=lfs -text
+dataset/gift.tar.gz filter=lfs diff=lfs merge=lfs -text
+dataset/bigann_base.bvecs.gz filter=lfs diff=lfs merge=lfs -text
+dataset/bigann_query.bvecs.gz filter=lfs diff=lfs merge=lfs -text
+dataset/bigann_gnd.tar.gz filter=lfs diff=lfs merge=lfs -text
