@@ -29,13 +29,13 @@ DATASETS = [
 # 2. 定义参数网格
 # 脚本将运行这些参数的所有笛卡尔积组合
 PARAM_GRID = {
-    "node_num": [2, 4, 8],              # 测试不同的节点数
-    "partition_mode": ["round_robin"],  # 测试划分模式
-    "redundancy": [0, 1, 2],            # 冗余级别
-    "m": [8, 16],                       # HNSW 参数 M
-    "ef_construction": [64, 128],       # HNSW 建图参数
-    "ef_search": [16, 32, 64],          # HNSW 搜索参数
-    "k": [10]                           # Top-K
+    "node_num": [2, 4, 8, 16],                      # 测试不同的节点数
+    "partition_mode": ["round_robin", "k-means"],   # 测试划分模式
+    "redundancy": [0, 1, 2],                        # 冗余级别
+    "m": [8, 16, 32],                               # HNSW 参数 M
+    "ef_construction": [64, 128],                   # HNSW 建图参数
+    "ef_search": [16, 32, 64],                      # HNSW 搜索参数
+    "k": [10]                                       # Top-K
 }
 
 def run_worker(cmd, task_id, total_tasks, description):

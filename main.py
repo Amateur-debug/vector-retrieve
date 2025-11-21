@@ -4,6 +4,9 @@ import argparse
 import numpy as np
 import json
 
+import sys
+sys.setrecursionlimit(5000) 
+
 from hnsw import HNSWGraph
 from node import Cluster, Node
 from payload import Payload
@@ -162,9 +165,10 @@ if __name__ == "__main__":
 
     # --- 计算并打印最终结果 ---
     avg_recall = sum(recall.values()) / (num_queries)
-    avg_remote_transfer_cnt = sum(cluster.remote_transfer_cnt.values()) / num_queries
+    all_remote_transfer_cnt = sum(cluster.remote_transfer_cnt.values())
+    avg_remote_transfer_cnt = all_remote_transfer_cnt / num_queries
     avg_remote_transfer_latency_query = sum(cluster.remote_transfer_latency.values()) / num_queries
-    avg_remote_transfer_latency_trans = sum(cluster.remote_transfer_latency.values()) / sum(cluster.remote_transfer_cnt.values()) if sum(cluster.remote_transfer_cnt.values()) > 0 else 0.0
+    avg_remote_transfer_latency_trans = sum(cluster.remote_transfer_latency.values()) / all_remote_transfer_cnt if all_remote_transfer_cnt > 0 else 0.0
 
     print("-" * 30)
     print("Evaluation Results:")
@@ -186,8 +190,10 @@ if __name__ == "__main__":
     }
     cluster_params = {
         "node_num": cluster.node_num,
+        "partition_mode": cluster.partition_mode,
+        "redundancy_level": cluster.redundancy_level,
+        "redundancy_num": cluster.redundancy_num,
         "bandwidth": cluster.bandwidth,
-        "redundancy_num": cluster.redundancy_num
     }
     stats = {
         "hnsw_params": hnsw_params,
@@ -195,6 +201,7 @@ if __name__ == "__main__":
         "num_queries": num_queries,
         "k": k,
         f"avg_recall@{k}": avg_recall,
+        "all_remote_transfer_cnt": all_remote_transfer_cnt,
         "avg_remote_transfer_latency_query": avg_remote_transfer_latency_query,
         "avg_remote_transfer_latency_trans": avg_remote_transfer_latency_trans,
         "recall": recall,
@@ -207,7 +214,7 @@ if __name__ == "__main__":
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     results_path = (f"{results_dir}/results-{data_name}-m{m}-"
                     f"efc{ef_construction}-efs{ef_search}-ll{limited_level}-"
-                    f"node{node_num}-{partition_mode}-{timestamp}.json")
+                    f"node{node_num}-{partition_mode}-red{redundancy}.json")
 
     with open(results_path, 'w') as f:
         json.dump(stats, f, indent=4)

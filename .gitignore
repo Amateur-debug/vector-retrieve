@@ -5,7 +5,7 @@
 /dataset/*
 !/dataset/siftsmall.tar.gz
 !/dataset/sift.tar.gz
-!/dataset/gift.tar.gz
+!/dataset/gist.tar.gz
 !/dataset/bigann_base.bvecs.gz
 !/dataset/bigann_query.bvecs.gz
 !/dataset/bigann_gnd.tar.gz

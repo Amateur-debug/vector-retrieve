@@ -3,6 +3,7 @@ import random
 import heapq
 from collections import defaultdict
 import pickle
+import fcntl
 
 from payload import Payload
 
@@ -149,12 +150,9 @@ class HNSWGraph:
         else:
             if entry_point_id != -1:
                 dist = self.distance(query_vector, self.vectors.get(entry_point_id))
-                if not payload.visited:
-                    payload.visited = {entry_point_id}
-                if not payload.candidates:
-                    payload.candidates = [(dist, entry_point_id)]
-                if not payload.results:
-                    payload.results = [(-dist, entry_point_id)]
+                payload.visited = {entry_point_id}
+                payload.candidates = [(dist, entry_point_id)]
+                payload.results = [(-dist, entry_point_id)]
                 
         while payload.candidates:
             candidate_dist, candidate_id = heapq.heappop(payload.candidates)
@@ -225,8 +223,14 @@ class HNSWGraph:
         """将 HNSWGraph 对象保存到磁盘"""
         print(f"Saving HNSW to {filepath}...")
         with open(filepath, 'wb') as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(f"{filepath} is locked by another process, skipping save.")
+                return
             pickle.dump(self, f)
-        print("HNSW index saved successfully.")
+            fcntl.flock(f, fcntl.LOCK_UN)
+            print("HNSW saved successfully.")
 
     @staticmethod
     def load(filepath):

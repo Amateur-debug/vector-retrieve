@@ -3,6 +3,7 @@ import numpy as np
 from collections import defaultdict
 from sklearn.cluster import KMeans
 import pickle
+import fcntl
 
 from hnsw import HNSWGraph
 from payload import Payload
@@ -24,6 +25,10 @@ class Cluster:
             node = Node(node_id=i, cluster=self, local_hnsw=None)
             self.nodes[i] = node
 
+        self.partition_mode = None
+        self.outer_ring_max_iterations = 0
+
+        self.redundancy_level = 0
         self.redundancy_num = 0 
 
         self.remote_transfer_cnt = {}
@@ -36,6 +41,11 @@ class Cluster:
             node.reset()
 
     def partition(self, mode, redundancy=1):
+
+        self.partition_mode = mode
+        self.redundancy_level = redundancy
+        self.redundancy_num = 0
+
         max_level = self.hnsw.max_level 
         vectors = self.hnsw.vectors
         neighbors = self.hnsw.neighbors
@@ -58,7 +68,7 @@ class Cluster:
                 # 执行聚类
                 kmeans = KMeans(n_clusters=self.node_num, random_state=123, n_init=10)
                 kmeans.fit(data_matrix)
-                labels = kmeans.labels
+                labels = kmeans.labels_
 
                 # 根据聚类结果分配“主节点”
                 for idx, label in enumerate(labels):
@@ -69,6 +79,36 @@ class Cluster:
                     self.vector_node_map[vector_id] = target_node_id
                     # 将向量数据放入该节点的本地存储
                     local_vectors[target_node_id][vector_id] = vectors[vector_id]
+            case "outer_ring":
+                # 1. 先用 k-means 分配
+                vector_ids = list(vectors.keys())
+                # 将向量转换为 numpy 数组供 sklearn 使用
+                data_matrix = np.array([vectors[vid] for vid in vector_ids])
+
+                # 执行聚类
+                kmeans = KMeans(n_clusters=self.node_num, random_state=123, n_init=10)
+                kmeans.fit(data_matrix)
+                labels = kmeans.labels_
+
+                # 根据聚类结果分配“主节点”
+                for idx, label in enumerate(labels):
+                    vector_id = vector_ids[idx]
+                    target_node_id = label  # 簇 ID 即为 Node ID
+
+                    # 记录全局路由表：这个向量真正属于哪个节点
+                    self.vector_node_map[vector_id] = target_node_id
+                    # 将向量数据放入该节点的本地存储
+                    local_vectors[target_node_id][vector_id] = vectors[vector_id]
+                
+                # 2. 挑选边界向量，重新分配（迭代，支持提前停止）
+                removed_cnt_before = 0
+                for i in range(self.outer_ring_max_iterations):
+                    removed_cnt = self.outer_ring(local_vectors)
+                    removed_add_ratio = (removed_cnt - removed_cnt_before) / removed_cnt_before if removed_cnt_before > 0 else 1.0
+                    # 提前停止条件
+                    if removed_cnt == 0 or removed_add_ratio < 0.001:
+                        break
+                    removed_cnt_before = removed_cnt
 
         # 添加冗余
         if redundancy > 0:
@@ -104,7 +144,65 @@ class Cluster:
 
             local_hnsw.entry_point_id = self.hnsw.entry_point_id
             self.nodes[i].local_hnsw = local_hnsw
+    
+    def outer_ring(self, local_vectors):
+        # 1. 找出所有有跨节点邻居的候选 boundary vectors（及其跨节点邻居数）
+        neighbors = self.hnsw.neighbors
+        boundary_candidates = defaultdict(list)  # node_id -> [(vid, cross_cnt), ...]
+        for node_id in range(self.node_num):
+            for vid in local_vectors[node_id].keys():
+                cross_cnt = 0
+                for neighbor_id in neighbors[0][vid]:
+                    if self.vector_node_map.get(neighbor_id, node_id) != node_id:
+                        cross_cnt += 1
+                if cross_cnt > 0:
+                    boundary_candidates[node_id].append((vid, cross_cnt))
+        
+        # 2. 从候选中挑选尽量少的外圈向量（按跨节点邻居数降序），可调参数：
+        outer_fraction = 0.02   # 每个节点保留的比例（可调，越小越少）
+        max_outer = 50          # 每个节点保留的上限（可调）
+        outer_ring = defaultdict(set)
+        for node_id in range(self.node_num):
+            candidates = boundary_candidates.get(node_id, [])
+            if not candidates:
+                continue
+            # 按跨节点邻居数降序
+            candidates.sort(key=lambda x: -x[1])
+            # 选择数量：至少1个（若存在候选），或按比例取，且不超过 max_outer
+            choose_n = max(1, int(len(local_vectors[node_id]) * outer_fraction))
+            choose_n = min(choose_n, max_outer, len(candidates))
+            for vid, _ in candidates[:choose_n]:
+                outer_ring[node_id].add(vid)
+                                        
+        # 3. 从每个 node 的本地存储中删除未被选为外圈的 boundary vectors
+        removed = set()
+        for node_id in range(self.node_num):
+            for vid, _ in boundary_candidates.get(node_id, []):
+                if vid not in outer_ring[node_id]:
+                    local_vectors[node_id].pop(vid, None)
+                    removed.add(vid)
 
+        # 4. 重新分配local_vectors
+        for vid in list(removed):
+            # 统计该向量在各节点的邻居数量（只计入当前 local_vectors 中仍存在的邻居）
+            counts = defaultdict(int)
+            for neighbor_id in neighbors[0].get(vid, ()):
+                neighbor_node = self.vector_node_map.get(neighbor_id)
+                if neighbor_id in local_vectors.get(neighbor_node, {}):
+                    counts[neighbor_node] += 1
+            if counts:
+                # 选择邻居数最多的节点；如并列，选择当前存量最小的那个作为 tiebreak
+                best_node = max(counts.items(), key=lambda x: (x[1], -len(local_vectors[x[0]])))[0]
+            else:
+                # 没有可用邻居，放到当前最小负载节点
+                best_node = min(range(self.node_num), key=lambda nid: len(local_vectors[nid]))
+            
+            # 将向量数据放回到选定节点
+            vector = self.hnsw.vectors.get(vid)
+            local_vectors[best_node][vid] = vector
+            self.vector_node_map[vid] = best_node
+
+        return len(removed)
 
     def transfer_to_remote(self, query_id, query_vector, payload: Payload, k):
 
@@ -123,8 +221,14 @@ class Cluster:
         """将整个 Cluster 对象保存到磁盘"""
         print(f"Saving cluster to {filepath}...")
         with open(filepath, 'wb') as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(f"{filepath} is locked by another process, skipping save.")
+                return
             pickle.dump(self, f)
-        print("Cluster saved successfully.")
+            fcntl.flock(f, fcntl.LOCK_UN)
+            print("Cluster saved successfully.")
 
     @staticmethod
     def load(filepath):
