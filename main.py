@@ -153,13 +153,16 @@ if __name__ == "__main__":
         print("Saving cluster state to disk...")
         save_dir = "./save"
         os.makedirs(save_dir, exist_ok=True)
-        cluster_path = f"{save_dir}/cluster-{data_name}-node{node_num}-{partition_mode}.pkl"
+        cluster_path = (f"{save_dir}/cluster-{data_name}-m{m}-"
+                        f"efc{ef_construction}-efs{ef_search}-ll{limited_level}-"
+                        f"node{node_num}-{partition_mode}-red{redundancy}.pkl")
         cluster.save(cluster_path)
     if graph_path is None:
         print("Saving graph state to disk...")
         save_dir = "./save"
         os.makedirs(save_dir, exist_ok=True)
-        graph_path = f"{save_dir}/hnsw-{data_name}-m{m}-efc{ef_construction}-efs{ef_search}-ll{limited_level}.pkl"
+        graph_path = (f"{save_dir}/hnsw-{data_name}-m{m}-"
+                      f"efc{ef_construction}-efs{ef_search}-ll{limited_level}.pkl")
         hnsw.save(graph_path)
     print("-" * 30)
 
