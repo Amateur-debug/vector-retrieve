@@ -139,6 +139,7 @@ class Cluster:
         for i in range(self.node_num):
             local_hnsw = HNSWGraph(self.hnsw.dim, self.hnsw.m, self.hnsw.ef_construction, 
                                    self.hnsw.ef_search, self.hnsw.limited_level, self.hnsw.seed)
+            local_hnsw.max_level = max_level
             local_hnsw.vectors = local_vectors[i]
             local_hnsw.neighbors = neighbors
 

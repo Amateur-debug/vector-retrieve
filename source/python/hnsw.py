@@ -1,3 +1,4 @@
+import sys
 import math
 import random
 import heapq
@@ -27,7 +28,10 @@ class HNSWGraph:
     def add_vector(self, vector_id, vector):
         """向图中添加一个新向量"""
         # 生成新节点的层级
-        level = int(-math.log(self.seed.random()) * (1 / math.log(self.m)))
+        r = self.seed.random()
+        if r == 0.0:
+            r = sys.float_info.min
+        level = int(-math.log(r) * (1 / math.log(self.m)))
         if self.limited_level is not None:
             level = min(level, self.limited_level)
         
@@ -50,11 +54,6 @@ class HNSWGraph:
             self.search_layer_ef(vector, l, self.ef_construction, payload)
             entry_point_id = payload.results[0][1]
 
-            # 如果新节点的层级更高，更新图的全局入口点和最高层
-            if level > self.max_level:
-                self.max_level = level
-                self.entry_point_id = vector_id
-
             # 使用启发式算法从候选者中挑选邻居
             selected_neighbors = self.select_neighbors_heuristic(payload.results)
 
@@ -75,6 +74,11 @@ class HNSWGraph:
                 else:
                     # 如果未超限，直接添加
                     neighbor_connections.add(vector_id)
+            
+        # 如果新节点的层级更高，更新图的全局入口点和最高层
+        if level > self.max_level:
+            self.max_level = level
+            self.entry_point_id = vector_id
 
     def select_neighbors_heuristic(self, candidates):
         """

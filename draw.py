@@ -1,6 +1,7 @@
 import os
 import argparse
 import matplotlib.pyplot as plt
+from collections import defaultdict
 import json
 
 if __name__ == "__main__":
@@ -10,6 +11,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./plot", help="Directory to save plot")
     parser.add_argument("--x", type=str, default="ef_search", help="X-axis parameter for plotting (Merge mode)")
     parser.add_argument("--y", type=str, default="avg_remote_transfer_latency_query", help="Y-axis parameter for plotting")
+    parser.add_argument("--pmode", type=str, default="k-means", help="select partition mode filter")
 
     args = parser.parse_args()
 
@@ -24,26 +26,16 @@ if __name__ == "__main__":
         with open(path, 'r') as f:
             return json.load(f)
 
-    # 辅助函数：在 JSON 结构中查找参数 (用于 Merge 模式的 X 轴)
+    # 辅助函数：在 JSON 结构中查找参数
     def get_param_value(data, key):
-        # 1. 尝试直接在根节点找
+        # 尝试直接在根节点找
         if key in data: return data[key]
-        # 2. 尝试在 hnsw_params 中找
+        # 尝试在 hnsw_params 中找
         if 'hnsw_params' in data and key in data['hnsw_params']:
             return data['hnsw_params'][key]
-        # 3. 尝试在 cluster_params 中找
+        # 尝试在 cluster_params 中找
         if 'cluster_params' in data and key in data['cluster_params']:
-            return data['cluster_params'][key]
-        return None
-
-    # 辅助函数：查找指标值 (用于 Merge 模式的 Y 轴)
-    def get_metric_value(data, key):
-        # 1. 精确匹配
-        if key in data: return data[key]
-        # 2. 模糊匹配 (例如用户输入 avg_recall，匹配 avg_recall@10)
-        for k in data.keys():
-            if k.startswith(key) and (k == key or k[len(key)] == '@'):
-                return data[k]
+            return data['cluster_params'][key] 
         return None
 
     plt.figure(figsize=(10, 6))
@@ -55,35 +47,52 @@ if __name__ == "__main__":
             files = [os.path.join(args.json_path, f) for f in os.listdir(args.json_path) if f.endswith('.json')]
         else:
             files = [args.json_path]
-        
-        points = []
+
+        points = defaultdict(float)
+        all_num_queries = defaultdict(int)
         for f in files:
             try:
                 data = load_json(f)
-                
+
                 # 获取 X 轴 (参数)
                 x_val = get_param_value(data, args.x)
-                
+
                 # 获取 Y 轴 (汇总指标)
-                y_val = get_metric_value(data, args.y)
-                
-                if x_val is not None and y_val is not None:
-                    points.append((x_val, y_val))
-                else:
-                    print(f"Warning: Could not find x='{args.x}' or y='{args.y}' in {os.path.basename(f)}")
+
+                y_val = get_param_value(data, args.y)
+                num_queries = get_param_value(data, "num_queries")
+                points[x_val] += y_val * num_queries
+                all_num_queries[x_val] += num_queries if num_queries is not None else 0
+
+                partition_mode = get_param_value(data, "partition_mode")
+                  
+                if x_val is not None and y_val is not None and partition_mode == args.pmode:
+                    if (args.y == "avg_remote_transfer_latency_query" or
+                        args.y == "avg_remote_transfer_cnt"):
+                        points[x_val] += y_val * num_queries
             except Exception as e:
                 print(f"Skipping {f}: {e}")
-        
+
+        points_avg = []
+        if (args.y == "avg_remote_transfer_latency_query" or
+            args.y == "avg_remote_transfer_cnt"):
+            for x_val, total in points.items():
+                n = all_num_queries.get(x_val, 0)
+                if n > 0:
+                    points_avg.append((x_val, total / n))
+                else:
+                    print(f"Warning: no num_queries for x={x_val}, skip")
+    
         # 按 X 轴排序并绘图
-        points.sort(key=lambda p: p[0])
-        if points:
-            xs, ys = zip(*points)
+        points_avg.sort(key=lambda p: p[0])
+        if points_avg:
+            xs, ys = zip(*points_avg)
             plt.plot(xs, ys, marker='s', linestyle='--', color='b', label='Merged Results')
             plt.xlabel(f"Parameter: {args.x}")
             plt.title(f"{args.y} vs {args.x}")
             
             # 在点旁边标注数值
-            for x, y in points:
+            for x, y in points_avg:
                 plt.text(x, y, f"{y:.4f}", fontsize=9, ha='right')
         else:
             print("No valid data points found.")
@@ -125,8 +134,13 @@ if __name__ == "__main__":
     plt.ylabel(args.y)
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend()
-    
-    output_filename = f"{'merge' if args.merge else 'single'}_{args.y}_vs_{args.x if args.merge else 'query'}.pdf"
+
+    if args.merge:
+        output_filename = f"merge_{args.x}_{args.y}.pdf"
+    else:
+        base = os.path.splitext(os.path.basename(args.json_path))[0]
+        output_filename = f"{base}_{args.y}.pdf"
+
     output_path = os.path.join(args.output_dir, output_filename)
     plt.savefig(output_path)
     print(f"Plot saved to {output_path}")

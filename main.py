@@ -7,9 +7,34 @@ import json
 import sys
 sys.setrecursionlimit(5000) 
 
-from hnsw import HNSWGraph
-from node import Cluster, Node
-from payload import Payload
+select_parser = argparse.ArgumentParser(add_help=False)
+select_parser.add_argument("--use_cpp", type=bool, default=True,  
+                           help="whether to use the C++ implementation")
+select_args, rest = select_parser.parse_known_args()
+use_cpp = select_args.use_cpp
+
+project_root = os.path.abspath(os.path.dirname(__file__))
+py_source_dir = os.path.join(project_root, 'source/python')
+cpp_source_dir = os.path.join(project_root, 'source/cpp')
+build_dir = os.path.join(project_root, 'build')
+
+if use_cpp:
+    if os.path.isdir(build_dir):
+        os.environ['PYTHONPATH'] = f"{build_dir}:{os.environ.get('PYTHONPATH','')}"
+        if build_dir not in sys.path:
+            sys.path.insert(0, build_dir)
+
+    from vector_retrieve import PayloadFloat as Payload
+    from vector_retrieve import HNSWGraphFloat as HNSWGraph
+    from vector_retrieve import ClusterFloat as Cluster
+else:
+    if os.path.isdir(py_source_dir):
+        if py_source_dir not in sys.path:
+            sys.path.insert(0, py_source_dir)
+
+    from payload import Payload
+    from hnsw import HNSWGraph
+    from cluster import Cluster
 
 def read_fvecs(filename, c_contiguous=True):
     """读取 .fvecs 格式的文件"""
@@ -68,7 +93,7 @@ if __name__ == "__main__":
     parser.add_argument("--partition_mode", type=str, default="round_robin", help="Data partition mode across nodes")
     parser.add_argument("--redundancy", type=int, default=1, help="Redundancy level for data replication across nodes")
 
-    args = parser.parse_args()
+    args = parser.parse_args(rest)
 
     data_name = args.data_name
     data_path = args.data_path
@@ -94,6 +119,12 @@ if __name__ == "__main__":
     elif graph_path is not None and os.path.exists(graph_path):
         print("Loading HNSW graph from disk...")
         hnsw = HNSWGraph.load(graph_path)
+        print("Partitioning data across cluster nodes...")
+        cluster = Cluster(hnsw, node_num)
+        start_time = time.time()
+        cluster.partition(mode=partition_mode, redundancy=redundancy)
+        partition_time = time.time() - start_time
+        print(f"Partitioning Time: {partition_time:.4f} seconds.")
     else:
         print("Loading data...")
         data = read_fvecs(data_path)
@@ -108,7 +139,11 @@ if __name__ == "__main__":
         hnsw = HNSWGraph(dim=dim, m=m, ef_construction=ef_construction, ef_search=ef_search, limited_level=limited_level)
         start_time = time.time()
         for idx, vector in enumerate(data[:num_elements]):
+            start_time_add = time.time()
             hnsw.add_vector(idx, vector) 
+            end_time_add = time.time()
+            add_time = end_time_add - start_time_add
+            print(f"Add vector {idx}/{num_elements} Time: {add_time:.4f} seconds.", end='\r')
         build_time = time.time() - start_time
         print(f"Building Machine Time: {build_time:.4f} seconds.")
 
@@ -135,6 +170,7 @@ if __name__ == "__main__":
         payload = Payload()
         
         results = cluster.nodes[0].query(i, query, payload, k=k)
+        results = set(results)
         query_time = time.time() - start_time
 
         # --- 召回率计算 ---
@@ -148,23 +184,23 @@ if __name__ == "__main__":
         print(f"Recall@{k}({i}): {recall[i]:.4f}")
 
     # --- 保存cluster或graph状态 ---
-    print("-" * 30)
-    if cluster_path is None:
-        print("Saving cluster state to disk...")
-        save_dir = "./save"
-        os.makedirs(save_dir, exist_ok=True)
-        cluster_path = (f"{save_dir}/cluster-{data_name}-m{m}-"
-                        f"efc{ef_construction}-efs{ef_search}-ll{limited_level}-"
-                        f"node{node_num}-{partition_mode}-red{redundancy}.pkl")
-        cluster.save(cluster_path)
+    # print("-" * 30)
+    # if cluster_path is None:
+    #     print("Saving cluster state to disk...")
+    #     save_dir = "./save"
+    #     os.makedirs(save_dir, exist_ok=True)
+    #     cluster_path = (f"{save_dir}/cluster-{data_name}-m{m}-"
+    #                     f"efc{ef_construction}-efs{ef_search}-ll{limited_level}-"
+    #                     f"node{node_num}-{partition_mode}-red{redundancy}.pkl")
+    #     cluster.save(cluster_path)
     if graph_path is None:
         print("Saving graph state to disk...")
         save_dir = "./save"
         os.makedirs(save_dir, exist_ok=True)
         graph_path = (f"{save_dir}/hnsw-{data_name}-m{m}-"
-                      f"efc{ef_construction}-efs{ef_search}-ll{limited_level}.pkl")
+                      f"efc{ef_construction}-efs{ef_search}-ll{limited_level}.json")
         hnsw.save(graph_path)
-    print("-" * 30)
+    # print("-" * 30)
 
     # --- 计算并打印最终结果 ---
     avg_recall = sum(recall.values()) / (num_queries)
@@ -212,8 +248,10 @@ if __name__ == "__main__":
         "remote_transfer_cnt": cluster.remote_transfer_cnt,
         "remote_transfer_latency": cluster.remote_transfer_latency,
     }
-
-    results_dir = "./results"
+    if use_cpp:
+        results_dir = "./results/cpp"
+    else:
+        results_dir = "./results/python"
     os.makedirs(results_dir, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     results_path = (f"{results_dir}/results-{data_name}-m{m}-"

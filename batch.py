@@ -29,19 +29,37 @@ DATASETS = [
 # 2. 定义参数网格
 # 脚本将运行这些参数的所有笛卡尔积组合
 PARAM_GRID = {
-    "node_num": [2, 4, 8, 16],                      # 测试不同的节点数
-    "partition_mode": ["round_robin", "k-means"],   # 测试划分模式
-    "redundancy": [0, 1, 2],                        # 冗余级别
-    "m": [8, 16, 32],                               # HNSW 参数 M
-    "ef_construction": [64, 128],                   # HNSW 建图参数
+    "node_num": [1, 2, 4, 8, 16, 32, 64, 128],      # 测试不同的节点数
+    "partition_mode": ["k-means", "round_robin"],   # 测试划分模式
+    "redundancy": [0, 1, 2, 3],                     # 冗余级别
+    "m": [8, 16, 32, 64],                           # HNSW 参数 M
+    "ef_construction": [32, 64, 96, 128],           # HNSW 建图参数
     "ef_search": [16, 32, 64],                      # HNSW 搜索参数
+    "limited_level": [5],                           # HNSW 参数 limited_level
     "k": [10]                                       # Top-K
 }
+
+# 等待已生成 graph 最长秒数（0 表示无限等待）
+GRAPH_WAIT_TIMEOUT = 0
 
 def run_worker(cmd, task_id, total_tasks, description):
     """
     单个任务的工作函数
     """
+    # 若命令带 --graph_path，则等待文件可用
+    if "--graph_path" in cmd:
+        idx = cmd.index("--graph_path")
+        graph_path = cmd[idx + 1] if idx + 1 < len(cmd) else None
+        if graph_path:
+            waited = 0
+            interval = 1
+            print(f"[{task_id}/{total_tasks}] Waiting for graph file {graph_path} to exist...")
+            while not os.path.exists(graph_path):
+                time.sleep(interval)
+                waited += interval
+                if GRAPH_WAIT_TIMEOUT and waited >= GRAPH_WAIT_TIMEOUT:
+                    print(f"[{task_id}/{total_tasks}] TIMEOUT waiting for {graph_path}. Skipping task.")
+                    return
     print(f"[{task_id}/{total_tasks}] STARTING: {description}")
     start_time = time.time()
     try:
@@ -74,10 +92,23 @@ def run_batch():
             print(f"Warning: Dataset file not found: {data_path}. Skipping...")
             continue
 
+        # 用于追踪哪些 (m, ef_construction, ef_search, limited_level) 已经 build 过
+        built_graph_keys = set()
+
         for combo in combinations:
             params = dict(zip(keys, combo))
-            
-            # 构建命令
+
+            # 形成 graph 保存/加载路径（与 main.py 的命名一致）
+            graph_filename = f"save/hnsw-{data_name}-m{params['m']}-efc{params['ef_construction']}-efs{params['ef_search']}-ll{params['limited_level']}.json"
+            graph_path = os.path.join(".", graph_filename)
+
+            key = (params['m'], params['ef_construction'], params['ef_search'], params['limited_level'])
+
+            # 如果目标 graph 已存在于磁盘，直接视为已构建
+            if os.path.exists(graph_path):
+                built_graph_keys.add(key)
+
+            # 构建命令基础
             cmd = [
                 "python", SCRIPT_PATH,
                 "--data_name", data_name,
@@ -88,12 +119,22 @@ def run_batch():
                 "--m", str(params['m']),
                 "--ef_construction", str(params['ef_construction']),
                 "--ef_search", str(params['ef_search']),
+                "--limited_level", str(params['limited_level']),
                 "--node_num", str(params['node_num']),
                 "--partition_mode", params['partition_mode'],
                 "--redundancy", str(params['redundancy']),
             ]
-            
-            description = f"Dataset: {dataset['name']} | Params: {params}"
+
+            # 如果该组合已经建图过，后续任务都应该直接 load（传 --graph_path）
+            if key in built_graph_keys:
+                # 直接加载已经存在的 graph
+                cmd += ["--graph_path", graph_path]
+                description = f"Dataset: {dataset['name']} | Load graph {graph_path} | Params: {params}"
+            else:
+                # 第一次遇到此 m/efc/efs 组合时，创建 build 任务（不传 --graph_path），并标记已构建
+                built_graph_keys.add(key)
+                description = f"Dataset: {dataset['name']} | Build graph (first time) | Params: {params}"
+
             tasks.append((cmd, description))
 
     total_experiments = len(tasks)
