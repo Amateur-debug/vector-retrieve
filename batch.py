@@ -29,14 +29,14 @@ DATASETS = [
 # 2. 定义参数网格
 # 脚本将运行这些参数的所有笛卡尔积组合
 PARAM_GRID = {
-    "node_num": [1, 2, 4, 8, 16, 32, 64, 128],      # 测试不同的节点数
-    "partition_mode": ["k-means", "round_robin"],   # 测试划分模式
-    "redundancy": [0, 1, 2, 3],                     # 冗余级别
-    "m": [8, 16, 32, 64],                           # HNSW 参数 M
-    "ef_construction": [32, 64, 96, 128],           # HNSW 建图参数
-    "ef_search": [16, 32, 64],                      # HNSW 搜索参数
-    "limited_level": [5],                           # HNSW 参数 limited_level
-    "k": [10]                                       # Top-K
+    "node_num": [1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128],   # 测试不同的节点数
+    "partition_mode": ["k-means", "round_robin"],                   # 测试划分模式
+    "redundancy": [0, 1, 2, 3],                                     # 冗余级别
+    "m": [8, 12, 16, 24, 32, 48],                                   # HNSW 参数 M
+    "ef_construction": [16, 24, 32, 48, 64, 96, 128],               # HNSW 建图参数
+    "ef_search": [16, 24, 32, 48, 64],                              # HNSW 搜索参数
+    "limited_level": [5],                                           # HNSW 参数 limited_level
+    "k": [10]                                                       # Top-K
 }
 
 # 等待已生成 graph 最长秒数（0 表示无限等待）
@@ -99,10 +99,10 @@ def run_batch():
             params = dict(zip(keys, combo))
 
             # 形成 graph 保存/加载路径（与 main.py 的命名一致）
-            graph_filename = f"save/hnsw-{data_name}-m{params['m']}-efc{params['ef_construction']}-efs{params['ef_search']}-ll{params['limited_level']}.json"
+            graph_filename = f"save/hnsw-{data_name}-m{params['m']}-efc{params['ef_construction']}-ll{params['limited_level']}.json"
             graph_path = os.path.join(".", graph_filename)
 
-            key = (params['m'], params['ef_construction'], params['ef_search'], params['limited_level'])
+            key = (params['m'], params['ef_construction'], params['limited_level'])
 
             # 如果目标 graph 已存在于磁盘，直接视为已构建
             if os.path.exists(graph_path):
@@ -131,7 +131,7 @@ def run_batch():
                 cmd += ["--graph_path", graph_path]
                 description = f"Dataset: {dataset['name']} | Load graph {graph_path} | Params: {params}"
             else:
-                # 第一次遇到此 m/efc/efs 组合时，创建 build 任务（不传 --graph_path），并标记已构建
+                # 第一次遇到此 m/efc 组合时，创建 build 任务（不传 --graph_path），并标记已构建
                 built_graph_keys.add(key)
                 description = f"Dataset: {dataset['name']} | Build graph (first time) | Params: {params}"
 
@@ -142,7 +142,7 @@ def run_batch():
     print(f"Total experiments to run: {total_experiments}")
 
     # --- 并行执行配置 ---
-    MAX_WORKERS = 48  # 设置并行数量
+    MAX_WORKERS = 256  # 设置并行数量
     print(f"Parallel Workers: {MAX_WORKERS}")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:

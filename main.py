@@ -119,6 +119,7 @@ if __name__ == "__main__":
     elif graph_path is not None and os.path.exists(graph_path):
         print("Loading HNSW graph from disk...")
         hnsw = HNSWGraph.load(graph_path)
+        hnsw.ef_search = ef_search
         print("Partitioning data across cluster nodes...")
         cluster = Cluster(hnsw, node_num)
         start_time = time.time()
@@ -198,7 +199,7 @@ if __name__ == "__main__":
         save_dir = "./save"
         os.makedirs(save_dir, exist_ok=True)
         graph_path = (f"{save_dir}/hnsw-{data_name}-m{m}-"
-                      f"efc{ef_construction}-efs{ef_search}-ll{limited_level}.json")
+                      f"efc{ef_construction}-ll{limited_level}.json")
         hnsw.save(graph_path)
     # print("-" * 30)
 
@@ -220,6 +221,7 @@ if __name__ == "__main__":
     # --- 保存所有结果 ---
     print("-" * 30)
     hnsw_params = {
+        "data_name": data_name,
         "dim": hnsw.dim,
         "m": hnsw.m,
         "ef_construction": hnsw.ef_construction,
