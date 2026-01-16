@@ -4,10 +4,13 @@
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <random>
+#include <shared_mutex>
 #include <string>
 #include <sys/file.h>
+#include <thread>
 #include <type_traits>
 #include <unistd.h>
 #include <unordered_map>
@@ -43,6 +46,16 @@ public:
     std::mt19937 rng;
     std::uniform_real_distribution<double> uniform_;
 
+    // 线程安全保护
+    mutable std::shared_mutex vectors_mutex;  // 保护 vectors
+    mutable std::shared_mutex neighbors_mutex; // 保护 neighbors
+    mutable std::mutex entry_mutex;          // 保护 entry_point_id 和 max_level
+    mutable std::mutex rng_mutex;            // 保护随机数生成器
+    
+    // 节点级别的细粒度锁（使用shared_mutex减少竞争）
+    mutable std::unordered_map<int, std::unique_ptr<std::mutex>> node_mutexes;
+    mutable std::shared_mutex node_mutexes_mutex;  // 改用shared_mutex提高并发
+
     HNSWGraph(int dim, int m = 16, int ef_construction = 128, int ef_search = 64,
               int limited_level = 5, unsigned int seed = 123)
         : dim(dim),
@@ -58,83 +71,240 @@ public:
     {
     }
 
-    // 添加向量
+    // 获取节点级别的锁（使用读写锁减少热点竞争）
+    std::mutex* get_node_mutex(int node_id)
+    {
+        // 先用读锁尝试查找（允许多线程并发读取）
+        {
+            std::shared_lock<std::shared_mutex> read_lock(node_mutexes_mutex);
+            auto it = node_mutexes.find(node_id);
+            if (it != node_mutexes.end())
+            {
+                return it->second.get();
+            }
+        }
+        
+        // 需要创建新锁时才用写锁（双重检查锁定模式）
+        std::unique_lock<std::shared_mutex> write_lock(node_mutexes_mutex);
+        auto it = node_mutexes.find(node_id);
+        if (it == node_mutexes.end())
+        {
+            node_mutexes[node_id] = std::make_unique<std::mutex>();
+            return node_mutexes[node_id].get();
+        }
+        return it->second.get();
+    }
+
+    // 添加向量（线程安全，使用细粒度锁）
     void add_vector(int vid, const std::vector<T> &vec)
     {
-        int level = random_level();
-        vectors[vid] = vec;
-        for (int i = 0; i <= level; i++)
+        int level;
         {
-            neighbors[i][vid];
+            std::lock_guard<std::mutex> lock(rng_mutex);
+            level = random_level();
         }
 
-        if (entry_point_id == -1)
+        // 检查是否是第一个节点
+        bool is_first = false;
         {
-            entry_point_id = vid;
-            max_level = level;
+            std::lock_guard<std::mutex> entry_lock(entry_mutex);
+            is_first = (entry_point_id == -1);
+        }
+
+        // 添加向量和初始化邻居表（使用细粒度写锁）
+        {
+            std::unique_lock<std::shared_mutex> lock(vectors_mutex);
+            vectors[vid] = vec;
+        }
+        {
+            std::unique_lock<std::shared_mutex> lock(neighbors_mutex);
+            for (int i = 0; i <= level; i++)
+            {
+                neighbors[i][vid];
+            }
+        }
+
+        if (is_first)
+        {
+            std::lock_guard<std::mutex> entry_lock(entry_mutex);
+            if (entry_point_id == -1)  // 双重检查
+            {
+                entry_point_id = vid;
+                max_level = level;
+            }
             return;
         }
 
-        int ep = entry_point_id;
+        int ep, current_max_level;
+        {
+            std::lock_guard<std::mutex> entry_lock(entry_mutex);
+            ep = entry_point_id;
+            current_max_level = max_level;
+        }
+
         // 从最高层向下搜索
-        for (int i = max_level; i >= 0; i--)
+        for (int i = current_max_level; i >= 0; i--)
         {
             Payload<T> payload;
             payload.entry_point_id = ep;
 
-            // 使用 ef_construction 搜索候选
+            // 使用 ef_construction 搜索候选（不持锁，在 search_layer_ef 内部按需加锁）
             search_layer_ef(vec, i, ef_construction, payload);
 
-            // payload.results 是 priority_queue<pair<T,int>>
             const auto &topk = payload.topk_ids(1);
             ep = topk[0];
 
             // 使用启发式算法从候选者中挑选邻居
             std::unordered_set<int> selected_neighbors = select_neighbors_heuristic(payload.results);
-            neighbors[i][vid] = selected_neighbors;
+            
+            // 使用节点级别的锁更新邻居关系（减少锁竞争）
+            {
+                std::unique_lock<std::shared_mutex> lock(neighbors_mutex);
+                neighbors[i][vid] = selected_neighbors;
+            }
 
-            // 为被选中的邻居建立反向连接
+            // 为被选中的邻居建立反向连接（批量优化：一次性更新所有邻居）
+            // 步骤1: 批量读取所有需要的向量数据（一次加锁）
+            std::unordered_map<int, std::vector<T>> all_vecs;
+            {
+                std::shared_lock<std::shared_mutex> vec_lock(vectors_mutex);
+                all_vecs[vid] = vec; // 新插入的向量
+                for (int neighbor_id : selected_neighbors)
+                {
+                    auto it = vectors.find(neighbor_id);
+                    if (it != vectors.end())
+                    {
+                        all_vecs[neighbor_id] = it->second;
+                    }
+                }
+                // 预读所有邻居的邻居向量（用于距离计算）
+                for (int neighbor_id : selected_neighbors)
+                {
+                    auto level_it = neighbors.find(i);
+                    if (level_it == neighbors.end())
+                    {
+                        continue;
+                    }
+                    auto conn_it = level_it->second.find(neighbor_id);
+                    if (conn_it != level_it->second.end())
+                    {
+                        for (int conn_id : conn_it->second)
+                        {
+                            if (all_vecs.find(conn_id) == all_vecs.end())
+                            {
+                                auto it = vectors.find(conn_id);
+                                if (it != vectors.end())
+                                {
+                                    all_vecs[conn_id] = it->second;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // 步骤2: 批量读取所有邻居的连接状态（一次加锁）
+            std::unordered_map<int, std::unordered_set<int>> all_connections;
+            {
+                std::shared_lock<std::shared_mutex> read_lock(neighbors_mutex);
+                for (int neighbor_id : selected_neighbors)
+                {
+                    auto level_it = neighbors.find(i);
+                    if (level_it == neighbors.end())
+                    {
+                        continue;
+                    }
+                    auto it = level_it->second.find(neighbor_id);
+                    if (it != level_it->second.end())
+                    {
+                        all_connections[neighbor_id] = it->second;
+                    }
+                }
+            }
+            
+            // 步骤3: 完全无锁计算所有更新决策
+            std::unordered_map<int, std::pair<bool, int>> update_decisions;
             for (int neighbor_id : selected_neighbors)
             {
-                auto &neighbor_connections = neighbors[i][neighbor_id];
-                // 如果邻居的连接数超限
-                if ((int)neighbor_connections.size() >= m)
+                const auto &neighbor_connections = all_connections[neighbor_id];
+                bool should_add = false;
+                int to_remove = -1;
+                
+                if ((int)neighbor_connections.size() < m)
                 {
-                    // 将超出的邻居的现有连接和新节点一起放入候选池
-                    std::priority_queue<std::pair<T, int>> new_candidates_for_neighbor;
-                    for (int nid : neighbor_connections)
-                    {
-                        T dist = distance_id(neighbor_id, nid);
-                        std::pair<T, int> item = {dist, nid};
-                        new_candidates_for_neighbor.push(item);
-                    }
-                    std::pair<T, int> item = {distance_id(neighbor_id, vid), vid};
-                    new_candidates_for_neighbor.push(item);
-                    // 重新选择
-                    std::unordered_set<int> new_neighbors = select_neighbors_heuristic(new_candidates_for_neighbor);
-                    neighbors[i][neighbor_id] = move(new_neighbors);
+                    should_add = true;
                 }
-                else
+                else if (all_vecs.find(neighbor_id) != all_vecs.end())
                 {
-                    neighbors[i][neighbor_id].insert(vid);
+                    const auto &neighbor_vec = all_vecs[neighbor_id];
+                    T max_dist = -1;
+                    int furthest_id = -1;
+                    
+                    for (int conn_id : neighbor_connections)
+                    {
+                        if (all_vecs.find(conn_id) != all_vecs.end())
+                        {
+                            T dist = distance(neighbor_vec, all_vecs[conn_id]);
+                            if (dist > max_dist)
+                            {
+                                max_dist = dist;
+                                furthest_id = conn_id;
+                            }
+                        }
+                    }
+                    
+                    T new_dist = distance(neighbor_vec, all_vecs[vid]);
+                    if (furthest_id != -1 && new_dist < max_dist)
+                    {
+                        should_add = true;
+                        to_remove = furthest_id;
+                    }
+                }
+                
+                update_decisions[neighbor_id] = {should_add, to_remove};
+            }
+            
+            // 步骤4: 批量更新所有邻居（一次加锁，快速完成）
+            {
+                std::unique_lock<std::shared_mutex> write_lock(neighbors_mutex);
+                for (const auto &kv : update_decisions)
+                {
+                    int neighbor_id = kv.first;
+                    bool should_add = kv.second.first;
+                    int to_remove = kv.second.second;
+                    
+                    if (should_add)
+                    {
+                        auto &conns = neighbors[i][neighbor_id];
+                        if (to_remove != -1)
+                        {
+                            conns.erase(to_remove);
+                        }
+                        conns.insert(vid);
+                    }
                 }
             }
         }
 
         // 更新入口点和最大层级
-        if (level > max_level)
+        if (level > current_max_level)
         {
-            max_level = level;
-            entry_point_id = vid;
+            std::lock_guard<std::mutex> entry_lock(entry_mutex);
+            if (level > max_level)  // 双重检查
+            {
+                max_level = level;
+                entry_point_id = vid;
+            }
         }
     }
 
-    // query 接口：返回 k 个最接近点的 id 集合
+    // query 接口：返回 k 个最接近点的 id 集合（线程安全）
     std::vector<int> query(const std::vector<T> &query_vector, Payload<T> &payload, int k)
     {
         // 如果不是继续搜索，初始化起始层与入口点
         if (!payload.continue_search)
         {
+            std::lock_guard<std::mutex> entry_lock(entry_mutex);
             payload.start_level = max_level;
             payload.entry_point_id = entry_point_id;
         }
@@ -169,7 +339,7 @@ public:
         return final_results;
     }
 
-    // 搜索单层
+    // 搜索单层（使用细粒度读锁）
     void search_layer_ef(const std::vector<T> &query_vector, int level, int ef, Payload<T> &payload)
     {
         int entry_point_id = payload.entry_point_id;
@@ -177,16 +347,23 @@ public:
 
         if (!payload.continue_search)
         {
-            if (vectors.find(entry_point_id) == vectors.end())
+            std::vector<T> entry_vec;
             {
-                payload.continue_search = true;
-                payload.require_id = entry_point_id;
-                payload.start_level = level;
-                payload.entry_point_id = entry_point_id;
-                return;
+                std::shared_lock<std::shared_mutex> lock(vectors_mutex);
+                auto it = vectors.find(entry_point_id);
+                if (it == vectors.end())
+                {
+                    payload.continue_search = true;
+                    payload.require_id = entry_point_id;
+                    payload.start_level = level;
+                    payload.entry_point_id = entry_point_id;
+                    return;
+                }
+                entry_vec = it->second;
             }
 
-            T dist = distance(query_vector, vectors[entry_point_id]);
+            T dist = distance(query_vector, entry_vec);
+            payload.distance_cnt++;  // 累加距离计算次数
             payload.visited.insert(entry_point_id);
             payload.candidates.push({dist, entry_point_id});
             payload.results.push({dist, entry_point_id});
@@ -195,10 +372,24 @@ public:
         {
             if (entry_point_id != -1)
             {
-                T dist = distance(query_vector, vectors[entry_point_id]);
-                payload.visited.insert(entry_point_id);
-                payload.candidates.push({dist, entry_point_id});
-                payload.results.push({dist, entry_point_id});
+                std::vector<T> entry_vec;
+                {
+                    std::shared_lock<std::shared_mutex> lock(vectors_mutex);
+                    auto it = vectors.find(entry_point_id);
+                    if (it != vectors.end())
+                    {
+                        entry_vec = it->second;
+                    }
+                }
+                
+                if (!entry_vec.empty())
+                {
+                    T dist = distance(query_vector, entry_vec);
+                    payload.distance_cnt++;  // 累加距离计算次数
+                    payload.visited.insert(entry_point_id);
+                    payload.candidates.push({dist, entry_point_id});
+                    payload.results.push({dist, entry_point_id});
+                }
             }
         }
 
@@ -218,27 +409,49 @@ public:
                 break;
             }
 
+            // 获取候选节点的邻居列表（快速读取，不长时间持锁）
+            std::unordered_set<int> neighbor_ids;
+            {
+                std::shared_lock<std::shared_mutex> lock(neighbors_mutex);
+                auto level_it = neighbors.find(level);
+                if (level_it != neighbors.end())
+                {
+                    auto it = level_it->second.find(candidate_id);
+                    if (it != level_it->second.end())
+                    {
+                        neighbor_ids = it->second;
+                    }
+                }
+            }
+
             // 遍历候选节点的邻居
-            for (int neighbor_id : neighbors[level][candidate_id])
+            for (int neighbor_id : neighbor_ids)
             {
                 worst_dist = payload.results.top().first;
 
                 if (payload.visited.find(neighbor_id))
                     continue;
 
-                if (vectors.find(neighbor_id) == vectors.end())
+                std::vector<T> neighbor_vec;
                 {
-                    payload.continue_search = true;
-                    payload.require_id = neighbor_id;
-                    payload.start_level = level;
-                    payload.candidates.push({candidate_dist, candidate_id});
-                    return;
+                    std::shared_lock<std::shared_mutex> lock(vectors_mutex);
+                    auto it = vectors.find(neighbor_id);
+                    if (it == vectors.end())
+                    {
+                        payload.continue_search = true;
+                        payload.require_id = neighbor_id;
+                        payload.start_level = level;
+                        payload.candidates.push({candidate_dist, candidate_id});
+                        return;
+                    }
+                    neighbor_vec = it->second;
                 }
 
                 payload.visited.insert(neighbor_id);
-                T neighbor_dist = distance(query_vector, vectors[neighbor_id]);
+                T neighbor_dist = distance(query_vector, neighbor_vec);
+                payload.distance_cnt++;  // 累加距离计算次数
 
-                // 决定是否把该邻居加入 results：如果 results 小于 ef，直接加入；
+                // 决定是否把该邻居加入 results
                 if ((int)payload.results.size() < ef)
                 {
                     payload.results.push({neighbor_dist, neighbor_id});
@@ -258,9 +471,10 @@ public:
         return;
     }
 
-    // 计算层级
+    // 计算层级（需要外部加锁调用）
     int random_level()
     {
+        // 注意：调用者需要持有 rng_mutex
         double r = uniform_(rng);
         if (r == 0.0)
             r = std::numeric_limits<double>::min();
@@ -320,10 +534,22 @@ public:
     // 计算距离
     T distance_id(int id1, int id2) const
     {
-        auto it1 = vectors.find(id1);
-        auto it2 = vectors.find(id2);
+        std::vector<T> vec1, vec2;
+        {
+            std::shared_lock<std::shared_mutex> lock(vectors_mutex);
+            auto it1 = vectors.find(id1);
+            auto it2 = vectors.find(id2);
+            if (it1 != vectors.end() && it2 != vectors.end())
+            {
+                vec1 = it1->second;
+                vec2 = it2->second;
+            }
+        }
 
-        return distance(it1->second, it2->second);
+        if (vec1.empty() || vec2.empty())
+            return std::numeric_limits<T>::max();
+
+        return distance(vec1, vec2);
     }
 
     bool save(const string &filepath)
@@ -410,7 +636,7 @@ public:
     }
 
     // 从 JSON 加载全部内容
-    static HNSWGraph load(const string &filepath)
+    static HNSWGraph* load(const string &filepath)
     {
         std::ifstream ifs(filepath, std::ios::binary);
         if (!ifs)
@@ -424,10 +650,10 @@ public:
         int efs = j.value("ef_search", 64);
         int lim = j.value("limited_level", 5);
 
-        HNSWGraph<T> g(dim, m, efc, efs, lim);
+        HNSWGraph<T>* g = new HNSWGraph<T>(dim, m, efc, efs, lim);
 
-        g.max_level = j.value("max_level", 0);
-        g.entry_point_id = j.value("entry_point_id", -1);
+        g->max_level = j.value("max_level", 0);
+        g->entry_point_id = j.value("entry_point_id", -1);
 
         // neighbors
         if (j.contains("neighbors"))
@@ -449,7 +675,7 @@ public:
                     for (const auto &v : nid_array)
                         s.insert(v.get<int>());
 
-                    g.neighbors[level][nid] = std::move(s);
+                    g->neighbors[level][nid] = std::move(s);
                 }
             }
         }
@@ -468,7 +694,7 @@ public:
                 for (const auto &v : vec_arr)
                     vec.push_back(v.get<T>());
 
-                g.vectors[vid] = std::move(vec);
+                g->vectors[vid] = std::move(vec);
             }
         }
 

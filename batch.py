@@ -12,12 +12,12 @@ DATASET_ROOT = "/home/CONNECT/xchen740/workspace/vector-retrieve/dataset"
 # 1. 定义要运行的数据集
 # 请根据实际情况修改路径和数量
 DATASETS = [
-    {
-        "name": "siftsmall",
-        "base": "siftsmall/siftsmall_base.fvecs",
-        "query": "siftsmall/siftsmall_query.fvecs",
-        "groundtruth": "siftsmall/siftsmall_groundtruth.ivecs",
-    },
+    # {
+    #     "name": "siftsmall",
+    #     "base": "siftsmall/siftsmall_base.fvecs",
+    #     "query": "siftsmall/siftsmall_query.fvecs",
+    #     "groundtruth": "siftsmall/siftsmall_groundtruth.ivecs",
+    # },
     {
         "name": "sift",
         "base": "sift/sift_base.fvecs",
@@ -29,14 +29,17 @@ DATASETS = [
 # 2. 定义参数网格
 # 脚本将运行这些参数的所有笛卡尔积组合
 PARAM_GRID = {
-    "node_num": [1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128],   # 测试不同的节点数
-    "partition_mode": ["k-means", "round_robin"],                   # 测试划分模式
-    "redundancy": [0, 1, 2, 3],                                     # 冗余级别
-    "m": [8, 12, 16, 24, 32, 48],                                   # HNSW 参数 M
-    "ef_construction": [16, 24, 32, 48, 64, 96, 128],               # HNSW 建图参数
-    "ef_search": [16, 24, 32, 48, 64],                              # HNSW 搜索参数
+    "node_num": [1],   # 测试不同的节点数
+    "partition_mode": ["k-means"],                   # 测试划分模式
+    "redundancy": [3],                                     # 冗余级别
+    "m": [24],                                   # HNSW 参数 M
+    "ef_construction": [400],               # HNSW 建图参数
+    "ef_search": [128],                              # HNSW 搜索参数
     "limited_level": [5],                                           # HNSW 参数 limited_level
-    "k": [10]                                                       # Top-K
+    "k": [10],                                                       # Top-K
+    "num_query_threads": [64],                                        # 查询线程数（传递给 main.py --num_query_threads）
+    "reduce": [False],                                          # Reduce 模式开关（独立图每节点）
+    "distributed": [True],                                           # 分布式模式开关
 }
 
 # 等待已生成 graph 最长秒数（0 表示无限等待）
@@ -120,21 +123,32 @@ def run_batch():
                 "--ef_construction", str(params['ef_construction']),
                 "--ef_search", str(params['ef_search']),
                 "--limited_level", str(params['limited_level']),
+                "--num_query_threads", str(params['num_query_threads']),
                 "--node_num", str(params['node_num']),
                 "--partition_mode", params['partition_mode'],
                 "--redundancy", str(params['redundancy']),
             ]
 
-            # 如果该组合已经建图过，后续任务都应该直接 load（传 --graph_path）
-            if key in built_graph_keys:
-                # 直接加载已经存在的 graph
-                cmd += ["--graph_path", graph_path]
-                description = f"Dataset: {dataset['name']} | Load graph {graph_path} | Params: {params}"
-            else:
-                # 第一次遇到此 m/efc 组合时，创建 build 任务（不传 --graph_path），并标记已构建
-                built_graph_keys.add(key)
-                description = f"Dataset: {dataset['name']} | Build graph (first time) | Params: {params}"
+            if params.get('reduce'):
+                cmd.append('--reduce')
+            if params.get('distributed'):
+                cmd.append('--distributed')
 
+            description = f"Dataset: {dataset['name']} | Build graph | Params: {params}"
+
+            # # 如果该组合已经建图过，后续任务都应该直接 load（传 --graph_path）
+            # if params.get('reduce'):
+            #     description = f"Dataset: {dataset['name']} | Build graph | Params: {params}"
+            # else:
+            #     if key in built_graph_keys:
+            #         # 直接加载已经存在的 graph
+            #         cmd += ["--graph_path", graph_path]
+            #         description = f"Dataset: {dataset['name']} | Load graph {graph_path} | Params: {params}"
+            #     else:
+            #         # 第一次遇到此 m/efc 组合时，创建 build 任务（不传 --graph_path），并标记已构建
+            #         built_graph_keys.add(key)
+            #         description = f"Dataset: {dataset['name']} | Build graph (first time) | Params: {params}"
+            
             tasks.append((cmd, description))
 
     total_experiments = len(tasks)
@@ -142,17 +156,23 @@ def run_batch():
     print(f"Total experiments to run: {total_experiments}")
 
     # --- 并行执行配置 ---
-    MAX_WORKERS = 256  # 设置并行数量
+    MAX_WORKERS = 1  # 设置并行数量
     print(f"Parallel Workers: {MAX_WORKERS}")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = []
+    if MAX_WORKERS > 1:
+        print("Running tasks in parallel...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = []
+            for i, (cmd, desc) in enumerate(tasks):
+                # 提交任务到线程池
+                futures.append(executor.submit(run_worker, cmd, i + 1, total_experiments, desc))
+
+            # 等待所有任务完成
+            concurrent.futures.wait(futures)
+    else:
+        print("Running tasks sequentially...")
         for i, (cmd, desc) in enumerate(tasks):
-            # 提交任务到线程池
-            futures.append(executor.submit(run_worker, cmd, i + 1, total_experiments, desc))
-        
-        # 等待所有任务完成
-        concurrent.futures.wait(futures)
+            run_worker(cmd, i + 1, total_experiments, desc)
 
 if __name__ == "__main__":
     run_batch()

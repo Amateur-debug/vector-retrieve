@@ -3,6 +3,7 @@ import argparse
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import json
+import re
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize Vector Retrieval Results")
@@ -18,7 +19,11 @@ if __name__ == "__main__":
     parser.add_argument("--limited_level", type=int, default=5, help="Level limit for HNSW")
     parser.add_argument("--node_num", type=int, default=None, help="Number of cluster nodes")
     parser.add_argument("--partition_mode", type=str, default="k-means", help="Data partition mode across nodes")
-    parser.add_argument("--redundancy", type=int, default=1, help="Redundancy level for data replication across nodes")
+    parser.add_argument("--redundancy", type=int, default=0, help="Redundancy level for data replication across nodes")
+    parser.add_argument("--threads", type=int, default=1, help="Number of query threads")
+    parser.add_argument("--reduce", action='store_true', help="Enable ghreduce mode (independent graphs per node)")
+    parser.add_argument("--distributed", action='store_true', help="Enable distributed mode")
+    parser.add_argument("--plot_type", type=str, default="line", help="Type of plot for query results (line or scatter)")
 
     args = parser.parse_args()
 
@@ -45,7 +50,96 @@ if __name__ == "__main__":
             return data['cluster_params'][key] 
         return None
 
-    plt.figure(figsize=(10, 6))
+    # 新增函数：从文件名中解析参数
+    def parse_filename_params(filename):
+        """从结果文件名中解析参数，返回参数字典"""
+        # 文件名格式: results-{data_name}-m{m}-efc{ef_construction}-efs{ef_search}-ll{limited_level}-node{node_num}-{partition_mode}-red{redundancy}-threads{threads}-...
+        params = {}
+        
+        # 提取数据名称
+        match = re.search(r'results-([a-z]+?)-m', filename)
+        if match:
+            params['data_name'] = match.group(1)
+        
+        # 提取 m
+        match = re.search(r'-m(\d+)-', filename)
+        if match:
+            params['m'] = int(match.group(1))
+        
+        # 提取 efc (ef_construction)
+        match = re.search(r'-efc(\d+)-', filename)
+        if match:
+            params['ef_construction'] = int(match.group(1))
+        
+        # 提取 efs (ef_search)
+        match = re.search(r'-efs(\d+)-', filename)
+        if match:
+            params['ef_search'] = int(match.group(1))
+        
+        # 提取 ll (limited_level)
+        match = re.search(r'-ll(\d+)-', filename)
+        if match:
+            params['limited_level'] = int(match.group(1))
+        
+        # 提取 node_num
+        match = re.search(r'-node(\d+)-', filename)
+        if match:
+            params['node_num'] = int(match.group(1))
+        
+        # 提取 partition_mode
+        match = re.search(r'-node\d+-([a-z_-]+)-red', filename)
+        if match:
+            params['partition_mode'] = match.group(1)
+        
+        # 提取 redundancy_level
+        match = re.search(r'-red(\d+)', filename)
+        if match:
+            params['redundancy'] = int(match.group(1))
+        
+        # 提取 threads
+        match = re.search(r'-threads(\d+)', filename)
+        if match:
+            params['threads'] = int(match.group(1))
+        
+        # 检查 reduce 模式 (文件名中含有 "reduce")
+        params['reduce'] = 'reduce' in filename
+        
+        # 检查 distributed 模式 (文件名中含有 "distributed")
+        params['distributed'] = 'distributed' in filename
+        
+        return params
+
+    # 新增函数：根据参数筛选文件
+    def find_matching_file(directory, target_params):
+        """从目录中找到匹配参数的第一个 JSON 文件"""
+        if not os.path.isdir(directory):
+            return None
+        
+        for filename in sorted(os.listdir(directory)):
+            if not filename.endswith('.json'):
+                continue
+            
+            file_params = parse_filename_params(filename)
+            
+            # 检查所有指定的参数是否匹配
+            match = True
+            for key, value in target_params.items():
+                # 只有当用户指定了参数（value 不为 None）才进行匹配
+                if value is None:
+                    continue
+                
+                # 精确匹配
+                file_value = file_params.get(key)
+                if file_value != value:
+                    match = False
+                    break
+            
+            if match:
+                return os.path.join(directory, filename)
+        
+        return None
+
+    plt.figure(figsize=(20, 6))
     
     # --- 1. Merge 模式: 比较不同参数下的汇总指标 ---
     if args.merge:
@@ -118,11 +212,34 @@ if __name__ == "__main__":
     
     # --- 2. 非 Merge 模式: 查看单次实验中每次查询的详细数据 ---
     else:
+        json_file = args.json_path
+        
+        # 如果输入是目录，则根据参数自动筛选文件
         if os.path.isdir(args.json_path):
-            print("Error: In non-merge mode, json_path must be a file.")
-            exit(1)
+            target_params = {
+                'data_name': args.data_name,
+                'm': args.m,
+                'ef_construction': args.ef_construction,
+                'ef_search': args.ef_search,
+                'limited_level': args.limited_level,
+                'node_num': args.node_num,
+                'partition_mode': args.partition_mode,
+                'redundancy': args.redundancy,
+                'threads': args.threads,
+                'reduce': args.reduce,
+                'distributed': args.distributed
+            }
             
-        data = load_json(args.json_path)
+            json_file = find_matching_file(args.json_path, target_params)
+            
+            if json_file is None:
+                print("Error: No matching JSON file found with the specified parameters.")
+                print(f"Target parameters: {target_params}")
+                exit(1)
+            
+            print(f"Found matching file: {json_file}")
+        
+        data = load_json(json_file)
         
         # 获取详细数据字典 (例如 recall, remote_transfer_cnt)
         raw_y_data = data.get(args.y)
@@ -141,7 +258,11 @@ if __name__ == "__main__":
                 x_vals = [item[0] for item in sorted_items]
                 y_vals = [item[1] for item in sorted_items]
                 
-                plt.plot(x_vals, y_vals, marker='.', linestyle='-', linewidth=0.5, markersize=2, label=os.path.basename(args.json_path))
+                if args.plot_type == "scatter":
+                    plt.scatter(x_vals, y_vals, alpha=0.6, s=20, label=os.path.basename(json_file))
+                else:  # line plot (default)
+                    plt.plot(x_vals, y_vals, marker='.', linestyle='-', linewidth=0.5, markersize=2, label=os.path.basename(json_file))
+                
                 plt.xlabel("Query Index (nth query)")
                 plt.title(f"{args.y} per Query")
             else:
@@ -159,11 +280,15 @@ if __name__ == "__main__":
             f"{args.x}-{args.y}-{args.data_name}-"
             f"m{args.m}-efc{args.ef_construction}-efs{args.ef_search}-ll{args.limited_level}-"
             + (f"node{args.node_num}-" if args.node_num is not None else "")
-            + f"{args.partition_mode}-red{args.redundancy}.pdf"
+            + f"{args.partition_mode}-red{args.redundancy}"
+            + (f"-threads{args.threads}" if args.threads is not None else "")
+            + ("-reduce" if args.reduce else "")
+            + ("-distributed" if args.distributed else "")
+            + ".pdf"
         )
     else:
-        base = os.path.splitext(os.path.basename(args.json_path))[0]
-        output_filename = f"{base}_{args.y}.pdf"
+        base = os.path.splitext(os.path.basename(json_file))[0]
+        output_filename = f"{args.y}-{base}.pdf"
 
     output_path = os.path.join(args.output_dir, output_filename)
     plt.savefig(output_path)

@@ -14,9 +14,14 @@ using namespace std;
 template <typename T>
 struct Payload {
     bool continue_search = false;   // 是否是跳转来的继续搜索
+    int origin_node_id = -1;        // 链式转发时的入口节点（由最终节点回传结果）
     int require_id = -1;            // 下一步需要的节点/向量ID 
     int start_level = -1;           // 继续跳转时的起始层级
     int entry_point_id = -1;        // 继续跳转时的入口点 
+    int remote_transfer_cnt = 0;
+    double remote_transfer_latency = 0.0;     // 总延迟(毫秒)
+    double send_timestamp = 0.0;    // 发送时间戳(毫秒)
+    int distance_cnt = 0;        // 计算距离次数
 
     Visited visited;
 
@@ -31,6 +36,7 @@ struct Payload {
         visited.clear();
         candidates = decltype(candidates)();
         results = decltype(results)();
+        send_timestamp = 0.0;
     }
 
     // 估算当前 Payload 的大小 (bits)，用于计算网络延迟

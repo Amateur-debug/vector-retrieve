@@ -45,6 +45,17 @@ public:
         }
     }
 
+    std::vector<int> to_vector() const {
+        std::vector<int> vec;
+        vec.reserve(visited_count);
+        for (size_t i = 0; i < visited_epoch.size(); ++i) {
+            if (visited_epoch[i] == cur_epoch) {
+                vec.push_back(static_cast<int>(i));
+            }
+        }
+        return vec;
+    }
+
     std::size_t size() const { return visited_count; }
 
     std::uint64_t capacity_bytes() const {

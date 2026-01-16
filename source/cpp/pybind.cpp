@@ -17,6 +17,11 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_property_readonly("size_bits", &Payload<float>::size_bits)
         .def_readwrite("require_id", &Payload<float>::require_id)
         .def_readwrite("continue_search", &Payload<float>::continue_search)
+        .def_readwrite("origin_node_id", &Payload<float>::origin_node_id)
+        .def_readwrite("remote_transfer_cnt", &Payload<float>::remote_transfer_cnt)
+        .def_readwrite("remote_transfer_latency", &Payload<float>::remote_transfer_latency)
+        .def_readwrite("send_timestamp", &Payload<float>::send_timestamp)
+        .def_readwrite("distance_cnt", &Payload<float>::distance_cnt)
         .def_readwrite("results", &Payload<float>::results)
         .def("topk_ids", &Payload<float>::topk_ids, py::arg("k"));
 
@@ -26,6 +31,11 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_property_readonly("size_bits", &Payload<double>::size_bits)
         .def_readwrite("require_id", &Payload<double>::require_id)
         .def_readwrite("continue_search", &Payload<double>::continue_search)
+        .def_readwrite("origin_node_id", &Payload<double>::origin_node_id)
+        .def_readwrite("remote_transfer_cnt", &Payload<double>::remote_transfer_cnt)
+        .def_readwrite("remote_transfer_latency", &Payload<double>::remote_transfer_latency)
+        .def_readwrite("send_timestamp", &Payload<double>::send_timestamp)
+        .def_readwrite("distance_cnt", &Payload<double>::distance_cnt)
         .def_readwrite("results", &Payload<double>::results)
         .def("topk_ids", &Payload<double>::topk_ids, py::arg("k"));
 
@@ -43,10 +53,11 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("vectors", &HNSWGraph<float>::vectors)
         .def_readwrite("neighbors", &HNSWGraph<float>::neighbors)
         .def_readwrite("entry_point_id", &HNSWGraph<float>::entry_point_id)
-        .def("add_vector", &HNSWGraph<float>::add_vector, py::arg("vid"), py::arg("vec"))
-        .def("query", &HNSWGraph<float>::query)
+        .def("add_vector", &HNSWGraph<float>::add_vector, py::arg("vid"), py::arg("vec"),
+             py::call_guard<py::gil_scoped_release>())  // 释放GIL，允许真正的多线程并行
+        .def("query", &HNSWGraph<float>::query, py::call_guard<py::gil_scoped_release>())
         .def("save", &HNSWGraph<float>::save, py::arg("filepath"))
-        .def_static("load", &HNSWGraph<float>::load, py::arg("filepath"));
+        .def_static("load", &HNSWGraph<float>::load, py::arg("filepath"), py::return_value_policy::take_ownership);
 
     // 绑定 HNSWGraph 类（double 版本）
     py::class_<HNSWGraph<double>>(m, "HNSWGraphDouble")
@@ -62,33 +73,54 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("vectors", &HNSWGraph<double>::vectors)
         .def_readwrite("neighbors", &HNSWGraph<double>::neighbors)
         .def_readwrite("entry_point_id", &HNSWGraph<double>::entry_point_id)
-        .def("add_vector", &HNSWGraph<double>::add_vector, py::arg("vid"), py::arg("vec"))
-        .def("query", &HNSWGraph<double>::query)
+        .def("add_vector", &HNSWGraph<double>::add_vector, py::arg("vid"), py::arg("vec"),
+             py::call_guard<py::gil_scoped_release>())  // 释放GIL，允许真正的多线程并行
+        .def("query", &HNSWGraph<double>::query, py::call_guard<py::gil_scoped_release>())
         .def("save", &HNSWGraph<double>::save, py::arg("filepath"))
-        .def_static("load", &HNSWGraph<double>::load, py::arg("filepath"));
+        .def_static("load", &HNSWGraph<double>::load, py::arg("filepath"), py::return_value_policy::take_ownership);
 
     // 绑定 Node 类（float 版本）
     py::class_<Node<float>>(m, "NodeFloat")
-        .def(py::init<int, Cluster<float> *, HNSWGraph<float> *>(),
-             py::arg("node_id"), py::arg("cluster"), py::arg("local_hnsw"))
+        .def(py::init<int, Cluster<float> *, HNSWGraph<float> *, bool, unsigned int>(),
+             py::arg("node_id"), py::arg("cluster"), py::arg("local_hnsw"), py::arg("is_remote_node") = false, py::arg("num_worker") = 1)
         .def_readwrite("node_id", &Node<float>::node_id)
         .def_readwrite("num_queries", &Node<float>::num_queries)
+        .def_readwrite("is_remote_node", &Node<float>::is_remote_node)
+        .def_readwrite("num_worker", &Node<float>::num_worker)
+        .def_readwrite("ip_addr", &Node<float>::ip_addr)
+        .def_readwrite("port", &Node<float>::port)
+        .def_readwrite("local_hnsw", &Node<float>::local_hnsw)
+        .def("start_server", &Node<float>::start_server)
         .def("reset", &Node<float>::reset)
         .def("query", &Node<float>::query,
-             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k") = 10);
+             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k") = 10,
+             py::call_guard<py::gil_scoped_release>())
+        .def("add_vector", &Node<float>::add_vector,
+             py::arg("vid"), py::arg("vec"),
+             py::call_guard<py::gil_scoped_release>());
 
     // 绑定 Node 类（double 版本）
     py::class_<Node<double>>(m, "NodeDouble")
-        .def(py::init<int, Cluster<double> *, HNSWGraph<double> *>(),
-             py::arg("node_id"), py::arg("cluster"), py::arg("local_hnsw"))
+        .def(py::init<int, Cluster<double> *, HNSWGraph<double> *, bool, unsigned int>(),
+             py::arg("node_id"), py::arg("cluster"), py::arg("local_hnsw"), py::arg("is_remote_node") = false, py::arg("num_worker") = 1)
         .def_readwrite("node_id", &Node<double>::node_id)
         .def_readwrite("num_queries", &Node<double>::num_queries)
+        .def_readwrite("is_remote_node", &Node<double>::is_remote_node)
+        .def_readwrite("num_worker", &Node<double>::num_worker)
+        .def_readwrite("ip_addr", &Node<double>::ip_addr)
+        .def_readwrite("port", &Node<double>::port)
+        .def_readwrite("local_hnsw", &Node<double>::local_hnsw)
+        .def("start_server", &Node<double>::start_server)
         .def("reset", &Node<double>::reset)
         .def("query", &Node<double>::query,
-             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k") = 10);
+             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k") = 10,
+             py::call_guard<py::gil_scoped_release>())
+        .def("add_vector", &Node<double>::add_vector,
+             py::arg("vid"), py::arg("vec"),
+             py::call_guard<py::gil_scoped_release>());
 
     // 绑定 Cluster 类（float 版本）
-    py::class_<Cluster<float>>(m, "ClusterFloat")
+    py::class_<Cluster<float>, std::unique_ptr<Cluster<float>>>(m, "ClusterFloat")
         .def(py::init<HNSWGraph<float> *, int>(),
              py::arg("hnsw"), py::arg("node_num") = 4)
         .def_property_readonly("nodes", [](Cluster<float> &c)
@@ -104,19 +136,35 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("outer_ring_max_iterations", &Cluster<float>::outer_ring_max_iterations)
         .def_readwrite("redundancy_level", &Cluster<float>::redundancy_level)
         .def_readwrite("redundancy_num", &Cluster<float>::redundancy_num)
-        .def_readwrite("remote_transfer_cnt", &Cluster<float>::remote_transfer_cnt)
-        .def_readwrite("remote_transfer_latency", &Cluster<float>::remote_transfer_latency)
+        .def_readwrite("is_distributed", &Cluster<float>::is_distributed)
+        .def_readwrite("is_reduce", &Cluster<float>::is_reduce)
         .def("reset", &Cluster<float>::reset)
+        .def("add_vector", &Cluster<float>::add_vector,
+             py::arg("vid"), py::arg("vec"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("query", &Cluster<float>::query,
+             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k"),
+             py::call_guard<py::gil_scoped_release>())
         .def_static("kmeans", &Cluster<float>::kmeans,
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123)
         .def("outer_ring", &Cluster<float>::outer_ring)
         .def("partition", &Cluster<float>::partition,
              py::arg("mode"), py::arg("redundancy") = 1)
+        .def("set_node_info", &Cluster<float>::set_node_info,
+             py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
+        .def("start_node_server", &Cluster<float>::start_node_server,
+             py::arg("node_id"))
+        .def("join_node_server", &Cluster<float>::join_node_server,
+             py::arg("node_id"))
         .def("transfer_to_remote", &Cluster<float>::transfer_to_remote,
-             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k"));
+             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k"))
+        .def("save", &Cluster<float>::save, py::arg("filepath"))
+        .def_static("load", [](const std::string &filepath) {
+            return std::unique_ptr<Cluster<float>>(Cluster<float>::load(filepath));
+        }, py::arg("filepath"));
 
     // 绑定 Cluster 类（double 版本）
-    py::class_<Cluster<double>>(m, "ClusterDouble")
+    py::class_<Cluster<double>, std::unique_ptr<Cluster<double>>>(m, "ClusterDouble")
         .def(py::init<HNSWGraph<double> *, int>(),
              py::arg("hnsw"), py::arg("node_num") = 4)
         .def_property_readonly("nodes", [](Cluster<double> &c)
@@ -132,14 +180,30 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("outer_ring_max_iterations", &Cluster<double>::outer_ring_max_iterations)
         .def_readwrite("redundancy_level", &Cluster<double>::redundancy_level)
         .def_readwrite("redundancy_num", &Cluster<double>::redundancy_num)
-        .def_readwrite("remote_transfer_cnt", &Cluster<double>::remote_transfer_cnt)
-        .def_readwrite("remote_transfer_latency", &Cluster<double>::remote_transfer_latency)
+        .def_readwrite("is_distributed", &Cluster<double>::is_distributed)
+        .def_readwrite("is_reduce", &Cluster<double>::is_reduce)
         .def("reset", &Cluster<double>::reset)
+        .def("add_vector", &Cluster<double>::add_vector,
+             py::arg("vid"), py::arg("vec"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("query", &Cluster<double>::query,
+             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k"),
+             py::call_guard<py::gil_scoped_release>())
         .def_static("kmeans", &Cluster<double>::kmeans,
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123)
         .def("outer_ring", &Cluster<double>::outer_ring)
         .def("partition", &Cluster<double>::partition,
              py::arg("mode"), py::arg("redundancy") = 1)
+        .def("set_node_info", &Cluster<double>::set_node_info,
+             py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
+        .def("start_node_server", &Cluster<double>::start_node_server,
+             py::arg("node_id"))
+        .def("join_node_server", &Cluster<double>::join_node_server,
+             py::arg("node_id"))
         .def("transfer_to_remote", &Cluster<double>::transfer_to_remote,
-             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k"));
+             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k"))
+        .def("save", &Cluster<double>::save, py::arg("filepath"))
+        .def_static("load", [](const std::string &filepath) {
+            return std::unique_ptr<Cluster<double>>(Cluster<double>::load(filepath));
+        }, py::arg("filepath"));
 }
