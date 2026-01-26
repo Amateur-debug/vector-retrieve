@@ -133,6 +133,7 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("node_num", &Cluster<float>::node_num)
         .def_readwrite("bandwidth", &Cluster<float>::bandwidth)
         .def_readwrite("partition_mode", &Cluster<float>::partition_mode)
+        .def_readwrite("layer_config", &Cluster<float>::layer_config)
         .def_readwrite("outer_ring_max_iterations", &Cluster<float>::outer_ring_max_iterations)
         .def_readwrite("redundancy_level", &Cluster<float>::redundancy_level)
         .def_readwrite("redundancy_num", &Cluster<float>::redundancy_num)
@@ -149,7 +150,7 @@ PYBIND11_MODULE(vector_retrieve, m)
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123)
         .def("outer_ring", &Cluster<float>::outer_ring)
         .def("partition", &Cluster<float>::partition,
-             py::arg("mode"), py::arg("redundancy") = 1)
+             py::arg("mode"), py::arg("redundancy") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin")
         .def("set_node_info", &Cluster<float>::set_node_info,
              py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
         .def("start_node_server", &Cluster<float>::start_node_server,
@@ -177,6 +178,7 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("node_num", &Cluster<double>::node_num)
         .def_readwrite("bandwidth", &Cluster<double>::bandwidth)
         .def_readwrite("partition_mode", &Cluster<double>::partition_mode)
+        .def_readwrite("layer_config", &Cluster<double>::layer_config)
         .def_readwrite("outer_ring_max_iterations", &Cluster<double>::outer_ring_max_iterations)
         .def_readwrite("redundancy_level", &Cluster<double>::redundancy_level)
         .def_readwrite("redundancy_num", &Cluster<double>::redundancy_num)
@@ -193,7 +195,7 @@ PYBIND11_MODULE(vector_retrieve, m)
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123)
         .def("outer_ring", &Cluster<double>::outer_ring)
         .def("partition", &Cluster<double>::partition,
-             py::arg("mode"), py::arg("redundancy") = 1)
+             py::arg("mode"), py::arg("redundancy") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin")
         .def("set_node_info", &Cluster<double>::set_node_info,
              py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
         .def("start_node_server", &Cluster<double>::start_node_server,

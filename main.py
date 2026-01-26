@@ -82,10 +82,10 @@ def read_ivecs(filename, c_contiguous=True):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="HNSW Vector Retrieval")
-    parser.add_argument("--data_name", type=str, default="sift", help="Name of the dataset")
-    parser.add_argument("--data_path", type=str, default="/home/CONNECT/xchen740/workspace/vector-retrieve/dataset/sift/sift_base.fvecs", help="Path to base vectors file")
-    parser.add_argument("--query_path", type=str, default="/home/CONNECT/xchen740/workspace/vector-retrieve/dataset/sift/sift_query.fvecs", help="Path to query vectors file")
-    parser.add_argument("--groundtruth_path", type=str, default="/home/CONNECT/xchen740/workspace/vector-retrieve/dataset/sift/sift_groundtruth.ivecs", help="Path to groundtruth file")
+    parser.add_argument("--data_name", type=str, default="siftsmall", help="Name of the dataset")
+    parser.add_argument("--data_path", type=str, default="/home/CONNECT/xchen740/workspace/vector-retrieve/dataset/siftsmall/siftsmall_base.fvecs", help="Path to base vectors file")
+    parser.add_argument("--query_path", type=str, default="/home/CONNECT/xchen740/workspace/vector-retrieve/dataset/siftsmall/siftsmall_query.fvecs", help="Path to query vectors file")
+    parser.add_argument("--groundtruth_path", type=str, default="/home/CONNECT/xchen740/workspace/vector-retrieve/dataset/siftsmall/siftsmall_groundtruth.ivecs", help="Path to groundtruth file")
     parser.add_argument("--graph_path", type=str, default=None, help="Path to save/load the graph")
     parser.add_argument("--cluster_path", type=str, default=None, help="Path to save/load the cluster")
     parser.add_argument("--k", type=int, default=10, help="Number of nearest neighbors to retrieve")
@@ -94,7 +94,9 @@ if __name__ == "__main__":
     parser.add_argument("--ef_search", type=int, default=16, help="Size of the dynamic candidate list for search")
     parser.add_argument("--limited_level", type=int, default=5, help="Level limit for HNSW")
     parser.add_argument("--node_num", type=int, default=6, help="Number of cluster nodes")
-    parser.add_argument("--partition_mode", type=str, default="round_robin", help="Data partition mode across nodes")
+    parser.add_argument("--partition_mode", type=str, default="k-means", help="Data partition mode across nodes")
+    parser.add_argument("--layer", action='store_true', default=False, help="Enable layer-based partitioning")
+    parser.add_argument("--layer_config", type=str, default="{}", help="Layer configuration in JSON format")
     parser.add_argument("--redundancy", type=int, default=1, help="Redundancy level for data replication across nodes")
     parser.add_argument("--distributed", default=False, action='store_true', help="Enable distributed mode")
     parser.add_argument("--reduce", default=False, action='store_true', help="Enable reduce mode (independent graphs per node)")
@@ -227,6 +229,19 @@ if __name__ == "__main__":
     ef_search = args.ef_search
     limited_level = args.limited_level
     partition_mode = args.partition_mode
+    use_layer = args.layer
+    # 解析 JSON 字符串并确保键为 int 类型
+    # layer_config = {int(k): v for k, v in json.loads(args.layer_config).items()}
+    
+    # 直接在代码中定义 layer_config 字典
+    layer_config = {
+        0: [2],
+        1: [2],
+        2: [0, 1],
+        3: [0, 1],
+        4: [3, 4]
+    }
+    
     redundancy = args.redundancy
 
     if cluster_path is not None and os.path.exists(cluster_path):
@@ -249,7 +264,10 @@ if __name__ == "__main__":
             cluster.start_node_server(host_id)
 
         start_time = time.time()
-        cluster.partition(mode=partition_mode, redundancy=redundancy)
+        if use_layer:
+            cluster.partition(mode="layer", redundancy=redundancy, layer_config=layer_config, layer_partition_mode=partition_mode)
+        else:
+            cluster.partition(mode=partition_mode, redundancy=redundancy, layer_config=layer_config)
         partition_time = time.time() - start_time
         print(f"Partitioning Time: {partition_time:.4f} seconds.")
     else:
@@ -422,7 +440,10 @@ if __name__ == "__main__":
             print("Partitioning data across cluster nodes...")
 
             start_time = time.time()
-            cluster.partition(mode=partition_mode, redundancy=redundancy)
+            if use_layer:
+                cluster.partition(mode="layer", redundancy=redundancy, layer_config=layer_config, layer_partition_mode=partition_mode)
+            else:
+                cluster.partition(mode=partition_mode, redundancy=redundancy, layer_config=layer_config)
             partition_time = time.time() - start_time
             print(f"Partitioning Time: {partition_time:.4f} seconds.")
 
@@ -575,6 +596,11 @@ if __name__ == "__main__":
         "is_distributed": cluster.is_distributed,
         "is_reduce": cluster.is_reduce,
     }
+    
+    if cluster.partition_mode == "layer":
+        cluster_params["layer_partition_mode"] = partition_mode
+        cluster_params["layer_config"] = layer_config
+
     stats = {
         "hnsw_params": hnsw_params,
         "cluster_params": cluster_params,
@@ -601,10 +627,12 @@ if __name__ == "__main__":
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     distributed_suffix = "-distributed" if args.distributed else ""
     reduce_suffix = "-reduce" if args.reduce else ""
+    layer_suffix = "-layer" if use_layer else ""
+
     results_path = (f"{results_dir}/results-{data_name}-m{m}-"
                     f"efc{ef_construction}-efs{ef_search}-ll{limited_level}-"
                     f"node{node_num}-{partition_mode}-red{redundancy}-"
-                    f"threads{num_query_threads}{reduce_suffix}{distributed_suffix}.json")
+                    f"threads{num_query_threads}{distributed_suffix}{reduce_suffix}{layer_suffix}.json")
 
     with open(results_path, 'w') as f:
         json.dump(stats, f, indent=4)

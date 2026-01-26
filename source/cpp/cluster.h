@@ -424,6 +424,8 @@ public:
 
     // 分区模式
     std::string partition_mode;
+    std::unordered_map<int, std::vector<int>> layer_config;
+
     int outer_ring_max_iterations = 0;
 
     int redundancy_level = 0;
@@ -732,7 +734,7 @@ public:
         return (int)removed.size();
     }
 
-    void partition(const string &mode, int redundancy = 1)
+    void partition(const string &mode, int redundancy = 1, const std::unordered_map<int, std::vector<int>> &layer_config = {}, const std::string &layer_partition_mode = "round_robin")
     {
         partition_mode = mode;
         redundancy_level = redundancy;
@@ -785,6 +787,110 @@ public:
                 if (removed_cnt == 0 || removed_add_ratio < 0.001)
                     break;
                 removed_cnt_before = removed_cnt;
+            }
+        }
+        else if (mode == "layer")
+        {
+            this->layer_config = layer_config;
+
+            // 初始化路由表
+            for (const auto &kv : vectors)
+            {
+                vector_node_map[kv.first] = 0;
+            }
+
+            for (const auto &level_kv : neighbors)
+            {
+                int level = level_kv.first;
+                std::vector<int> target_nodes;
+
+                if (layer_config.count(level))
+                {
+                    target_nodes = layer_config.at(level);
+                }
+                else
+                {
+                    // 默认分配给所有节点
+                    for (int i = 0; i < node_num; i++)
+                        target_nodes.push_back(i);
+                }
+
+                if (target_nodes.empty())
+                    continue;
+
+                // 计算层内分区策略 (如 KMeans)
+                std::unordered_map<int, int> vid_partition_map;
+                if (layer_partition_mode == "k-means" && target_nodes.size() > 1)
+                {
+                    // 收集当前层的所有向量构建子集
+                    std::unordered_map<int, std::vector<T>> subset_vectors;
+                    std::vector<int> subset_ids;
+                    int sub_cnt = 0;
+                    for (const auto &node_kv : level_kv.second)
+                    {
+                        int vid = node_kv.first;
+                        if (vectors.count(vid))
+                        {
+                            subset_vectors[sub_cnt] = vectors.at(vid);
+                            subset_ids.push_back(vid);
+                            sub_cnt++;
+                        }
+                    }
+
+                    if (sub_cnt > 0)
+                    {
+                        // 执行 KMeans (k 为目标节点数)
+                        int k = std::min((int)target_nodes.size(), sub_cnt);
+                        auto labels = kmeans(subset_vectors, k, 100, hnsw->seed);
+                        for (int i = 0; i < sub_cnt; i++)
+                        {
+                            vid_partition_map[subset_ids[i]] = labels[i];
+                        }
+                    }
+                }
+
+                const auto &node_map = level_kv.second;
+                for (const auto &node_kv : node_map)
+                {
+                    int vid = node_kv.first;
+
+                    // 确定目标节点索引
+                    int target_idx = 0;
+                    if (!vid_partition_map.empty() && vid_partition_map.count(vid))
+                    {
+                        target_idx = vid_partition_map.at(vid);
+                    }
+                    else
+                    {
+                        // 默认层内 Round Robin 分配
+                        target_idx = vid % target_nodes.size();
+                    }
+
+                    // 边界检查
+                    if (target_idx < 0 || target_idx >= (int)target_nodes.size()) target_idx = 0;
+
+                    int target_node = target_nodes[target_idx];
+
+                    if (target_node >= 0 && target_node < node_num)
+                    {
+                        // 复制向量数据
+                        if (vectors.count(vid)) {
+                            local_vectors[target_node][vid] = vectors.at(vid);
+                        }
+                        
+                        // 路由表优先依据第0层
+                        if (level == 0)
+                        {
+                            vector_node_map[vid] = target_node;
+                        }
+                    }
+                }
+            }
+            
+            // 修正 entry_point 的路由，指向最高层所在的节点
+            if (layer_config.count(max_level) && !layer_config.at(max_level).empty()) {
+                int target_node = layer_config.at(max_level)[hnsw->entry_point_id % layer_config.at(max_level).size()];
+                vector_node_map[hnsw->entry_point_id] = target_node;
             }
         }
 
