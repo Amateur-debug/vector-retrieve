@@ -48,7 +48,13 @@ enum MessageType
     MSG_INIT_GRAPH = 1,
     MSG_ADD_VECTOR = 2,
     MSG_QUERY = 3,
-    MSG_SEARCH_RESULT = 4  // 异步查询结果回传
+    MSG_SEARCH_RESULT = 4,  // 异步查询结果回传
+    MSG_PARTITION = 5,
+    MSG_LOAD_CLUSTER = 6,
+    MSG_LOAD_HNSW = 7,
+    MSG_GET_INFORMATION = 8,
+    MSG_SAVE_CLUSTER = 9,
+    MSG_SAVE_HNSW = 10
 };
 
 // Buffer helper for serialization
@@ -81,6 +87,16 @@ public:
         }
     }
 
+    void write_string(const std::string &str)
+    {
+        uint64_t size = (uint64_t)str.size();
+        write_val(size);
+        if (size > 0)
+        {
+            write(str.data(), size);
+        }
+    }
+
     void read(void *ptr, size_t size)
     {
         if (read_pos + size > data.size())
@@ -107,6 +123,18 @@ public:
             read(vec.data(), size * sizeof(U));
         }
         return vec;
+    }
+
+    std::string read_string()
+    {
+        uint64_t size = read_val<uint64_t>();
+        if (size == 0)
+            return std::string();
+        if (read_pos + size > data.size())
+            throw std::runtime_error("Buffer underflow");
+        std::string str(data.data() + read_pos, data.data() + read_pos + size);
+        read_pos += size;
+        return str;
     }
 };
 
@@ -270,25 +298,56 @@ HNSWGraph<T> *deserialize_hnsw(Buffer &buf)
     return hnsw;
 }
 
-void serialize_routing(Buffer &buf, const std::unordered_map<int, int> &map)
+void serialize_routing(Buffer &buf, const std::vector<std::unordered_map<int, int>> &maps)
 {
-    buf.write_val((uint64_t)map.size());
-    for (const auto &kv : map)
+    buf.write_val((uint64_t)maps.size());
+    for (const auto &map : maps)
     {
-        buf.write_val(kv.first);
-        buf.write_val(kv.second);
+        buf.write_val((uint64_t)map.size());
+        for (const auto &kv : map)
+        {
+            buf.write_val(kv.first);
+            buf.write_val(kv.second);
+        }
     }
 }
 
-void deserialize_routing(Buffer &buf, std::unordered_map<int, int> &map)
+void deserialize_routing(Buffer &buf, std::vector<std::unordered_map<int, int>> &maps)
+{
+    uint64_t levels = buf.read_val<uint64_t>();
+    maps.clear();
+    maps.resize(levels);
+    for (uint64_t l = 0; l < levels; ++l)
+    {
+        uint64_t size = buf.read_val<uint64_t>();
+        for (uint64_t i = 0; i < size; ++i)
+        {
+            int k = buf.read_val<int>();
+            int v = buf.read_val<int>();
+            maps[l][k] = v;
+        }
+    }
+}
+
+void serialize_layer_config(Buffer &buf, const std::unordered_map<int, std::vector<int>> &layer_config)
+{
+    buf.write_val((uint64_t)layer_config.size());
+    for (const auto &kv : layer_config)
+    {
+        buf.write_val(kv.first);
+        buf.write_vec(kv.second);
+    }
+}
+
+void deserialize_layer_config(Buffer &buf, std::unordered_map<int, std::vector<int>> &layer_config)
 {
     uint64_t size = buf.read_val<uint64_t>();
-    map.clear();
+    layer_config.clear();
     for (uint64_t i = 0; i < size; ++i)
     {
-        int k = buf.read_val<int>();
-        int v = buf.read_val<int>();
-        map[k] = v;
+        int level = buf.read_val<int>();
+        std::vector<int> nodes = buf.read_vec<int>();
+        layer_config[level] = std::move(nodes);
     }
 }
 
@@ -345,8 +404,7 @@ public:
     std::thread server_thread;
     std::atomic<bool> stop_server{false};
 
-    unsigned int num_worker = 0;
-    std::atomic<int> active_handlers{0};  // 追踪活跃的 handle_client 线程数
+    std::atomic<int> active_handlers{0};
 
     // 异步查询结果等待
     struct PendingQuery {
@@ -362,8 +420,8 @@ public:
     void send_result_to_origin(int query_id, const std::vector<int>& results, Payload<T>& payload);
     void wait_for_async_result(int query_id, std::vector<int>& results, Payload<T>& payload);
 
-    Node(int node_id, Cluster<T> *cluster, HNSWGraph<T> *local_hnsw = nullptr, bool is_remote_node = false, unsigned int num_worker = 1)
-        : node_id(node_id), cluster(cluster), local_hnsw(local_hnsw), is_remote_node(is_remote_node), num_worker(num_worker)
+    Node(int node_id, Cluster<T> *cluster, HNSWGraph<T> *local_hnsw = nullptr, bool is_remote_node = false)
+        : node_id(node_id), cluster(cluster), local_hnsw(local_hnsw), is_remote_node(is_remote_node)
     {
         port = 9500 + node_id;
     }
@@ -377,8 +435,7 @@ public:
         : node_id(other.node_id), cluster(other.cluster), local_hnsw(other.local_hnsw),
           num_queries(other.num_queries), is_remote_node(other.is_remote_node),
           sockfd(other.sockfd), sock_addr(other.sock_addr), ip_addr(std::move(other.ip_addr)),
-          port(other.port), server_thread(std::move(other.server_thread)), stop_server(other.stop_server.load()),
-          num_worker(other.num_worker)
+          port(other.port), server_thread(std::move(other.server_thread)), stop_server(other.stop_server.load())
     {
         other.sockfd = -1;
         other.local_hnsw = nullptr;
@@ -416,8 +473,8 @@ public:
     // 节点集合
     std::vector<Node<T>> nodes;
 
-    // 向量 -> 主节点路由
-    std::unordered_map<int, int> vector_node_map;
+    // 向量 -> 主节点路由（按层）
+    std::vector<std::unordered_map<int, int>> vector_node_map;
 
     // 模拟网络带宽 Mb/s
     double bandwidth = 1000.0;
@@ -542,6 +599,7 @@ public:
     }
 
     // 简单 KMeans 实现（欧氏距离）
+    // 返回值：与 data 迭代顺序一致的 label 数组（labels[i] 对应 data 第 i 个元素）
     static std::vector<int> kmeans(const std::unordered_map<int, vector<T>> &data,
                                    int k, int max_iters = 100, int seed = 123)
     {
@@ -550,19 +608,25 @@ public:
         if (n == 0 || k <= 0)
             return labels;
 
-        int dim = (int)data.at(0).size();
+        // 将 unordered_map 转为连续数组，避免用整数 key 当下标访问
+        std::vector<const std::vector<T>*> ptrs;
+        ptrs.reserve(n);
+        for (const auto &kv : data)
+            ptrs.push_back(&kv.second);
+
+        int dim = (int)ptrs[0]->size();
         std::mt19937 rng(seed);
 
         // 初始化：随机选 k 个质心
         std::vector<vector<T>> centers;
         centers.reserve(k);
         std::unordered_set<int> chosen;
-        std::uniform_int_distribution<int> uid(0, n);
+        std::uniform_int_distribution<int> uid(0, n - 1);
         while ((int)centers.size() < k)
         {
             int idx = uid(rng);
             if (chosen.insert(idx).second)
-                centers.push_back(data.at(idx));
+                centers.push_back(*ptrs[idx]);
         }
 
         for (int iter = 0; iter < max_iters; iter++)
@@ -575,7 +639,7 @@ public:
                 int best_center = 0;
                 for (int j = 0; j < (int)centers.size(); j++)
                 {
-                    T dist = distance(data.at(i), centers[j]);
+                    T dist = distance(*ptrs[i], centers[j]);
 
                     if (dist < best_dist)
                     {
@@ -601,7 +665,7 @@ public:
                 counts[current_id]++;
                 for (int j = 0; j < dim; j++)
                 {
-                    sums[current_id][j] += data.at(i).at(j);
+                    sums[current_id][j] += (*ptrs[i])[j];
                 }
             }
             for (int j = 0; j < k; j++)
@@ -616,7 +680,7 @@ public:
                 else
                 {
                     // 重新随机选一个点作为质心
-                    centers[j] = data.at(uid(rng));
+                    centers[j] = *ptrs[uid(rng)];
                 }
             }
         }
@@ -636,7 +700,7 @@ public:
                 const auto &neighbor_set = hnsw->neighbors[0][vid];
                 for (int nid : neighbor_set)
                 {
-                    if (vector_node_map[nid] != node_id)
+                    if (vector_node_map[0][nid] != node_id)
                     {
                         cross_cnt++;
                     }
@@ -691,7 +755,7 @@ public:
             const auto &neighbor_set = hnsw->neighbors[0][vid];
             for (int nid : neighbor_set)
             {
-                int neighbor_node = vector_node_map[nid];
+                int neighbor_node = vector_node_map[0][nid];
                 if (local_vectors[neighbor_node].count(nid))
                     counts[neighbor_node]++;
             }
@@ -728,7 +792,7 @@ public:
             }
             // 将向量数据放回到选定节点
             local_vectors[best_node][vid] = hnsw->vectors[vid];
-            vector_node_map[vid] = best_node;
+            vector_node_map[0][vid] = best_node;
         }
 
         return (int)removed.size();
@@ -747,35 +811,45 @@ public:
         // local_vectors: node_id -> map<vid, vector<T>>
         vector<unordered_map<int, vector<T>>> local_vectors(node_num);
 
+        vector_node_map.clear();
+        if (mode == "layer")
+            vector_node_map.resize(max_level + 1);
+        else
+            vector_node_map.resize(1);
+
         if (mode == "round_robin")
         {
             for (const auto &kv : vectors)
             {
                 int vid = kv.first;
                 int target = vid % node_num;
-                vector_node_map[vid] = target;
+                vector_node_map[0][vid] = target;
                 local_vectors[target][vid] = kv.second;
             }
         }
         else if (mode == "k-means")
         {
             auto labels = kmeans(hnsw->vectors, node_num, 100, hnsw->seed);
-            for (size_t vid = 0; vid < hnsw->vectors.size(); vid++)
+            int idx = 0;
+            for (const auto &kv : hnsw->vectors)
             {
-                int target = labels[vid];
-                vector_node_map[vid] = target;
-                local_vectors[target][vid] = vectors[vid];
+                int vid = kv.first;
+                int target = labels[idx++];
+                vector_node_map[0][vid] = target;
+                local_vectors[target][vid] = kv.second;
             }
         }
         else if (mode == "outer_ring")
         {
             // 先用 k-means 分配
             auto labels = kmeans(hnsw->vectors, node_num, 100, hnsw->seed);
-            for (size_t vid = 0; vid < hnsw->vectors.size(); vid++)
+            int idx = 0;
+            for (const auto &kv : hnsw->vectors)
             {
-                int target = labels[vid];
-                vector_node_map[vid] = target;
-                local_vectors[target][vid] = vectors[vid];
+                int vid = kv.first;
+                int target = labels[idx++];
+                vector_node_map[0][vid] = target;
+                local_vectors[target][vid] = kv.second;
             }
 
             // 挑选边界向量，重新分配（迭代，支持提前停止）
@@ -793,10 +867,10 @@ public:
         {
             this->layer_config = layer_config;
 
-            // 初始化路由表
+            // 初始化路由表（先给第 0 层占位）
             for (const auto &kv : vectors)
             {
-                vector_node_map[kv.first] = 0;
+                vector_node_map[0][kv.first] = 0;
             }
 
             for (const auto &level_kv : neighbors)
@@ -822,34 +896,33 @@ public:
                 std::unordered_map<int, int> vid_partition_map;
                 if (layer_partition_mode == "k-means" && target_nodes.size() > 1)
                 {
-                    // 收集当前层的所有向量构建子集
+                    // 收集当前层的所有向量构建子集（key 使用真实 vid）
                     std::unordered_map<int, std::vector<T>> subset_vectors;
-                    std::vector<int> subset_ids;
-                    int sub_cnt = 0;
                     for (const auto &node_kv : level_kv.second)
                     {
                         int vid = node_kv.first;
                         if (vectors.count(vid))
-                        {
-                            subset_vectors[sub_cnt] = vectors.at(vid);
-                            subset_ids.push_back(vid);
-                            sub_cnt++;
-                        }
+                            subset_vectors[vid] = vectors.at(vid);
                     }
 
+                    int sub_cnt = (int)subset_vectors.size();
                     if (sub_cnt > 0)
                     {
                         // 执行 KMeans (k 为目标节点数)
                         int k = std::min((int)target_nodes.size(), sub_cnt);
                         auto labels = kmeans(subset_vectors, k, 100, hnsw->seed);
-                        for (int i = 0; i < sub_cnt; i++)
+                        // kmeans() 内部用 for(const auto &kv : data) 迭代，
+                        // 此处用相同顺序遍历 subset_vectors 来对齐 labels
+                        int i = 0;
+                        for (const auto &kv : subset_vectors)
                         {
-                            vid_partition_map[subset_ids[i]] = labels[i];
+                            vid_partition_map[kv.first] = labels[i++];
                         }
                     }
                 }
 
                 const auto &node_map = level_kv.second;
+                LOG_DEBUG_STREAM("[layer partition] level=" << level << " vids=" << node_map.size() << " target_nodes=[" << [&]{ std::string s; for(int n:target_nodes) s+=std::to_string(n)+","; return s; }() << "]");
                 for (const auto &node_kv : node_map)
                 {
                     int vid = node_kv.first;
@@ -878,11 +951,8 @@ public:
                             local_vectors[target_node][vid] = vectors.at(vid);
                         }
                         
-                        // 路由表优先依据第0层
-                        if (level == 0)
-                        {
-                            vector_node_map[vid] = target_node;
-                        }
+                        // 路由表按层记录
+                        vector_node_map[level][vid] = target_node;
                     }
                 }
             }
@@ -890,11 +960,12 @@ public:
             // 修正 entry_point 的路由，指向最高层所在的节点
             if (layer_config.count(max_level) && !layer_config.at(max_level).empty()) {
                 int target_node = layer_config.at(max_level)[hnsw->entry_point_id % layer_config.at(max_level).size()];
-                vector_node_map[hnsw->entry_point_id] = target_node;
+                vector_node_map[max_level][hnsw->entry_point_id] = target_node;
             }
         }
 
         // redundancy: 将邻居复制到本地
+        // layer 模式：只在节点被分配的层内复制同层邻居，避免跨层链式扩散
         if (redundancy > 0)
         {
             for (int r = 0; r < redundancy; r++)
@@ -903,22 +974,53 @@ public:
                 vector<unordered_map<int, vector<T>>> updates(node_num);
                 for (const auto &level_kv : neighbors)
                 {
-                    // level_kv: level -> map<vid, vector<int>>
+                    int level = level_kv.first;
+                    // layer 模式下，当前层有路由表才继续；否则跳过（节点未被分配该层）
+                    const std::unordered_map<int, int> *route_map = nullptr;
+                    if (mode == "layer")
+                    {
+                        if (level < 0 || level >= (int)vector_node_map.size())
+                            continue;
+                        route_map = &vector_node_map[level];
+                    }
+
                     for (const auto &neighbor_kv : level_kv.second)
                     {
                         int vid = neighbor_kv.first;
                         const auto &neighbor_set = neighbor_kv.second;
-                        for (int node_id = 0; node_id < node_num; node_id++)
+
+                        if (mode == "layer")
                         {
-                            if (local_vectors[node_id].count(vid))
+                            // layer 模式：只对"路由表显示该层主节点为 node_id"的 vid 做复制
+                            auto it = route_map->find(vid);
+                            if (it == route_map->end())
+                                continue;
+                            int node_id = it->second;
+                            for (int neighbor_id : neighbor_set)
                             {
-                                for (int neighbor_id : neighbor_set)
+                                if (!local_vectors[node_id].count(neighbor_id) &&
+                                    !updates[node_id].count(neighbor_id) &&
+                                    vectors.count(neighbor_id))
                                 {
-                                    if (!local_vectors[node_id].count(neighbor_id))
+                                    updates[node_id][neighbor_id] = vectors.at(neighbor_id);
+                                    redundancy_num++;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // 非 layer 模式：原有逻辑，持有 vid 的节点复制其邻居
+                            for (int node_id = 0; node_id < node_num; node_id++)
+                            {
+                                if (local_vectors[node_id].count(vid))
+                                {
+                                    for (int neighbor_id : neighbor_set)
                                     {
-                                        if (!updates[node_id].count(neighbor_id))
+                                        if (!local_vectors[node_id].count(neighbor_id) &&
+                                            !updates[node_id].count(neighbor_id) &&
+                                            vectors.count(neighbor_id))
                                         {
-                                            updates[node_id][neighbor_id] = vectors[neighbor_id];
+                                            updates[node_id][neighbor_id] = vectors.at(neighbor_id);
                                             redundancy_num++;
                                         }
                                     }
@@ -935,9 +1037,19 @@ public:
             }
         }
 
+        // 打印各节点分到的向量数
+        for (int i = 0; i < node_num; i++)
+            LOG_DEBUG_STREAM("[partition] node " << i << " local_vectors=" << local_vectors[i].size());
+
         // 为每个 node 创建 local_hnsw（浅拷贝/新实例），并设置 vectors/neighbors/entrypoint/max_level
         for (int i = 0; i < node_num; i++)
         {
+            // 释放旧的 local_hnsw（避免重复 partition 时内存泄漏）
+            if (nodes[i].local_hnsw != nullptr && nodes[i].local_hnsw != hnsw)
+            {
+                delete nodes[i].local_hnsw;
+                nodes[i].local_hnsw = nullptr;
+            }
             HNSWGraph<T> *local_hnsw = new HNSWGraph<T>(hnsw->dim, hnsw->m, hnsw->ef_construction, hnsw->ef_search, hnsw->limited_level, hnsw->seed);
             local_hnsw->max_level = max_level;
             local_hnsw->vectors = local_vectors[i];
@@ -1177,7 +1289,25 @@ public:
         payload.remote_transfer_cnt += 1;
 
         int require_id = payload.require_id;
-        int target_node_id = vector_node_map[require_id];
+        int route_level = payload.start_level;
+        if (route_level < 0 || route_level >= (int)vector_node_map.size())
+            route_level = 0;
+
+        int target_node_id = 0;
+        if (!vector_node_map.empty())
+        {
+            auto it = vector_node_map[route_level].find(require_id);
+            if (it != vector_node_map[route_level].end())
+            {
+                target_node_id = it->second;
+            }
+            else if (route_level != 0)
+            {
+                auto it0 = vector_node_map[0].find(require_id);
+                if (it0 != vector_node_map[0].end())
+                    target_node_id = it0->second;
+            }
+        }
 
         Node<T> &target_node = nodes[target_node_id];
 
@@ -1270,13 +1400,33 @@ public:
             j["is_reduce"] = is_reduce;
             j["add_round_robin_counter"] = add_round_robin_counter;
 
-            // 保存 vector_node_map
-            json jmap = json::object();
-            for (const auto &kv : vector_node_map)
+            // 保存 vector_node_map（layer: 多层；非 layer: 仅第0层）
+            if (partition_mode == "layer")
             {
-                jmap[std::to_string(kv.first)] = kv.second;
+                json jmaps = json::array();
+                for (const auto &level_map : vector_node_map)
+                {
+                    json jmap = json::object();
+                    for (const auto &kv : level_map)
+                    {
+                        jmap[std::to_string(kv.first)] = kv.second;
+                    }
+                    jmaps.push_back(std::move(jmap));
+                }
+                j["vector_node_map"] = std::move(jmaps);
             }
-            j["vector_node_map"] = std::move(jmap);
+            else
+            {
+                json jmap = json::object();
+                if (!vector_node_map.empty())
+                {
+                    for (const auto &kv : vector_node_map[0])
+                    {
+                        jmap[std::to_string(kv.first)] = kv.second;
+                    }
+                }
+                j["vector_node_map"] = std::move(jmap);
+            }
 
             // 保存主 HNSW 图
             string hnsw_path = filepath + ".hnsw.json";
@@ -1381,14 +1531,37 @@ public:
         cluster->is_reduce = j.value("is_reduce", false);
         cluster->add_round_robin_counter = j.value("add_round_robin_counter", 0);
 
-        // 加载 vector_node_map
+        // 加载 vector_node_map（layer: 多层；非 layer: 仅第0层）
         if (j.contains("vector_node_map"))
         {
-            for (auto const &kv : j["vector_node_map"].items())
+            cluster->vector_node_map.clear();
+            if (cluster->partition_mode == "layer")
             {
-                int vid = std::stoi(kv.key());
-                int node_id = kv.value().get<int>();
-                cluster->vector_node_map[vid] = node_id;
+                if (!j["vector_node_map"].is_array())
+                    throw std::runtime_error("vector_node_map format error for layer mode");
+                cluster->vector_node_map.resize(j["vector_node_map"].size());
+                for (size_t l = 0; l < j["vector_node_map"].size(); l++)
+                {
+                    const auto &jmap = j["vector_node_map"][l];
+                    for (auto const &kv : jmap.items())
+                    {
+                        int vid = std::stoi(kv.key());
+                        int node_id = kv.value().get<int>();
+                        cluster->vector_node_map[l][vid] = node_id;
+                    }
+                }
+            }
+            else
+            {
+                if (!j["vector_node_map"].is_object())
+                    throw std::runtime_error("vector_node_map format error for non-layer mode");
+                cluster->vector_node_map.resize(1);
+                for (auto const &kv : j["vector_node_map"].items())
+                {
+                    int vid = std::stoi(kv.key());
+                    int node_id = kv.value().get<int>();
+                    cluster->vector_node_map[0][vid] = node_id;
+                }
             }
         }
 
@@ -1519,29 +1692,10 @@ void Node<T>::tcp_server_loop()
             continue;
         }
 
-        // 防止高并发时 recv_all/send_all 永久阻塞：为每个连接设置读写超时
-        {
-            struct timeval tv;
-            tv.tv_sec = 2;
-            tv.tv_usec = 0;
-            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        }
-
         // int buf = 4 * 1024 * 1024;
         // setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
         // setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
 
-        // 限制并发线程数,避免线程爆炸
-        if (num_worker > 0)
-        {
-            while (active_handlers.load() >= (int)num_worker)
-            {
-                LOG_DEBUG_STREAM("[Node " << node_id << "] waiting for idle threads");
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        }
-        
         std::thread(&Node<T>::handle_client, this, client_fd).detach();
     }
 }
@@ -1590,7 +1744,9 @@ void Node<T>::handle_client(int client_fd)
 
             LOG_DEBUG_STREAM("[Node " << node_id << "] MSG_SEARCH query " << query_id << " returned, results.size=" << results.size() << ", continue_search=" << payload.continue_search << ", transfer_cnt=" << payload.remote_transfer_cnt);
 
+            active_handlers--;
             close_connection_hard(client_fd);
+            return;
         }
         else if (msg_type == MSG_INIT_GRAPH)
         {
@@ -1624,14 +1780,28 @@ void Node<T>::handle_client(int client_fd)
             int vid = buf.read_val<int>();
             std::vector<T> vec = buf.read_vec<T>();
 
-            if (local_hnsw == nullptr)
+            if (cluster && !cluster->is_reduce)
             {
-                local_hnsw = new HNSWGraph<T>(
-                    cluster->hnsw->dim, cluster->hnsw->m, cluster->hnsw->ef_construction,
-                    cluster->hnsw->ef_search, cluster->hnsw->limited_level, cluster->hnsw->seed);
+                if (cluster->hnsw)
+                {
+                    cluster->hnsw->add_vector(vid, vec);
+                }
+                else
+                {
+                    LOG_DEBUG_STREAM("Local cluster hnsw is null, cannot add vector");
+                }
             }
+            else
+            {
+                if (local_hnsw == nullptr)
+                {
+                    local_hnsw = new HNSWGraph<T>(
+                        cluster->hnsw->dim, cluster->hnsw->m, cluster->hnsw->ef_construction,
+                        cluster->hnsw->ef_search, cluster->hnsw->limited_level, cluster->hnsw->seed);
+                }
 
-            local_hnsw->add_vector(vid, vec);
+                local_hnsw->add_vector(vid, vec);
+            }
 
             // Send ACK back
             char ack = 1;
@@ -1649,21 +1819,15 @@ void Node<T>::handle_client(int client_fd)
             Payload<T> payload;
             deserialize_payload(buf, payload);
 
-            // 本地查询，不跨节点
-
             std::vector<pair<T, int>> results;
-            if (local_hnsw)
-            {
-                payload.continue_search = false;
-                local_hnsw->query(query_vector, payload, k);
+            this->query(query_id, query_vector, payload, k);
 
-                // 从payload.results中获取带距离的结果
-                auto pq = payload.results;
-                while (!pq.empty())
-                {
-                    results.push_back(pq.top());
-                    pq.pop();
-                }  
+            // 从payload.results中获取带距离的结果
+            auto pq = payload.results;
+            while (!pq.empty())
+            {
+                results.push_back(pq.top());
+                pq.pop();
             }
             LOG_DEBUG_STREAM("[Node " << node_id << "] MSG_QUERY: results.size=" << results.size());
 
@@ -1682,6 +1846,197 @@ void Node<T>::handle_client(int client_fd)
             send_all(client_fd, resp_buf.data.data(), resp_size);
             // MSG_QUERY 需要可靠回包，使用正常 FIN 关闭，避免 RST 导致对端 recv_all 卡死
             close_connection_soft(client_fd);
+        }
+        else if (msg_type == MSG_PARTITION)
+        {
+            std::string mode = buf.read_string();
+            int redundancy = buf.read_val<int>();
+            std::unordered_map<int, std::vector<int>> layer_config;
+            std::string layer_partition_mode = "round_robin";
+            if (mode == "layer")
+            {
+                deserialize_layer_config(buf, layer_config);
+                layer_partition_mode = buf.read_string();
+            }
+
+            if (cluster)
+            {
+                cluster->partition(mode, redundancy, layer_config, layer_partition_mode);
+            }
+
+            // 发送 ACK
+            char ack = 1;
+            send_all(client_fd, &ack, 1);
+            // Partition 结束后使用 FIN 关闭，避免客户端 recv_all 因 RST 失败
+            close_connection_soft(client_fd);
+        }
+        else if (msg_type == MSG_LOAD_CLUSTER)
+        {
+            std::string filepath = buf.read_string();
+            bool ok = false;
+            if (cluster)
+            {
+                Cluster<T> *loaded = nullptr;
+                try
+                {
+                    loaded = Cluster<T>::load(filepath);
+                }
+                catch (...)
+                {
+                    loaded = nullptr;
+                }
+
+                if (loaded && loaded->node_num == cluster->node_num)
+                {
+                    cluster->bandwidth = loaded->bandwidth;
+                    cluster->partition_mode = loaded->partition_mode;
+                    cluster->outer_ring_max_iterations = loaded->outer_ring_max_iterations;
+                    cluster->redundancy_level = loaded->redundancy_level;
+                    cluster->redundancy_num = loaded->redundancy_num;
+                    cluster->is_distributed = loaded->is_distributed;
+                    cluster->is_reduce = loaded->is_reduce;
+                    cluster->add_round_robin_counter = loaded->add_round_robin_counter;
+                    cluster->vector_node_map = std::move(loaded->vector_node_map);
+                    cluster->layer_config = std::move(loaded->layer_config);
+
+                    if (cluster->hnsw && cluster->hnsw != loaded->hnsw)
+                    {
+                        delete cluster->hnsw;
+                    }
+                    cluster->hnsw = loaded->hnsw;
+                    loaded->hnsw = nullptr;
+
+                    for (int i = 0; i < cluster->node_num && i < (int)loaded->nodes.size(); i++)
+                    {
+                        cluster->nodes[i].num_queries = loaded->nodes[i].num_queries;
+                        cluster->nodes[i].is_remote_node = loaded->nodes[i].is_remote_node;
+                        cluster->nodes[i].ip_addr = loaded->nodes[i].ip_addr;
+                        cluster->nodes[i].port = loaded->nodes[i].port;
+
+                        if (cluster->nodes[i].local_hnsw != nullptr && cluster->nodes[i].local_hnsw != cluster->hnsw)
+                        {
+                            delete cluster->nodes[i].local_hnsw;
+                        }
+                        cluster->nodes[i].local_hnsw = loaded->nodes[i].local_hnsw;
+                        loaded->nodes[i].local_hnsw = nullptr;
+                    }
+
+                    ok = true;
+                }
+
+                if (loaded)
+                {
+                    delete loaded;
+                }
+            }
+            char ack = ok ? 1 : 0;
+            send_all(client_fd, &ack, 1);
+            close_connection_hard(client_fd);
+        }
+        else if (msg_type == MSG_LOAD_HNSW)
+        {
+            std::string filepath = buf.read_string();
+            bool ok = false;
+            if (cluster)
+            {
+                HNSWGraph<T> *loaded_hnsw = nullptr;
+                try
+                {
+                    loaded_hnsw = HNSWGraph<T>::load(filepath);
+                }
+                catch (...)
+                {
+                    loaded_hnsw = nullptr;
+                }
+
+                if (loaded_hnsw)
+                {
+                    if (cluster->hnsw && cluster->hnsw != loaded_hnsw)
+                    {
+                        delete cluster->hnsw;
+                    }
+                    cluster->hnsw = loaded_hnsw;
+
+                    ok = true;
+                }
+            }
+            char ack = ok ? 1 : 0;
+            send_all(client_fd, &ack, 1);
+            close_connection_hard(client_fd);
+        }
+        else if (msg_type == MSG_SAVE_HNSW)
+        {
+            std::string filepath = buf.read_string();
+            bool ok = false;
+            if (cluster && cluster->hnsw)
+            {
+                try
+                {
+                    cluster->hnsw->save(filepath);
+                    ok = true;
+                }
+                catch (...) {}
+            }
+            char ack = ok ? 1 : 0;
+            send_all(client_fd, &ack, 1);
+            close_connection_hard(client_fd);
+        }
+        else if (msg_type == MSG_GET_INFORMATION)
+        {
+            json info;
+            if (cluster)
+            {
+                json cj;
+                cj["node_num"] = cluster->node_num;
+                cj["bandwidth"] = cluster->bandwidth;
+                cj["partition_mode"] = cluster->partition_mode;
+                cj["redundancy_level"] = cluster->redundancy_level;
+                cj["redundancy_num"] = cluster->redundancy_num;
+                cj["is_distributed"] = cluster->is_distributed;
+                cj["is_reduce"] = cluster->is_reduce;
+                cj["layer_config"] = cluster->layer_config;
+                info["cluster"] = std::move(cj);
+
+                if (cluster->hnsw)
+                {
+                    json hj;
+                    hj["dim"] = cluster->hnsw->dim;
+                    hj["m"] = cluster->hnsw->m;
+                    hj["ef_construction"] = cluster->hnsw->ef_construction;
+                    hj["ef_search"] = cluster->hnsw->ef_search;
+                    hj["limited_level"] = cluster->hnsw->limited_level;
+                    hj["max_level"] = cluster->hnsw->max_level;
+                    info["hnsw"] = std::move(hj);
+                }
+                else
+                {
+                    info["hnsw"] = nullptr;
+                }
+            }
+            else
+            {
+                info["cluster"] = nullptr;
+                info["hnsw"] = nullptr;
+            }
+
+            std::string out = info.dump();
+            Buffer resp_buf;
+            resp_buf.write_string(out);
+            uint64_t resp_size = resp_buf.data.size();
+            send_all(client_fd, &resp_size, sizeof(uint64_t));
+            send_all(client_fd, resp_buf.data.data(), resp_size);
+            close_connection_soft(client_fd);
+        }
+        else if (msg_type == MSG_SAVE_CLUSTER)
+        {
+            std::string filepath = buf.read_string();
+            char ack = 0;
+            if (cluster)
+            {
+                ack = cluster->save(filepath) ? 1 : 0;
+            }
+            send_all(client_fd, &ack, 1);
+            close_connection_hard(client_fd);
         }
         else if (msg_type == MSG_SEARCH_RESULT)
         {
@@ -1907,7 +2262,7 @@ std::vector<int> Node<T>::query(int query_id, const vector<T> &query_vector, Pay
     {
         if (payload.continue_search)
         {
-            return cluster->transfer_to_remote(query_id, query_vector, payload, k);;
+            return cluster->transfer_to_remote(query_id, query_vector, payload, k);
         }
         else
         {

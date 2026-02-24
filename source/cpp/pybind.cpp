@@ -5,6 +5,7 @@
 #include "cluster.h"
 #include "hnsw.h"
 #include "payload.h"
+#include "sdk.h"
 
 namespace py = pybind11;
 
@@ -81,12 +82,11 @@ PYBIND11_MODULE(vector_retrieve, m)
 
     // 绑定 Node 类（float 版本）
     py::class_<Node<float>>(m, "NodeFloat")
-        .def(py::init<int, Cluster<float> *, HNSWGraph<float> *, bool, unsigned int>(),
-             py::arg("node_id"), py::arg("cluster"), py::arg("local_hnsw"), py::arg("is_remote_node") = false, py::arg("num_worker") = 1)
+        .def(py::init<int, Cluster<float> *, HNSWGraph<float> *, bool>(),
+             py::arg("node_id"), py::arg("cluster"), py::arg("local_hnsw"), py::arg("is_remote_node") = false)
         .def_readwrite("node_id", &Node<float>::node_id)
         .def_readwrite("num_queries", &Node<float>::num_queries)
         .def_readwrite("is_remote_node", &Node<float>::is_remote_node)
-        .def_readwrite("num_worker", &Node<float>::num_worker)
         .def_readwrite("ip_addr", &Node<float>::ip_addr)
         .def_readwrite("port", &Node<float>::port)
         .def_readwrite("local_hnsw", &Node<float>::local_hnsw)
@@ -101,12 +101,11 @@ PYBIND11_MODULE(vector_retrieve, m)
 
     // 绑定 Node 类（double 版本）
     py::class_<Node<double>>(m, "NodeDouble")
-        .def(py::init<int, Cluster<double> *, HNSWGraph<double> *, bool, unsigned int>(),
-             py::arg("node_id"), py::arg("cluster"), py::arg("local_hnsw"), py::arg("is_remote_node") = false, py::arg("num_worker") = 1)
+        .def(py::init<int, Cluster<double> *, HNSWGraph<double> *, bool>(),
+             py::arg("node_id"), py::arg("cluster"), py::arg("local_hnsw"), py::arg("is_remote_node") = false)
         .def_readwrite("node_id", &Node<double>::node_id)
         .def_readwrite("num_queries", &Node<double>::num_queries)
         .def_readwrite("is_remote_node", &Node<double>::is_remote_node)
-        .def_readwrite("num_worker", &Node<double>::num_worker)
         .def_readwrite("ip_addr", &Node<double>::ip_addr)
         .def_readwrite("port", &Node<double>::port)
         .def_readwrite("local_hnsw", &Node<double>::local_hnsw)
@@ -208,4 +207,74 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_static("load", [](const std::string &filepath) {
             return std::unique_ptr<Cluster<double>>(Cluster<double>::load(filepath));
         }, py::arg("filepath"));
+
+    // 绑定 ClusterSDKClient 类（float 版本）
+    py::class_<ClusterSDKClient<float>>(m, "ClusterSDKClientFloat")
+        .def(py::init<const std::string &, int, int>(),
+             py::arg("ip") = "127.0.0.1", py::arg("port") = 19000, py::arg("timeout") = 5)
+        .def("connect", &ClusterSDKClient<float>::connect)
+        .def("disconnect", &ClusterSDKClient<float>::disconnect)
+        .def("is_connected", &ClusterSDKClient<float>::is_connected)
+        .def("add_vector", &ClusterSDKClient<float>::add_vector,
+             py::arg("vid"), py::arg("vec"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("query", &ClusterSDKClient<float>::query,
+             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k") = 10,
+             py::call_guard<py::gil_scoped_release>())
+        .def("partition", &ClusterSDKClient<float>::partition,
+             py::arg("mode"), py::arg("redundancy") = 1,
+             py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
+             py::arg("layer_partition_mode") = "round_robin",
+             py::call_guard<py::gil_scoped_release>())
+        .def("load_cluster", &ClusterSDKClient<float>::load_cluster,
+             py::arg("filepath"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("save_cluster", &ClusterSDKClient<float>::save_cluster,
+             py::arg("filepath"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("load_hnsw", &ClusterSDKClient<float>::load_hnsw,
+             py::arg("filepath"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("save_hnsw", &ClusterSDKClient<float>::save_hnsw,
+             py::arg("filepath"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("get_information", [](ClusterSDKClient<float> &client) {
+            py::module_ json = py::module_::import("json");
+            return json.attr("loads")(client.get_information());
+        });
+
+    // 绑定 ClusterSDKClient 类（double 版本）
+    py::class_<ClusterSDKClient<double>>(m, "ClusterSDKClientDouble")
+        .def(py::init<const std::string &, int, int>(),
+             py::arg("ip") = "127.0.0.1", py::arg("port") = 19000, py::arg("timeout") = 5)
+        .def("connect", &ClusterSDKClient<double>::connect)
+        .def("disconnect", &ClusterSDKClient<double>::disconnect)
+        .def("is_connected", &ClusterSDKClient<double>::is_connected)
+        .def("add_vector", &ClusterSDKClient<double>::add_vector,
+             py::arg("vid"), py::arg("vec"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("query", &ClusterSDKClient<double>::query,
+             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k") = 10,
+             py::call_guard<py::gil_scoped_release>())
+        .def("partition", &ClusterSDKClient<double>::partition,
+             py::arg("mode"), py::arg("redundancy") = 1,
+             py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
+             py::arg("layer_partition_mode") = "round_robin",
+             py::call_guard<py::gil_scoped_release>())
+        .def("load_cluster", &ClusterSDKClient<double>::load_cluster,
+             py::arg("filepath"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("save_cluster", &ClusterSDKClient<double>::save_cluster,
+             py::arg("filepath"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("load_hnsw", &ClusterSDKClient<double>::load_hnsw,
+             py::arg("filepath"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("save_hnsw", &ClusterSDKClient<double>::save_hnsw,
+             py::arg("filepath"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("get_information", [](ClusterSDKClient<double> &client) {
+            py::module_ json = py::module_::import("json");
+            return json.attr("loads")(client.get_information());
+        });
 }

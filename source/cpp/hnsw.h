@@ -472,6 +472,9 @@ public:
     }
 
     // 计算层级（需要外部加锁调用）
+    // 使用对数公式：level = floor(-ln(r) / ln(m))
+    // 各层累积数严格以 1/m 指数递减：P(level >= L) = (1/m)^L
+    // 例如 m=8, N=1e6: neighbors[0]=1e6, [1]=125000, [2]=15625, [3]=1953, [4]=244, [5]=30
     int random_level()
     {
         // 注意：调用者需要持有 rng_mutex
@@ -479,7 +482,7 @@ public:
         if (r == 0.0)
             r = std::numeric_limits<double>::min();
 
-        int level = static_cast<int>(-log(r) * (1.0 / log(static_cast<double>(m))));
+        int level = static_cast<int>(-log(r) / log(static_cast<double>(m)));
 
         if (limited_level >= 0)
             level = std::min(level, limited_level);

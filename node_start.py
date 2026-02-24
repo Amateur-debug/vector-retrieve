@@ -40,8 +40,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--distributed", default=False, action='store_true', help="Enable distributed mode")
     parser.add_argument("--reduce", default=False, action='store_true', help="Enable reduce mode (independent graphs per node)")
-    parser.add_argument("--cpus", type=int, default=0, help="Number of CPU cores to bind this worker process to (0=do not set)")
-    parser.add_argument("--num_workers", type=int, default=1, help="Number of worker threads for this node server")
+
 
     args = parser.parse_args()
 
@@ -71,15 +70,6 @@ if __name__ == "__main__":
     cluster = Cluster(hnsw, node_num)
     cluster.is_distributed = args.distributed
     cluster.is_reduce = args.reduce
-    
-    # If cpus specified, set affinity for this worker process
-    if args.cpus and args.cpus > 0:
-        try:
-            cpuset = set(range(args.cpus))
-            print(f"[Node {node_id}] Setting CPU affinity to {cpuset}")
-            os.sched_setaffinity(0, cpuset)
-        except Exception as e:
-            print(f"[Node {node_id}] Warning: failed to set CPU affinity: {e}")
 
     # Configure all nodes
     # 关键逻辑：每个机器上的 Cluster 对象都必须包含所有节点的信息
@@ -90,9 +80,6 @@ if __name__ == "__main__":
         port = 19000 + i
         cluster.set_node_info(i, ip, port, is_remote)
         print(f"[Node {node_id}] Configured Node {i}: IP={ip}, Port={port}, Remote={is_remote}")
-
-    cluster.nodes[node_id].num_worker = int(args.num_workers)
-    print(f"[Node {node_id}] Server num_worker set to {cluster.nodes[node_id].num_worker}")
 
     print(f"[Node {node_id}] Starting server...")
     cluster.start_node_server(node_id)
