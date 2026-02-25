@@ -148,15 +148,22 @@ public:
             Payload<T> payload;
             payload.entry_point_id = ep;
 
-            // 使用 ef_construction 搜索候选（不持锁，在 search_layer_ef 内部按需加锁）
-            search_layer_ef(vec, i, ef_construction, payload);
+            // 高于目标层时仅做 greedy 导航（ef=1），不建边
+            int ef = (i > level) ? 1 : ef_construction;
+            search_layer_ef(vec, i, ef, payload);
 
             const auto &topk = payload.topk_ids(1);
             ep = topk[0];
 
+            // 关键修复：节点只应出现在 [0..level]，更高层不插入
+            if (i > level)
+            {
+                continue;
+            }
+
             // 使用启发式算法从候选者中挑选邻居
             std::unordered_set<int> selected_neighbors = select_neighbors_heuristic(payload.results);
-            
+
             // 使用节点级别的锁更新邻居关系（减少锁竞争）
             {
                 std::unique_lock<std::shared_mutex> lock(neighbors_mutex);
@@ -202,7 +209,7 @@ public:
                     }
                 }
             }
-            
+
             // 步骤2: 批量读取所有邻居的连接状态（一次加锁）
             std::unordered_map<int, std::unordered_set<int>> all_connections;
             {
@@ -221,7 +228,7 @@ public:
                     }
                 }
             }
-            
+
             // 步骤3: 完全无锁计算所有更新决策
             std::unordered_map<int, std::pair<bool, int>> update_decisions;
             for (int neighbor_id : selected_neighbors)
@@ -229,7 +236,7 @@ public:
                 const auto &neighbor_connections = all_connections[neighbor_id];
                 bool should_add = false;
                 int to_remove = -1;
-                
+
                 if ((int)neighbor_connections.size() < m)
                 {
                     should_add = true;
@@ -239,7 +246,7 @@ public:
                     const auto &neighbor_vec = all_vecs[neighbor_id];
                     T max_dist = -1;
                     int furthest_id = -1;
-                    
+
                     for (int conn_id : neighbor_connections)
                     {
                         if (all_vecs.find(conn_id) != all_vecs.end())
@@ -252,7 +259,7 @@ public:
                             }
                         }
                     }
-                    
+
                     T new_dist = distance(neighbor_vec, all_vecs[vid]);
                     if (furthest_id != -1 && new_dist < max_dist)
                     {
@@ -260,10 +267,10 @@ public:
                         to_remove = furthest_id;
                     }
                 }
-                
+
                 update_decisions[neighbor_id] = {should_add, to_remove};
             }
-            
+
             // 步骤4: 批量更新所有邻居（一次加锁，快速完成）
             {
                 std::unique_lock<std::shared_mutex> write_lock(neighbors_mutex);
@@ -272,7 +279,7 @@ public:
                     int neighbor_id = kv.first;
                     bool should_add = kv.second.first;
                     int to_remove = kv.second.second;
-                    
+
                     if (should_add)
                     {
                         auto &conns = neighbors[i][neighbor_id];

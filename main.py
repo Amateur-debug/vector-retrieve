@@ -114,10 +114,10 @@ class VectorRetrieveRunner:
         self.use_layer = args.layer
 
         self.layer_config = {
-            0: [1, 3, 4],
-            1: [1, 3, 4],
-            2: [1, 3, 4],
-            3: [0],
+            0: [3, 4],
+            1: [0, 1],
+            2: [2],
+            3: [2],
             4: [2],
             5: [2]
         }
@@ -920,12 +920,12 @@ if __name__ == "__main__":
     parser.add_argument("--partition_mode", type=str, default="k-means", help="Data partition mode across nodes")
     parser.add_argument("--layer", action='store_true', default=False, help="Enable layer-based partitioning")
     parser.add_argument("--layer_config", type=str, default="{}", help="Layer configuration in JSON format")
-    parser.add_argument("--redundancy", type=int, default=1, help="Redundancy level for data replication across nodes")
+    parser.add_argument("--redundancy", type=int, default=0, help="Redundancy level for data replication across nodes")
     parser.add_argument("--distributed", default=False, action='store_true', help="Enable distributed mode")
     parser.add_argument("--reduce", default=False, action='store_true', help="Enable reduce mode (independent graphs per node)")
     parser.add_argument("--num_construction_threads", type=int, default=64, help="Number of threads for parallel graph construction (0=auto detect)")
-    parser.add_argument("--num_query_threads", type=int, default=8, help="Number of threads for querying (each thread does all queries)")
-    parser.add_argument("--num_cpu", type=int, default=0, help="Limit CPU cores per node process (0=unlimited)")
+    parser.add_argument("--num_query_threads", type=int, default=64, help="Number of threads for querying (each thread does all queries)")
+    parser.add_argument("--num_cpu", type=int, default=8, help="Limit CPU cores per node process (0=unlimited)")
     parser.add_argument("--save", action='store_true', default=False, help="Save the built graph to disk after construction")
 
     args = parser.parse_args(rest)

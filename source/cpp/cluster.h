@@ -922,7 +922,7 @@ public:
                 }
 
                 const auto &node_map = level_kv.second;
-                LOG_DEBUG_STREAM("[layer partition] level=" << level << " vids=" << node_map.size() << " target_nodes=[" << [&]{ std::string s; for(int n:target_nodes) s+=std::to_string(n)+","; return s; }() << "]");
+                LOG_INFO_STREAM("[layer partition] level=" << level << " vids=" << node_map.size() << " target_nodes=[" << [&]{ std::string s; for(int n:target_nodes) s+=std::to_string(n)+","; return s; }() << "]");
                 for (const auto &node_kv : node_map)
                 {
                     int vid = node_kv.first;
@@ -1039,7 +1039,7 @@ public:
 
         // 打印各节点分到的向量数
         for (int i = 0; i < node_num; i++)
-            LOG_DEBUG_STREAM("[partition] node " << i << " local_vectors=" << local_vectors[i].size());
+            LOG_INFO_STREAM("[partition] node " << i << " local_vectors=" << local_vectors[i].size());
 
         // 为每个 node 创建 local_hnsw（浅拷贝/新实例），并设置 vectors/neighbors/entrypoint/max_level
         for (int i = 0; i < node_num; i++)
