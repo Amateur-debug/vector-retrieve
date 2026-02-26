@@ -1,0 +1,3 @@
+[submodule "CoTra"]
+	path = CoTra
+	url = https://github.com/xiangyuzhi/CoTra

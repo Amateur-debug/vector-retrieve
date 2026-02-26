@@ -114,13 +114,27 @@ class VectorRetrieveRunner:
         self.use_layer = args.layer
 
         self.layer_config = {
-            0: [3, 4],
-            1: [0, 1],
-            2: [2],
-            3: [2],
-            4: [2],
-            5: [2]
+            0: [0, 1, 2, 3, 4],
+            1: [0, 1, 2, 3, 4],
+            2: [0, 1, 2, 3, 4],
+            3: [0, 1, 2, 3, 4],
+            4: [0, 1, 2, 3, 4],
+            5: [0, 1, 2, 3, 4]
         }
+        
+        self.layer_replicate_flags = [
+            False, False, True, True, True, True
+        ]
+        if hasattr(args, "layer_replicate_flags") and args.layer_replicate_flags:
+            try:
+                parsed_flags = json.loads(args.layer_replicate_flags)
+                if isinstance(parsed_flags, list):
+                    if len(parsed_flags) > 0:
+                        self.layer_replicate_flags = [bool(v) for v in parsed_flags]
+                else:
+                    print(f"Warning: --layer_replicate_flags should be a JSON list, fallback to default {self.layer_replicate_flags}")
+            except Exception as e:
+                print(f"Warning: failed to parse --layer_replicate_flags ({e}), fallback to default {self.layer_replicate_flags}")
 
         self.redundancy = args.redundancy
 
@@ -386,6 +400,7 @@ class VectorRetrieveRunner:
                             redundancy=self.redundancy,
                             layer_config=self.layer_config,
                             layer_partition_mode=self.partition_mode,
+                            layer_replicate_flags=self.layer_replicate_flags,
                         )
                     else:
                         print(f"Partitioning in {self.partition_mode} mode (redundancy={self.redundancy})...")
@@ -413,7 +428,7 @@ class VectorRetrieveRunner:
 
             start_time = time.time()
             if self.use_layer:
-                self.cluster.partition(mode="layer", redundancy=self.redundancy, layer_config=self.layer_config, layer_partition_mode=self.partition_mode)
+                self.cluster.partition(mode="layer", redundancy=self.redundancy, layer_config=self.layer_config, layer_partition_mode=self.partition_mode, layer_replicate_flags=self.layer_replicate_flags)
             else:
                 self.cluster.partition(mode=self.partition_mode, redundancy=self.redundancy, layer_config=self.layer_config)
             partition_time = time.time() - start_time
@@ -585,7 +600,7 @@ class VectorRetrieveRunner:
                 print("Partitioning data across cluster nodes...")
                 start_time = time.time()
                 if self.use_layer:
-                    self.cluster.partition(mode="layer", redundancy=self.redundancy, layer_config=self.layer_config, layer_partition_mode=self.partition_mode)
+                    self.cluster.partition(mode="layer", redundancy=self.redundancy, layer_config=self.layer_config, layer_partition_mode=self.partition_mode, layer_replicate_flags=self.layer_replicate_flags)
                 else:
                     self.cluster.partition(mode=self.partition_mode, redundancy=self.redundancy, layer_config=self.layer_config)
                 partition_time = time.time() - start_time
@@ -601,14 +616,14 @@ class VectorRetrieveRunner:
 
         print("Performing queries...")
 
-        # 分布式模式下保存本机连接信息，每个进程将创建自己的独立连接
+        # 分布式模式下，查询入口路由由 SDK 负责并进行一次性初始化。
         if self.args.distributed:
             if self.sdk_config is None:
                 self.sdk_config = {
                     'ip': "127.0.0.1",
                     'port': 19000 + self.host_id
                 }
-            print(f"Each worker will connect to local node {self.host_id} ({self.sdk_config['ip']}:{self.sdk_config['port']})...")
+            print("Distributed query entry nodes are initialized by SDK from cluster info.")
 
         def query(worker_id, stats_list):
             local_recall = {}
@@ -616,39 +631,47 @@ class VectorRetrieveRunner:
             local_remote_transfer_latency = {}
             local_distance_cnt = {}
 
-            # 每个进程创建自己的SDK客户端连接
+            # 每个进程创建独立的 SDK 客户端实例。
             thread_sdk_client = None
             if self.args.distributed:
                 thread_sdk_client = ClusterSDKClient(
                     ip=self.sdk_config['ip'],
                     port=self.sdk_config['port']
                 )
-                if not thread_sdk_client.connect():
-                    raise RuntimeError(f"Worker {worker_id} failed to connect to local node")
+                if self.use_layer:
+                    if not thread_sdk_client.init_routes():
+                        raise RuntimeError("Failed to initialize distributed query routes in SDK")
 
             try:
-                for i, query_vec in enumerate(queries[:self.num_queries]):
+                # 打乱查询顺序，每个线程使用不同的随机顺序
+                import random
+                query_indices = list(range(self.num_queries))
+                random.seed(worker_id)  # 每个线程使用不同的种子
+                random.shuffle(query_indices)
+                
+                for idx, i in enumerate(query_indices):
+                    query_vec = queries[i]
                     start_time = time.time()
 
                     payload = Payload()
                     if self.args.distributed:
-                        # 分布式模式：使用当前进程的SDK客户端通过TCP查询本机node_start
+                        # 分布式模式：通过当前进程的 SDK 客户端发起 TCP 查询。
                         results = thread_sdk_client.query(i + worker_id * self.num_queries, query_vec, payload, k=self.k)
                         results = set(results)
                         local_remote_transfer_cnt[i] = payload.remote_transfer_cnt
                         local_remote_transfer_latency[i] = payload.remote_transfer_latency
                         avg_remote_transfer_latency = (payload.remote_transfer_latency / payload.remote_transfer_cnt) if payload.remote_transfer_cnt > 0 else 0.0
                     else:
-                        # 非分布式模式
+                        # 非分布式模式。
                         if self.args.reduce:
-                            # Reduce模式：向所有节点查询并合并结果
+                            # Reduce 模式：向所有节点查询并聚合结果。
                             results = self.cluster.query(i + worker_id * self.num_queries, query_vec, payload, self.k)
                             results = set(results)
                             local_remote_transfer_cnt[i] = 0
                             local_remote_transfer_latency[i] = 0.0
                             avg_remote_transfer_latency = 0.0
                         else:
-                            # 传统模式：使用payload进行跨节点搜索
+                            # 常规模式：基于 payload 执行跨节点搜索。
                             results = self.cluster.nodes[self.host_id].query(i + worker_id * self.num_queries, query_vec, payload, k=self.k)
                             results = set(results)
                             local_remote_transfer_cnt[i] = payload.remote_transfer_cnt
@@ -659,10 +682,10 @@ class VectorRetrieveRunner:
 
                     query_time = time.time() - start_time
 
-                    # --- 召回率计算 ---
-                    # 从 groundtruth 数据中获取真实的最近邻 ID 集合
+                    # 召回率计算。
+                    # 从 groundtruth 中读取真实近邻 ID 集合。
                     true_ids = set(groundtruth[i][:self.k])
-                    # 计算两个集合的交集，即正确找到的邻居数量
+                    # 统计检索结果与真实结果的交集数量。
                     correct = len(results.intersection(true_ids))
                     local_recall[i] = correct / self.k
 
@@ -673,7 +696,7 @@ class VectorRetrieveRunner:
                     # print(f"  - Distance computations: {local_distance_cnt[i]}")
                     # print(f"  - Recall@{self.k}: {local_recall[i]:.4f}")
             finally:
-                # 每个进程查询完成后断开自己的连接
+                # 每个进程完成查询后主动释放连接。
                 if thread_sdk_client:
                     thread_sdk_client.disconnect()
 
@@ -920,7 +943,8 @@ if __name__ == "__main__":
     parser.add_argument("--partition_mode", type=str, default="k-means", help="Data partition mode across nodes")
     parser.add_argument("--layer", action='store_true', default=False, help="Enable layer-based partitioning")
     parser.add_argument("--layer_config", type=str, default="{}", help="Layer configuration in JSON format")
-    parser.add_argument("--redundancy", type=int, default=0, help="Redundancy level for data replication across nodes")
+    parser.add_argument("--layer_replicate_flags", type=str, default="[]", help="Layer replicate flags in JSON list; default behavior is [false,false,true,...] based on limited_level")
+    parser.add_argument("--redundancy", type=int, default=1, help="Redundancy level for data replication across nodes")
     parser.add_argument("--distributed", default=False, action='store_true', help="Enable distributed mode")
     parser.add_argument("--reduce", default=False, action='store_true', help="Enable reduce mode (independent graphs per node)")
     parser.add_argument("--num_construction_threads", type=int, default=64, help="Number of threads for parallel graph construction (0=auto detect)")
@@ -933,7 +957,7 @@ if __name__ == "__main__":
     runner = VectorRetrieveRunner(args, use_cpp)
     runner.setup_distributed_nodes()
     runner.prepare()
+    runner.save_graph()  # 建图完成后立即保存
     thread_stats, total_query_time, qps = runner.run_queries()
-    runner.save_graph()
     runner.save_results(thread_stats, total_query_time, qps)
     runner.cleanup_workers()

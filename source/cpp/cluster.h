@@ -298,7 +298,7 @@ HNSWGraph<T> *deserialize_hnsw(Buffer &buf)
     return hnsw;
 }
 
-void serialize_routing(Buffer &buf, const std::vector<std::unordered_map<int, int>> &maps)
+void serialize_routing(Buffer &buf, const std::vector<std::unordered_map<int, std::vector<int>>> &maps)
 {
     buf.write_val((uint64_t)maps.size());
     for (const auto &map : maps)
@@ -307,12 +307,12 @@ void serialize_routing(Buffer &buf, const std::vector<std::unordered_map<int, in
         for (const auto &kv : map)
         {
             buf.write_val(kv.first);
-            buf.write_val(kv.second);
+            buf.write_vec(kv.second);
         }
     }
 }
 
-void deserialize_routing(Buffer &buf, std::vector<std::unordered_map<int, int>> &maps)
+void deserialize_routing(Buffer &buf, std::vector<std::unordered_map<int, std::vector<int>>> &maps)
 {
     uint64_t levels = buf.read_val<uint64_t>();
     maps.clear();
@@ -323,8 +323,8 @@ void deserialize_routing(Buffer &buf, std::vector<std::unordered_map<int, int>> 
         for (uint64_t i = 0; i < size; ++i)
         {
             int k = buf.read_val<int>();
-            int v = buf.read_val<int>();
-            maps[l][k] = v;
+            std::vector<int> v = buf.read_vec<int>();
+            maps[l][k] = std::move(v);
         }
     }
 }
@@ -348,6 +348,28 @@ void deserialize_layer_config(Buffer &buf, std::unordered_map<int, std::vector<i
         int level = buf.read_val<int>();
         std::vector<int> nodes = buf.read_vec<int>();
         layer_config[level] = std::move(nodes);
+    }
+}
+
+void serialize_layer_replicate_flags(Buffer &buf, const std::vector<bool> &flags)
+{
+    std::vector<uint8_t> raw;
+    raw.reserve(flags.size());
+    for (bool flag : flags)
+    {
+        raw.push_back(flag ? 1 : 0);
+    }
+    buf.write_vec(raw);
+}
+
+void deserialize_layer_replicate_flags(Buffer &buf, std::vector<bool> &flags)
+{
+    std::vector<uint8_t> raw = buf.read_vec<uint8_t>();
+    flags.clear();
+    flags.reserve(raw.size());
+    for (uint8_t v : raw)
+    {
+        flags.push_back(v != 0);
     }
 }
 
@@ -473,8 +495,8 @@ public:
     // 节点集合
     std::vector<Node<T>> nodes;
 
-    // 向量 -> 主节点路由（按层）
-    std::vector<std::unordered_map<int, int>> vector_node_map;
+    // 向量 -> 路由节点集合（按层）
+    std::vector<std::unordered_map<int, std::vector<int>>> vector_node_map;
 
     // 模拟网络带宽 Mb/s
     double bandwidth = 1000.0;
@@ -482,6 +504,7 @@ public:
     // 分区模式
     std::string partition_mode;
     std::unordered_map<int, std::vector<int>> layer_config;
+    std::vector<bool> layer_replicate_flags;
 
     int outer_ring_max_iterations = 0;
 
@@ -639,7 +662,7 @@ public:
                 int best_center = 0;
                 for (int j = 0; j < (int)centers.size(); j++)
                 {
-                    T dist = distance(*ptrs[i], centers[j]);
+                    T dist = L2Sqr(ptrs[i]->data(), centers[j].data(), dim);
 
                     if (dist < best_dist)
                     {
@@ -700,7 +723,10 @@ public:
                 const auto &neighbor_set = hnsw->neighbors[0][vid];
                 for (int nid : neighbor_set)
                 {
-                    if (vector_node_map[0][nid] != node_id)
+                    auto route_it = vector_node_map[0].find(nid);
+                    if (route_it == vector_node_map[0].end() || route_it->second.empty())
+                        continue;
+                    if (route_it->second[0] != node_id)
                     {
                         cross_cnt++;
                     }
@@ -755,7 +781,10 @@ public:
             const auto &neighbor_set = hnsw->neighbors[0][vid];
             for (int nid : neighbor_set)
             {
-                int neighbor_node = vector_node_map[0][nid];
+                auto route_it = vector_node_map[0].find(nid);
+                if (route_it == vector_node_map[0].end() || route_it->second.empty())
+                    continue;
+                int neighbor_node = route_it->second[0];
                 if (local_vectors[neighbor_node].count(nid))
                     counts[neighbor_node]++;
             }
@@ -792,17 +821,18 @@ public:
             }
             // 将向量数据放回到选定节点
             local_vectors[best_node][vid] = hnsw->vectors[vid];
-            vector_node_map[0][vid] = best_node;
+            vector_node_map[0][vid] = {best_node};
         }
 
         return (int)removed.size();
     }
 
-    void partition(const string &mode, int redundancy = 1, const std::unordered_map<int, std::vector<int>> &layer_config = {}, const std::string &layer_partition_mode = "round_robin")
+    void partition(const string &mode, int redundancy = 1, const std::unordered_map<int, std::vector<int>> &layer_config = {}, const std::string &layer_partition_mode = "round_robin", const std::vector<bool> &layer_replicate_flags = {})
     {
         partition_mode = mode;
         redundancy_level = redundancy;
         redundancy_num = 0;
+        this->layer_replicate_flags = layer_replicate_flags;
 
         int max_level = hnsw->max_level;
         auto &vectors = hnsw->vectors;
@@ -823,7 +853,7 @@ public:
             {
                 int vid = kv.first;
                 int target = vid % node_num;
-                vector_node_map[0][vid] = target;
+                vector_node_map[0][vid] = {target};
                 local_vectors[target][vid] = kv.second;
             }
         }
@@ -835,7 +865,7 @@ public:
             {
                 int vid = kv.first;
                 int target = labels[idx++];
-                vector_node_map[0][vid] = target;
+                vector_node_map[0][vid] = {target};
                 local_vectors[target][vid] = kv.second;
             }
         }
@@ -848,7 +878,7 @@ public:
             {
                 int vid = kv.first;
                 int target = labels[idx++];
-                vector_node_map[0][vid] = target;
+                vector_node_map[0][vid] = {target};
                 local_vectors[target][vid] = kv.second;
             }
 
@@ -870,7 +900,7 @@ public:
             // 初始化路由表（先给第 0 层占位）
             for (const auto &kv : vectors)
             {
-                vector_node_map[0][kv.first] = 0;
+                vector_node_map[0][kv.first] = {0};
             }
 
             for (const auto &level_kv : neighbors)
@@ -892,9 +922,13 @@ public:
                 if (target_nodes.empty())
                     continue;
 
-                // 计算层内分区策略 (如 KMeans)
+                bool is_replicate_level = (level >= 0 && level < (int)this->layer_replicate_flags.size())
+                                              ? this->layer_replicate_flags[level]
+                                              : false;
+
+                // split 模式才需要计算层内分区策略 (如 KMeans)
                 std::unordered_map<int, int> vid_partition_map;
-                if (layer_partition_mode == "k-means" && target_nodes.size() > 1)
+                if (!is_replicate_level && layer_partition_mode == "k-means" && target_nodes.size() > 1)
                 {
                     // 收集当前层的所有向量构建子集（key 使用真实 vid）
                     std::unordered_map<int, std::vector<T>> subset_vectors;
@@ -922,45 +956,86 @@ public:
                 }
 
                 const auto &node_map = level_kv.second;
-                LOG_INFO_STREAM("[layer partition] level=" << level << " vids=" << node_map.size() << " target_nodes=[" << [&]{ std::string s; for(int n:target_nodes) s+=std::to_string(n)+","; return s; }() << "]");
+                LOG_INFO_STREAM("[layer partition] level=" << level << " vids=" << node_map.size() << " mode=" << (is_replicate_level ? "replicate" : "split") << " target_nodes=[" << [&]{ std::string s; for(int n:target_nodes) s+=std::to_string(n)+","; return s; }() << "]");
                 for (const auto &node_kv : node_map)
                 {
                     int vid = node_kv.first;
 
-                    // 确定目标节点索引
-                    int target_idx = 0;
-                    if (!vid_partition_map.empty() && vid_partition_map.count(vid))
+                    if (is_replicate_level)
                     {
-                        target_idx = vid_partition_map.at(vid);
+                        std::vector<int> route_nodes;
+                        route_nodes.reserve(target_nodes.size());
+                        for (int target_node : target_nodes)
+                        {
+                            if (target_node < 0 || target_node >= node_num)
+                                continue;
+                            if (vectors.count(vid))
+                            {
+                                local_vectors[target_node][vid] = vectors.at(vid);
+                            }
+                            route_nodes.push_back(target_node);
+                        }
+                        if (!route_nodes.empty())
+                        {
+                            vector_node_map[level][vid] = std::move(route_nodes);
+                        }
                     }
                     else
                     {
-                        // 默认层内 Round Robin 分配
-                        target_idx = vid % target_nodes.size();
-                    }
-
-                    // 边界检查
-                    if (target_idx < 0 || target_idx >= (int)target_nodes.size()) target_idx = 0;
-
-                    int target_node = target_nodes[target_idx];
-
-                    if (target_node >= 0 && target_node < node_num)
-                    {
-                        // 复制向量数据
-                        if (vectors.count(vid)) {
-                            local_vectors[target_node][vid] = vectors.at(vid);
+                        // 确定目标节点索引
+                        int target_idx = 0;
+                        if (!vid_partition_map.empty() && vid_partition_map.count(vid))
+                        {
+                            target_idx = vid_partition_map.at(vid);
                         }
-                        
-                        // 路由表按层记录
-                        vector_node_map[level][vid] = target_node;
+                        else
+                        {
+                            // 默认层内 Round Robin 分配
+                            target_idx = vid % target_nodes.size();
+                        }
+
+                        // 边界检查
+                        if (target_idx < 0 || target_idx >= (int)target_nodes.size())
+                            target_idx = 0;
+
+                        int target_node = target_nodes[target_idx];
+
+                        if (target_node >= 0 && target_node < node_num)
+                        {
+                            // 复制向量数据
+                            if (vectors.count(vid))
+                            {
+                                local_vectors[target_node][vid] = vectors.at(vid);
+                            }
+
+                            // 路由表按层记录
+                            vector_node_map[level][vid] = {target_node};
+                        }
                     }
                 }
             }
             
-            // 修正 entry_point 的路由，指向最高层所在的节点
+            // 修正 entry_point 的路由，指向最高层所在的节点（replicate层写入全部节点）
             if (layer_config.count(max_level) && !layer_config.at(max_level).empty()) {
-                int target_node = layer_config.at(max_level)[hnsw->entry_point_id % layer_config.at(max_level).size()];
-                vector_node_map[max_level][hnsw->entry_point_id] = target_node;
+                bool ep_replicate = (max_level >= 0 && max_level < (int)this->layer_replicate_flags.size())
+                                        ? this->layer_replicate_flags[max_level]
+                                        : false;
+                if (ep_replicate)
+                {
+                    std::vector<int> route_nodes;
+                    for (int target_node : layer_config.at(max_level))
+                    {
+                        if (target_node >= 0 && target_node < node_num)
+                            route_nodes.push_back(target_node);
+                    }
+                    if (!route_nodes.empty())
+                        vector_node_map[max_level][hnsw->entry_point_id] = std::move(route_nodes);
+                }
+                else
+                {
+                    int target_node = layer_config.at(max_level)[hnsw->entry_point_id % layer_config.at(max_level).size()];
+                    vector_node_map[max_level][hnsw->entry_point_id] = {target_node};
+                }
             }
         }
 
@@ -976,7 +1051,7 @@ public:
                 {
                     int level = level_kv.first;
                     // layer 模式下，当前层有路由表才继续；否则跳过（节点未被分配该层）
-                    const std::unordered_map<int, int> *route_map = nullptr;
+                    const std::unordered_map<int, std::vector<int>> *route_map = nullptr;
                     if (mode == "layer")
                     {
                         if (level < 0 || level >= (int)vector_node_map.size())
@@ -991,19 +1066,23 @@ public:
 
                         if (mode == "layer")
                         {
-                            // layer 模式：只对"路由表显示该层主节点为 node_id"的 vid 做复制
+                            // layer 模式：对该层路由覆盖到的所有节点执行同层邻居复制
                             auto it = route_map->find(vid);
                             if (it == route_map->end())
                                 continue;
-                            int node_id = it->second;
-                            for (int neighbor_id : neighbor_set)
+                            for (int node_id : it->second)
                             {
-                                if (!local_vectors[node_id].count(neighbor_id) &&
-                                    !updates[node_id].count(neighbor_id) &&
-                                    vectors.count(neighbor_id))
+                                if (node_id < 0 || node_id >= node_num)
+                                    continue;
+                                for (int neighbor_id : neighbor_set)
                                 {
-                                    updates[node_id][neighbor_id] = vectors.at(neighbor_id);
-                                    redundancy_num++;
+                                    if (!local_vectors[node_id].count(neighbor_id) &&
+                                        !updates[node_id].count(neighbor_id) &&
+                                        vectors.count(neighbor_id))
+                                    {
+                                        updates[node_id][neighbor_id] = vectors.at(neighbor_id);
+                                        redundancy_num++;
+                                    }
                                 }
                             }
                         }
@@ -1293,19 +1372,36 @@ public:
         if (route_level < 0 || route_level >= (int)vector_node_map.size())
             route_level = 0;
 
+        auto choose_target_node = [this](const std::vector<int> &candidates) -> int {
+            std::vector<int> valid;
+            valid.reserve(candidates.size());
+            for (int node_id : candidates)
+            {
+                if (node_id >= 0 && node_id < this->node_num)
+                    valid.push_back(node_id);
+            }
+            if (valid.empty())
+                return 0;
+            if (valid.size() == 1)
+                return valid[0];
+            static thread_local std::mt19937 gen(std::random_device{}());
+            std::uniform_int_distribution<size_t> dist(0, valid.size() - 1);
+            return valid[dist(gen)];
+        };
+
         int target_node_id = 0;
         if (!vector_node_map.empty())
         {
             auto it = vector_node_map[route_level].find(require_id);
             if (it != vector_node_map[route_level].end())
             {
-                target_node_id = it->second;
+                target_node_id = choose_target_node(it->second);
             }
             else if (route_level != 0)
             {
                 auto it0 = vector_node_map[0].find(require_id);
                 if (it0 != vector_node_map[0].end())
-                    target_node_id = it0->second;
+                    target_node_id = choose_target_node(it0->second);
             }
         }
 
@@ -1400,6 +1496,12 @@ public:
             j["is_reduce"] = is_reduce;
             j["add_round_robin_counter"] = add_round_robin_counter;
 
+            if (partition_mode == "layer")
+            {
+                j["layer_config"] = layer_config;
+                j["layer_replicate_flags"] = layer_replicate_flags;
+            }
+
             // 保存 vector_node_map（layer: 多层；非 layer: 仅第0层）
             if (partition_mode == "layer")
             {
@@ -1422,7 +1524,8 @@ public:
                 {
                     for (const auto &kv : vector_node_map[0])
                     {
-                        jmap[std::to_string(kv.first)] = kv.second;
+                        if (!kv.second.empty())
+                            jmap[std::to_string(kv.first)] = kv.second[0];
                     }
                 }
                 j["vector_node_map"] = std::move(jmap);
@@ -1531,6 +1634,26 @@ public:
         cluster->is_reduce = j.value("is_reduce", false);
         cluster->add_round_robin_counter = j.value("add_round_robin_counter", 0);
 
+        if (cluster->partition_mode == "layer")
+        {
+            if (j.contains("layer_config") && j["layer_config"].is_object())
+            {
+                cluster->layer_config.clear();
+                for (auto const &kv : j["layer_config"].items())
+                {
+                    int level = std::stoi(kv.key());
+                    if (kv.value().is_array())
+                    {
+                        cluster->layer_config[level] = kv.value().get<std::vector<int>>();
+                    }
+                }
+            }
+            if (j.contains("layer_replicate_flags") && j["layer_replicate_flags"].is_array())
+            {
+                cluster->layer_replicate_flags = j["layer_replicate_flags"].get<std::vector<bool>>();
+            }
+        }
+
         // 加载 vector_node_map（layer: 多层；非 layer: 仅第0层）
         if (j.contains("vector_node_map"))
         {
@@ -1546,8 +1669,15 @@ public:
                     for (auto const &kv : jmap.items())
                     {
                         int vid = std::stoi(kv.key());
-                        int node_id = kv.value().get<int>();
-                        cluster->vector_node_map[l][vid] = node_id;
+                        if (kv.value().is_array())
+                        {
+                            cluster->vector_node_map[l][vid] = kv.value().get<std::vector<int>>();
+                        }
+                        else
+                        {
+                            int node_id = kv.value().get<int>();
+                            cluster->vector_node_map[l][vid] = {node_id};
+                        }
                     }
                 }
             }
@@ -1559,8 +1689,15 @@ public:
                 for (auto const &kv : j["vector_node_map"].items())
                 {
                     int vid = std::stoi(kv.key());
-                    int node_id = kv.value().get<int>();
-                    cluster->vector_node_map[0][vid] = node_id;
+                    if (kv.value().is_array())
+                    {
+                        cluster->vector_node_map[0][vid] = kv.value().get<std::vector<int>>();
+                    }
+                    else
+                    {
+                        int node_id = kv.value().get<int>();
+                        cluster->vector_node_map[0][vid] = {node_id};
+                    }
                 }
             }
         }
@@ -1853,15 +1990,17 @@ void Node<T>::handle_client(int client_fd)
             int redundancy = buf.read_val<int>();
             std::unordered_map<int, std::vector<int>> layer_config;
             std::string layer_partition_mode = "round_robin";
+            std::vector<bool> layer_replicate_flags;
             if (mode == "layer")
             {
                 deserialize_layer_config(buf, layer_config);
                 layer_partition_mode = buf.read_string();
+                deserialize_layer_replicate_flags(buf, layer_replicate_flags);
             }
 
             if (cluster)
             {
-                cluster->partition(mode, redundancy, layer_config, layer_partition_mode);
+                cluster->partition(mode, redundancy, layer_config, layer_partition_mode, layer_replicate_flags);
             }
 
             // 发送 ACK
@@ -1898,6 +2037,7 @@ void Node<T>::handle_client(int client_fd)
                     cluster->add_round_robin_counter = loaded->add_round_robin_counter;
                     cluster->vector_node_map = std::move(loaded->vector_node_map);
                     cluster->layer_config = std::move(loaded->layer_config);
+                    cluster->layer_replicate_flags = std::move(loaded->layer_replicate_flags);
 
                     if (cluster->hnsw && cluster->hnsw != loaded->hnsw)
                     {
@@ -1995,6 +2135,19 @@ void Node<T>::handle_client(int client_fd)
                 cj["is_distributed"] = cluster->is_distributed;
                 cj["is_reduce"] = cluster->is_reduce;
                 cj["layer_config"] = cluster->layer_config;
+                cj["layer_replicate_flags"] = cluster->layer_replicate_flags;
+
+                json nodes_json = json::array();
+                for (int i = 0; i < cluster->node_num && i < (int)cluster->nodes.size(); i++)
+                {
+                    json nj;
+                    nj["node_id"] = i;
+                    nj["ip_addr"] = cluster->nodes[i].ip_addr;
+                    nj["port"] = cluster->nodes[i].port;
+                    nj["is_remote_node"] = cluster->nodes[i].is_remote_node;
+                    nodes_json.push_back(std::move(nj));
+                }
+                cj["nodes"] = std::move(nodes_json);
                 info["cluster"] = std::move(cj);
 
                 if (cluster->hnsw)

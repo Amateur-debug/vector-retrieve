@@ -251,7 +251,7 @@ public:
                     {
                         if (all_vecs.find(conn_id) != all_vecs.end())
                         {
-                            T dist = distance(neighbor_vec, all_vecs[conn_id]);
+                            T dist = L2Sqr(neighbor_vec.data(), all_vecs[conn_id].data(), dim);
                             if (dist > max_dist)
                             {
                                 max_dist = dist;
@@ -260,7 +260,7 @@ public:
                         }
                     }
 
-                    T new_dist = distance(neighbor_vec, all_vecs[vid]);
+                    T new_dist = L2Sqr(neighbor_vec.data(), all_vecs[vid].data(), dim);
                     if (furthest_id != -1 && new_dist < max_dist)
                     {
                         should_add = true;
@@ -369,7 +369,7 @@ public:
                 entry_vec = it->second;
             }
 
-            T dist = distance(query_vector, entry_vec);
+            T dist = L2Sqr(query_vector.data(), entry_vec.data(), dim);
             payload.distance_cnt++;  // 累加距离计算次数
             payload.visited.insert(entry_point_id);
             payload.candidates.push({dist, entry_point_id});
@@ -391,7 +391,7 @@ public:
                 
                 if (!entry_vec.empty())
                 {
-                    T dist = distance(query_vector, entry_vec);
+                    T dist = L2Sqr(query_vector.data(), entry_vec.data(), dim);
                     payload.distance_cnt++;  // 累加距离计算次数
                     payload.visited.insert(entry_point_id);
                     payload.candidates.push({dist, entry_point_id});
@@ -455,7 +455,7 @@ public:
                 }
 
                 payload.visited.insert(neighbor_id);
-                T neighbor_dist = distance(query_vector, neighbor_vec);
+                T neighbor_dist = L2Sqr(query_vector.data(), neighbor_vec.data(), dim);
                 payload.distance_cnt++;  // 累加距离计算次数
 
                 // 决定是否把该邻居加入 results
@@ -559,7 +559,7 @@ public:
         if (vec1.empty() || vec2.empty())
             return std::numeric_limits<T>::max();
 
-        return distance(vec1, vec2);
+        return L2Sqr(vec1.data(), vec2.data(), dim);
     }
 
     bool save(const string &filepath)

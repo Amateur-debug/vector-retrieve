@@ -149,7 +149,7 @@ PYBIND11_MODULE(vector_retrieve, m)
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123)
         .def("outer_ring", &Cluster<float>::outer_ring)
         .def("partition", &Cluster<float>::partition,
-             py::arg("mode"), py::arg("redundancy") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin")
+             py::arg("mode"), py::arg("redundancy") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{})
         .def("set_node_info", &Cluster<float>::set_node_info,
              py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
         .def("start_node_server", &Cluster<float>::start_node_server,
@@ -194,7 +194,7 @@ PYBIND11_MODULE(vector_retrieve, m)
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123)
         .def("outer_ring", &Cluster<double>::outer_ring)
         .def("partition", &Cluster<double>::partition,
-             py::arg("mode"), py::arg("redundancy") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin")
+             py::arg("mode"), py::arg("redundancy") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{})
         .def("set_node_info", &Cluster<double>::set_node_info,
              py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
         .def("start_node_server", &Cluster<double>::start_node_server,
@@ -213,8 +213,11 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def(py::init<const std::string &, int, int>(),
              py::arg("ip") = "127.0.0.1", py::arg("port") = 19000, py::arg("timeout") = 5)
         .def("connect", &ClusterSDKClient<float>::connect)
+          .def("init_routes", &ClusterSDKClient<float>::init_routes)
         .def("disconnect", &ClusterSDKClient<float>::disconnect)
         .def("is_connected", &ClusterSDKClient<float>::is_connected)
+        .def("set_query_endpoints", &ClusterSDKClient<float>::set_query_endpoints,
+             py::arg("ips"), py::arg("ports"))
         .def("add_vector", &ClusterSDKClient<float>::add_vector,
              py::arg("vid"), py::arg("vec"),
              py::call_guard<py::gil_scoped_release>())
@@ -225,6 +228,7 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("mode"), py::arg("redundancy") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
              py::arg("layer_partition_mode") = "round_robin",
+             py::arg("layer_replicate_flags") = std::vector<bool>{},
              py::call_guard<py::gil_scoped_release>())
         .def("load_cluster", &ClusterSDKClient<float>::load_cluster,
              py::arg("filepath"),
@@ -248,8 +252,11 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def(py::init<const std::string &, int, int>(),
              py::arg("ip") = "127.0.0.1", py::arg("port") = 19000, py::arg("timeout") = 5)
         .def("connect", &ClusterSDKClient<double>::connect)
+          .def("init_routes", &ClusterSDKClient<double>::init_routes)
         .def("disconnect", &ClusterSDKClient<double>::disconnect)
         .def("is_connected", &ClusterSDKClient<double>::is_connected)
+        .def("set_query_endpoints", &ClusterSDKClient<double>::set_query_endpoints,
+             py::arg("ips"), py::arg("ports"))
         .def("add_vector", &ClusterSDKClient<double>::add_vector,
              py::arg("vid"), py::arg("vec"),
              py::call_guard<py::gil_scoped_release>())
@@ -260,6 +267,7 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("mode"), py::arg("redundancy") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
              py::arg("layer_partition_mode") = "round_robin",
+             py::arg("layer_replicate_flags") = std::vector<bool>{},
              py::call_guard<py::gil_scoped_release>())
         .def("load_cluster", &ClusterSDKClient<double>::load_cluster,
              py::arg("filepath"),
