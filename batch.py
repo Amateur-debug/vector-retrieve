@@ -31,14 +31,14 @@ DATASETS = [
 PARAM_GRID = {
     "node_num":           [1],
     "partition_mode":     ["k-means"],
-    "redundancy":         [0, 1],
+    "redundancy":         [2],
     "m":                  [16],
     "ef_construction":    [200],
-    "ef_search":          [20],
+    "ef_search":          [32],
     "limited_level":      [5],
     "k":                  [10],
-    "num_query_threads":  [64],
-    "reduce":             [False],
+    "num_query_threads":  [128],
+    "reduce":             [False, True],
     "distributed":        [True],
     "layer":              [True, False],
 }
@@ -119,9 +119,26 @@ def get_graph_path(data_name, params):
 
 def run_batch():
     """批量运行实验"""
-    keys = PARAM_GRID.keys()
-    values = PARAM_GRID.values()
-    combinations = list(itertools.product(*values))
+    # 原始参数顺序
+    keys = list(PARAM_GRID.keys())
+
+    # 为 reduce 模式生成参数组合（redundancy 只需一个值，因为 reduce 模式不分区）
+    # 同时排除 layer（reduce 模式下 layer 无效）
+    param_grid_reduce = {k: v for k, v in PARAM_GRID.items() if k not in ('redundancy', 'layer')}
+    param_grid_reduce['redundancy'] = [0]  # reduce 模式只需一个值
+    param_grid_reduce['reduce'] = [True]
+    param_grid_reduce['layer'] = [False]  # reduce 模式下 layer 无效
+
+    # 为非 reduce 模式生成参数组合
+    param_grid_normal = {k: v for k, v in PARAM_GRID.items() if k != 'reduce'}
+    param_grid_normal['reduce'] = [False]
+
+    # 确保 key 顺序与原始 PARAM_GRID 一致
+    param_grid_reduce = {k: param_grid_reduce.get(k, [False]) for k in keys}
+    param_grid_normal = {k: param_grid_normal.get(k, [False]) for k in keys}
+
+    combinations_reduce = list(itertools.product(*param_grid_reduce.values()))
+    combinations_normal = list(itertools.product(*param_grid_normal.values()))
 
     tasks = []
     built_graphs = set()  # 记录本次运行中已构建的图
@@ -132,12 +149,8 @@ def run_batch():
             print(f"Warning: Dataset file not found: {data_path}. Skipping...")
             continue
 
-        for combo in combinations:
+        for combo in combinations_reduce + combinations_normal:
             params = dict(zip(keys, combo))
-
-            # reduce 模式下 layer 无效，跳过无效组合
-            if params.get('reduce') and params.get('layer'):
-                continue
 
             cmd = build_command(dataset, params)
 

@@ -1,3 +1,12 @@
+/**
+ * @file hnsw.h
+ * @brief HNSW图实现 - 高性能近似最近邻搜索
+ * 
+ * 特性:
+ *   - 线程安全: 细粒度锁支持并行构建
+ *   - 读写分离: 批量更新策略减少锁竞争
+ */
+
 #pragma once
 
 #include <algorithm>

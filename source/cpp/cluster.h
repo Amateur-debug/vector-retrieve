@@ -25,12 +25,14 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 
 #include <cstring>
 #include <thread>
 #include <atomic>
 #include <future>
+#include <poll.h>
 
 #include "distance.h"
 #include "hnsw.h"
@@ -38,6 +40,229 @@
 #include "payload.h"
 
 using namespace std;
+
+// ==================== TCP Connection Pool ====================
+// 无限大小连接池，避免固定大小导致的死锁
+class TcpConnectionPool {
+private:
+    struct NodeConnections {
+        std::deque<int> idle_sockets;
+        std::mutex mutex;
+        std::string ip;
+        int port = 0;
+        int active_count = 0;  // 正在使用的连接数
+    };
+    
+    std::unordered_map<int, NodeConnections> node_pools;
+    std::mutex pools_mutex;
+    
+    // 创建新连接
+    int create_connection(const std::string& ip, int port) {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return -1;
+        
+        // 设置非阻塞连接超时
+        struct timeval timeout;
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        
+        // 禁用 Nagle 算法，减少延迟
+        int flag = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+        
+        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            close(sock);
+            return -1;
+        }
+        
+        return sock;
+    }
+    
+    // 检查 socket 是否有效
+    bool is_socket_valid(int sock) {
+        struct pollfd pfd;
+        pfd.fd = sock;
+        pfd.events = POLLIN | POLLOUT;
+        pfd.revents = 0;
+        
+        int ret = poll(&pfd, 1, 0);
+        if (ret <= 0) return true;  // 超时或无事件，认为连接正常
+        
+        // 有事件，检查是否为错误
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            return false;
+        }
+        return true;
+    }
+    
+public:
+    // 注册节点
+    void register_node(int node_id, const std::string& ip, int port) {
+        std::lock_guard<std::mutex> lock(pools_mutex);
+        // try_emplace: 如果不存在则默认构造
+        auto result = node_pools.try_emplace(node_id);
+        NodeConnections& nc = result.first->second;
+        nc.ip = ip;
+        nc.port = port;
+    }
+    
+    // 获取连接（优先复用，无可用则创建新连接）
+    int acquire(int node_id) {
+        std::string ip;
+        int port = 0;
+        int reused_sock = -1;
+        
+        // 第一阶段：获取连接或地址（持锁时间短）
+        {
+            std::lock_guard<std::mutex> lock(pools_mutex);
+            auto it = node_pools.find(node_id);
+            if (it == node_pools.end()) {
+                return -1;
+            }
+            
+            NodeConnections& nc = it->second;
+            std::lock_guard<std::mutex> nc_lock(nc.mutex);
+            
+            // 尝试复用空闲连接
+            while (!nc.idle_sockets.empty()) {
+                int sock = nc.idle_sockets.front();
+                nc.idle_sockets.pop_front();
+                
+                if (is_socket_valid(sock)) {
+                    nc.active_count++;
+                    int idle = (int)nc.idle_sockets.size();
+                    int active = nc.active_count;
+                    LOG_DEBUG_STREAM("[ConnectionPool] Acquired (reused) connection for node " << node_id 
+                        << ", socket=" << sock 
+                        << ", idle=" << idle
+                        << ", active=" << active
+                        << ", total=" << (idle + active));
+                    return sock;  // 找到有效连接，直接返回
+                }
+                // 无效连接，关闭并继续
+                close(sock);
+            }
+            
+            // 无可用连接，记录地址用于创建
+            ip = nc.ip;
+            port = nc.port;
+        }
+        // 锁已释放，在锁外创建连接
+        if (!ip.empty() && port > 0) {
+            int new_sock = create_connection(ip, port);
+            if (new_sock >= 0) {
+                // 创建成功，增加active_count
+                std::lock_guard<std::mutex> lock(pools_mutex);
+                auto it = node_pools.find(node_id);
+                if (it != node_pools.end()) {
+                    std::lock_guard<std::mutex> nc_lock(it->second.mutex);
+                    it->second.active_count++;
+                    int idle = (int)it->second.idle_sockets.size();
+                    int active = it->second.active_count;
+                    LOG_DEBUG_STREAM("[ConnectionPool] Acquired (created) connection for node " << node_id 
+                        << ", socket=" << new_sock 
+                        << ", idle=" << idle
+                        << ", active=" << active
+                        << ", total=" << (idle + active));
+                }
+            }
+            return new_sock;
+        }
+        return -1;
+    }
+    
+    // 释放连接回池
+    void release(int node_id, int sock, bool valid = true) {
+        if (sock < 0) return;
+        
+        std::lock_guard<std::mutex> lock(pools_mutex);
+        auto it = node_pools.find(node_id);
+        if (it == node_pools.end()) {
+            close(sock);
+            return;
+        }
+        
+        NodeConnections& nc = it->second;
+        std::lock_guard<std::mutex> nc_lock(nc.mutex);
+        
+        // 如果连接无效或检测到已关闭，直接关闭而不是放回池中
+        if (!valid || !is_socket_valid(sock)) {
+            close(sock);
+            if (nc.active_count > 0) nc.active_count--;
+            LOG_DEBUG_STREAM("[ConnectionPool] Closed invalid connection for node " << node_id << ", socket=" << sock);
+            return;
+        }
+        
+        nc.idle_sockets.push_back(sock);
+        if (nc.active_count > 0) nc.active_count--;
+        
+        int idle = (int)nc.idle_sockets.size();
+        int active = nc.active_count;
+        LOG_DEBUG_STREAM("[ConnectionPool] Released connection for node " << node_id 
+            << ", socket=" << sock 
+            << ", idle=" << idle
+            << ", active=" << active
+            << ", total=" << (idle + active));
+    }
+    
+    // 关闭指定节点的所有连接
+    void close_node(int node_id) {
+        std::lock_guard<std::mutex> lock(pools_mutex);
+        auto it = node_pools.find(node_id);
+        if (it == node_pools.end()) return;
+        
+        NodeConnections& nc = it->second;
+        std::lock_guard<std::mutex> nc_lock(nc.mutex);
+        size_t closed_count = nc.idle_sockets.size();
+        for (int sock : nc.idle_sockets) {
+            close(sock);
+        }
+        nc.idle_sockets.clear();
+        nc.active_count = 0;
+        
+        LOG_DEBUG_STREAM("[ConnectionPool] Closed all connections for node " << node_id 
+            << ", closed_idle=" << closed_count);
+    }
+    
+    // 获取统计信息
+    std::string get_stats() {
+        std::lock_guard<std::mutex> lock(pools_mutex);
+        std::string stats;
+        for (const auto& kv : node_pools) {
+            stats += "Node " + std::to_string(kv.first) + 
+                     ": " + std::to_string(kv.second.idle_sockets.size()) + " idle\n";
+        }
+        return stats;
+    }
+    
+    // 清空所有连接
+    void clear() {
+        std::lock_guard<std::mutex> lock(pools_mutex);
+        size_t total_closed = 0;
+        for (auto& kv : node_pools) {
+            std::lock_guard<std::mutex> nc_lock(kv.second.mutex);
+            total_closed += kv.second.idle_sockets.size();
+            for (int sock : kv.second.idle_sockets) {
+                close(sock);
+            }
+            kv.second.idle_sockets.clear();
+            kv.second.active_count = 0;
+        }
+        node_pools.clear();
+        LOG_DEBUG_STREAM("[ConnectionPool] Cleared all connections, total_closed=" << total_closed);
+    }
+};
+
+// 全局连接池实例
+static TcpConnectionPool g_connection_pool;
 
 template <typename T>
 class Cluster; // Forward declaration
@@ -54,7 +279,9 @@ enum MessageType
     MSG_LOAD_HNSW = 7,
     MSG_GET_INFORMATION = 8,
     MSG_SAVE_CLUSTER = 9,
-    MSG_SAVE_HNSW = 10
+    MSG_SAVE_HNSW = 10,
+    MSG_QUERY_LOCAL = 11,  // Reduce模式下只执行本地查询（避免递归）
+    MSG_ADD_VECTOR_LOCAL = 12  // Reduce模式下直接添加到本地（避免递归路由）
 };
 
 // Buffer helper for serialization
@@ -427,6 +654,9 @@ public:
     std::atomic<bool> stop_server{false};
 
     std::atomic<int> active_handlers{0};
+    
+    // 保护 local_hnsw 初始化的互斥锁
+    std::mutex local_hnsw_mutex;
 
     // 异步查询结果等待
     struct PendingQuery {
@@ -514,7 +744,7 @@ public:
     bool is_distributed = false;
     bool is_reduce = false;
 
-    int add_round_robin_counter = 0;
+    std::atomic<int> add_round_robin_counter{0};
 
     Cluster(HNSWGraph<T> *hnsw, int node_num = 4)
         : hnsw(hnsw), node_num(node_num)
@@ -597,6 +827,8 @@ public:
             nodes[node_id].ip_addr = ip;
             nodes[node_id].port = port;
             nodes[node_id].is_remote_node = is_remote;
+            // 注册到连接池
+            g_connection_pool.register_node(node_id, ip, port);
         }
     }
 
@@ -1040,78 +1272,82 @@ public:
         }
 
         // redundancy: 将邻居复制到本地
-        // layer 模式：只在节点被分配的层内复制同层邻居，避免跨层链式扩散
         if (redundancy > 0)
         {
             for (int r = 0; r < redundancy; r++)
             {
                 // 收集更新，避免遍历时修改
                 vector<unordered_map<int, vector<T>>> updates(node_num);
+                // 收集路由表更新
+                vector<unordered_map<int, std::vector<int>>> route_updates(vector_node_map.size());
+
                 for (const auto &level_kv : neighbors)
                 {
                     int level = level_kv.first;
-                    // layer 模式下，当前层有路由表才继续；否则跳过（节点未被分配该层）
-                    const std::unordered_map<int, std::vector<int>> *route_map = nullptr;
-                    if (mode == "layer")
-                    {
-                        if (level < 0 || level >= (int)vector_node_map.size())
-                            continue;
-                        route_map = &vector_node_map[level];
-                    }
+                    if (level < 0 || level >= (int)vector_node_map.size())
+                        continue;
+
+                    const auto &route_map = vector_node_map[level];
 
                     for (const auto &neighbor_kv : level_kv.second)
                     {
                         int vid = neighbor_kv.first;
                         const auto &neighbor_set = neighbor_kv.second;
 
-                        if (mode == "layer")
+                        // 查找该向量在该层的路由
+                        auto it = route_map.find(vid);
+                        if (it == route_map.end())
+                            continue;
+
+                        // 对路由覆盖的所有节点复制邻居
+                        for (int node_id : it->second)
                         {
-                            // layer 模式：对该层路由覆盖到的所有节点执行同层邻居复制
-                            auto it = route_map->find(vid);
-                            if (it == route_map->end())
+                            if (node_id < 0 || node_id >= node_num)
                                 continue;
-                            for (int node_id : it->second)
+                            for (int neighbor_id : neighbor_set)
                             {
-                                if (node_id < 0 || node_id >= node_num)
-                                    continue;
-                                for (int neighbor_id : neighbor_set)
+                                if (!local_vectors[node_id].count(neighbor_id) &&
+                                    !updates[node_id].count(neighbor_id) &&
+                                    vectors.count(neighbor_id))
                                 {
-                                    if (!local_vectors[node_id].count(neighbor_id) &&
-                                        !updates[node_id].count(neighbor_id) &&
-                                        vectors.count(neighbor_id))
+                                    updates[node_id][neighbor_id] = vectors.at(neighbor_id);
+                                    redundancy_num++;
+
+                                    // 更新路由表：将 neighbor_id 添加到 node_id
+                                    auto &route = route_updates[level][neighbor_id];
+                                    if (std::find(route.begin(), route.end(), node_id) == route.end())
                                     {
-                                        updates[node_id][neighbor_id] = vectors.at(neighbor_id);
-                                        redundancy_num++;
-                                    }
-                                }
-                            }
-                        }
-                        else
-                        {
-                            // 非 layer 模式：原有逻辑，持有 vid 的节点复制其邻居
-                            for (int node_id = 0; node_id < node_num; node_id++)
-                            {
-                                if (local_vectors[node_id].count(vid))
-                                {
-                                    for (int neighbor_id : neighbor_set)
-                                    {
-                                        if (!local_vectors[node_id].count(neighbor_id) &&
-                                            !updates[node_id].count(neighbor_id) &&
-                                            vectors.count(neighbor_id))
-                                        {
-                                            updates[node_id][neighbor_id] = vectors.at(neighbor_id);
-                                            redundancy_num++;
-                                        }
+                                        route.push_back(node_id);
                                     }
                                 }
                             }
                         }
                     }
                 }
+
+                // 应用向量更新
                 for (int node_id = 0; node_id < node_num; node_id++)
                 {
                     for (const auto &kv : updates[node_id])
                         local_vectors[node_id][kv.first] = kv.second;
+                }
+
+                // 应用路由表更新
+                for (size_t lvl = 0; lvl < route_updates.size(); lvl++)
+                {
+                    for (const auto &kv : route_updates[lvl])
+                    {
+                        int vid = kv.first;
+                        const auto &nodes = kv.second;
+                        auto &existing = vector_node_map[lvl][vid];
+                        for (int node_id : nodes)
+                        {
+                            if (std::find(existing.begin(), existing.end(), node_id) == existing.end())
+                            {
+                                existing.push_back(node_id);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1143,29 +1379,11 @@ public:
             Node<T> &target_node = nodes[i];
             if (target_node.is_remote_node)
             {
-
-                int sock = socket(AF_INET, SOCK_STREAM, 0);
+                // 使用连接池获取连接
+                int sock = g_connection_pool.acquire(i);
                 if (sock < 0)
                 {
-                    perror("socket");
-                    continue;
-                }
-
-                struct sockaddr_in serv_addr;
-                memset(&serv_addr, 0, sizeof(serv_addr));
-                serv_addr.sin_family = AF_INET;
-                serv_addr.sin_port = htons(target_node.port);
-                if (inet_pton(AF_INET, target_node.ip_addr.c_str(), &serv_addr.sin_addr) <= 0)
-                {
-                    LOG_DEBUG_STREAM("Invalid address: " << target_node.ip_addr);
-                    close(sock);
-                    continue;
-                }
-
-                if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-                {
-                    perror("connect");
-                    close(sock);
+                    LOG_DEBUG_STREAM("Failed to get connection to node " << i);
                     continue;
                 }
 
@@ -1196,6 +1414,7 @@ public:
                 {
                     LOG_DEBUG_STREAM("Warning: No ACK from node " << i);
                 }
+                // MSG_INIT_GRAPH 后服务器会关闭连接，不复用
                 close(sock);
             }
             else
@@ -1239,25 +1458,10 @@ public:
 
                     if (is_distributed && node.is_remote_node)
                     {
-                        int sock = socket(AF_INET, SOCK_STREAM, 0);
+                        // 使用连接池获取连接
+                        int sock = g_connection_pool.acquire(i);
                         if (sock < 0)
                         {
-                            out.payload = std::move(node_payload);
-                            return out;
-                        }
-                        struct sockaddr_in serv_addr;
-                        memset(&serv_addr, 0, sizeof(serv_addr));
-                        serv_addr.sin_family = AF_INET;
-                        serv_addr.sin_port = htons(node.port);
-                        if (inet_pton(AF_INET, node.ip_addr.c_str(), &serv_addr.sin_addr) <= 0)
-                        {
-                            close(sock);
-                            out.payload = std::move(node_payload);
-                            return out;
-                        }
-                        if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-                        {
-                            close(sock);
                             out.payload = std::move(node_payload);
                             return out;
                         }
@@ -1265,7 +1469,7 @@ public:
                         LOG_DEBUG_STREAM("[Cluster] Sending query " << query_id << " to remote node " << i);
 
                         Buffer buf;
-                        buf.write_val((int)MSG_QUERY);
+                        buf.write_val((int)MSG_QUERY_LOCAL);  // 使用 MSG_QUERY_LOCAL 避免递归
                         buf.write_val(query_id);
                         buf.write_val(k);
                         buf.write_vec(query_vector);
@@ -1285,7 +1489,8 @@ public:
 
                             LOG_DEBUG_STREAM("[Cluster] Received response for query " << query_id << " from remote node " << i);
 
-                            close(sock);
+                            // 非持久连接：远程节点已关闭，标记为无效
+                            g_connection_pool.release(i, sock, false);
 
                             Buffer resp_buf;
                             resp_buf.data = std::move(resp_data);
@@ -1302,7 +1507,7 @@ public:
                         }
                         catch (...)
                         {
-                            close(sock);
+                            g_connection_pool.release(i, sock, false);
                             out.payload = std::move(node_payload);
                             return out;
                         }
@@ -1413,33 +1618,11 @@ public:
             auto now = std::chrono::system_clock::now();
             payload.send_timestamp = std::chrono::duration<double, std::milli>(now.time_since_epoch()).count();
 
-            // 创建新连接，发送后关闭（不使用连接池）
-            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            // 使用连接池获取连接
+            int sock = g_connection_pool.acquire(target_node_id);
             if (sock < 0)
             {
-                LOG_DEBUG_STREAM("[Cluster] ERROR: Failed to create socket for query " << query_id << " to node " << target_node_id << ": " << strerror(errno));
-                return {};
-            }
-
-            // 设置SO_REUSEADDR允许重用TIME_WAIT状态的端口
-            int reuse = 1;
-            setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-            struct sockaddr_in serv_addr;
-            memset(&serv_addr, 0, sizeof(serv_addr));
-            serv_addr.sin_family = AF_INET;
-            serv_addr.sin_port = htons(target_node.port);
-            if (inet_pton(AF_INET, target_node.ip_addr.c_str(), &serv_addr.sin_addr) <= 0)
-            {
-                LOG_DEBUG_STREAM("[Cluster] ERROR: Invalid IP address " << target_node.ip_addr << " for node " << target_node_id << " query " << query_id);
-                close(sock);
-                return {};
-            }
-
-            if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-            {
-                LOG_DEBUG_STREAM("[Cluster] ERROR: Failed to connect to node " << target_node_id << " (" << target_node.ip_addr << ":" << target_node.port << ") for query " << query_id << ": " << strerror(errno));
-                close(sock);
+                LOG_DEBUG_STREAM("[Cluster] ERROR: Failed to get connection for query " << query_id << " to node " << target_node_id);
                 return {};
             }
 
@@ -1459,8 +1642,8 @@ public:
                 send_all(sock, &msg_size, sizeof(uint64_t));
                 send_all(sock, buf.data.data(), msg_size);
 
-                // 异步模式：发送后立即关闭连接，不等待响应
-                close(sock);
+                // 非持久连接：远程节点已关闭，标记为无效
+                g_connection_pool.release(target_node_id, sock, false);
                 
                 LOG_DEBUG_STREAM("[Cluster] MSG_SEARCH successfully sent to node " << target_node_id << " for query " << query_id);
                 
@@ -1468,7 +1651,7 @@ public:
             }
             catch (...)
             {
-                close(sock);
+                g_connection_pool.release(target_node_id, sock, false);
                 return {};
             }
         }
@@ -1494,7 +1677,7 @@ public:
             j["redundancy_num"] = redundancy_num;
             j["is_distributed"] = is_distributed;
             j["is_reduce"] = is_reduce;
-            j["add_round_robin_counter"] = add_round_robin_counter;
+            j["add_round_robin_counter"] = add_round_robin_counter.load();
 
             if (partition_mode == "layer")
             {
@@ -1841,393 +2024,472 @@ template <typename T>
 void Node<T>::handle_client(int client_fd)
 {
     active_handlers++;
-    int current_active = active_handlers.load();
-    if (current_active % 100 == 0 || current_active > 500)
+
+    // 持久连接模式：循环处理多个消息
+    while (true)
     {
-        LOG_DEBUG_STREAM("[Node " << node_id << "] Active handlers: " << current_active);
-    }
-    
-    try
-    {
-        uint64_t msg_size = 0;
-        recv_all(client_fd, &msg_size, sizeof(uint64_t));
-
-        std::vector<char> buffer(msg_size);
-        recv_all(client_fd, buffer.data(), msg_size);
-
-        Buffer buf;
-        buf.data = std::move(buffer);
-
-        int msg_type = buf.read_val<int>();
-
-        if (msg_type == MSG_SEARCH)
+        try
         {
-            int query_id = buf.read_val<int>();
-            int k = buf.read_val<int>();
-            std::vector<T> query_vector = buf.read_vec<T>();
-
-            Payload<T> payload;
-            deserialize_payload(buf, payload);
-            
-            LOG_DEBUG_STREAM("[Node " << node_id << "] Received MSG_SEARCH for query " << query_id << ", transfer_cnt=" << payload.remote_transfer_cnt << ", origin=" << payload.origin_node_id);
-
-            // 计算网络延迟
-            auto now = std::chrono::system_clock::now();
-            double recv_timestamp = std::chrono::duration<double, std::milli>(now.time_since_epoch()).count();
-            double latency = recv_timestamp - payload.send_timestamp;
-            payload.remote_transfer_latency += latency;
-
-            std::vector<int> results = this->query(query_id, query_vector, payload, k);
-
-            LOG_DEBUG_STREAM("[Node " << node_id << "] MSG_SEARCH query " << query_id << " returned, results.size=" << results.size() << ", continue_search=" << payload.continue_search << ", transfer_cnt=" << payload.remote_transfer_cnt);
-
-            active_handlers--;
-            close_connection_hard(client_fd);
-            return;
-        }
-        else if (msg_type == MSG_INIT_GRAPH)
-        {
-            LOG_DEBUG_STREAM("Node " << node_id << " receiving graph partition...");
-            deserialize_routing(buf, cluster->vector_node_map);
-
-            if (local_hnsw)
-                delete local_hnsw;
-            local_hnsw = deserialize_hnsw<T>(buf);
-
-            LOG_DEBUG_STREAM("Node " << node_id << " initialized with " << local_hnsw->vectors.size() << " vectors.");
-
-            if (buf.read_pos != buf.data.size())
+            uint64_t msg_size = 0;
+            ssize_t r = recv(client_fd, &msg_size, sizeof(uint64_t), MSG_WAITALL);
+            if (r <= 0)
             {
-                LOG_DEBUG_STREAM("Warning: Buffer not fully consumed! read_pos=" << buf.read_pos << " size=" << buf.data.size());
-            }
-            else
-            {
-                LOG_DEBUG_STREAM("Buffer fully consumed.");
+                // 连接关闭或错误
+                break;
             }
 
-            // Send ACK back to master
-            char ack = 1;
-            send_all(client_fd, &ack, 1);
-            
-            // MSG_INIT_GRAPH 是一次性操作，关闭连接
-            close_connection_hard(client_fd);
-        }
-        else if (msg_type == MSG_ADD_VECTOR)
-        {
-            int vid = buf.read_val<int>();
-            std::vector<T> vec = buf.read_vec<T>();
+            std::vector<char> buffer(msg_size);
+            recv_all(client_fd, buffer.data(), msg_size);
 
-            if (cluster && !cluster->is_reduce)
+            Buffer buf;
+            buf.data = std::move(buffer);
+
+            int msg_type = buf.read_val<int>();
+
+            if (msg_type == MSG_SEARCH)
             {
-                if (cluster->hnsw)
-                {
-                    cluster->hnsw->add_vector(vid, vec);
-                }
-                else
-                {
-                    LOG_DEBUG_STREAM("Local cluster hnsw is null, cannot add vector");
-                }
+                int query_id = buf.read_val<int>();
+                int k = buf.read_val<int>();
+                std::vector<T> query_vector = buf.read_vec<T>();
+
+                Payload<T> payload;
+                deserialize_payload(buf, payload);
+
+                LOG_DEBUG_STREAM("[Node " << node_id << "] Received MSG_SEARCH for query " << query_id << ", transfer_cnt=" << payload.remote_transfer_cnt << ", origin=" << payload.origin_node_id);
+
+                // 计算网络延迟
+                auto now = std::chrono::system_clock::now();
+                double recv_timestamp = std::chrono::duration<double, std::milli>(now.time_since_epoch()).count();
+                double latency = recv_timestamp - payload.send_timestamp;
+                payload.remote_transfer_latency += latency;
+
+                std::vector<int> results = this->query(query_id, query_vector, payload, k);
+
+                LOG_DEBUG_STREAM("[Node " << node_id << "] MSG_SEARCH query " << query_id << " returned, results.size=" << results.size() << ", continue_search=" << payload.continue_search << ", transfer_cnt=" << payload.remote_transfer_cnt);
+
+                // 持久连接：不关闭，继续等待下一个消息
+                continue;
             }
-            else
+            else if (msg_type == MSG_INIT_GRAPH)
             {
-                if (local_hnsw == nullptr)
+                LOG_DEBUG_STREAM("Node " << node_id << " receiving graph partition...");
+                deserialize_routing(buf, cluster->vector_node_map);
+
+                if (local_hnsw)
+                    delete local_hnsw;
+                local_hnsw = deserialize_hnsw<T>(buf);
+
+                LOG_DEBUG_STREAM("Node " << node_id << " initialized with " << local_hnsw->vectors.size() << " vectors.");
+
+                if (buf.read_pos != buf.data.size())
                 {
-                    local_hnsw = new HNSWGraph<T>(
-                        cluster->hnsw->dim, cluster->hnsw->m, cluster->hnsw->ef_construction,
-                        cluster->hnsw->ef_search, cluster->hnsw->limited_level, cluster->hnsw->seed);
+                    LOG_DEBUG_STREAM("Warning: Buffer not fully consumed! read_pos=" << buf.read_pos << " size=" << buf.data.size());
                 }
 
-                local_hnsw->add_vector(vid, vec);
+                // Send ACK back to master
+                char ack = 1;
+                send_all(client_fd, &ack, 1);
+                break;
             }
-
-            // Send ACK back
-            char ack = 1;
-            send_all(client_fd, &ack, 1);
-            
-            // MSG_ADD_VECTOR 是一次性操作，关闭连接
-            close_connection_hard(client_fd);
-        }
-        else if (msg_type == MSG_QUERY)
-        {
-            int query_id = buf.read_val<int>();
-            int k = buf.read_val<int>();
-            std::vector<T> query_vector = buf.read_vec<T>();
-            
-            Payload<T> payload;
-            deserialize_payload(buf, payload);
-
-            std::vector<pair<T, int>> results;
-            this->query(query_id, query_vector, payload, k);
-
-            // 从payload.results中获取带距离的结果
-            auto pq = payload.results;
-            while (!pq.empty())
+            else if (msg_type == MSG_ADD_VECTOR)
             {
-                results.push_back(pq.top());
-                pq.pop();
-            }
-            LOG_DEBUG_STREAM("[Node " << node_id << "] MSG_QUERY: results.size=" << results.size());
+                int vid = buf.read_val<int>();
+                std::vector<T> vec = buf.read_vec<T>();
 
-            // 发送结果回主节点
-            Buffer resp_buf;
-            resp_buf.write_val((int)results.size());
-            for (const auto &p : results)
-            {
-                resp_buf.write_val(p.first);  // distance
-                resp_buf.write_val(p.second); // id
-            }
-            serialize_payload(resp_buf, payload);
-
-            uint64_t resp_size = resp_buf.data.size();
-            send_all(client_fd, &resp_size, sizeof(uint64_t));
-            send_all(client_fd, resp_buf.data.data(), resp_size);
-            // MSG_QUERY 需要可靠回包，使用正常 FIN 关闭，避免 RST 导致对端 recv_all 卡死
-            close_connection_soft(client_fd);
-        }
-        else if (msg_type == MSG_PARTITION)
-        {
-            std::string mode = buf.read_string();
-            int redundancy = buf.read_val<int>();
-            std::unordered_map<int, std::vector<int>> layer_config;
-            std::string layer_partition_mode = "round_robin";
-            std::vector<bool> layer_replicate_flags;
-            if (mode == "layer")
-            {
-                deserialize_layer_config(buf, layer_config);
-                layer_partition_mode = buf.read_string();
-                deserialize_layer_replicate_flags(buf, layer_replicate_flags);
-            }
-
-            if (cluster)
-            {
-                cluster->partition(mode, redundancy, layer_config, layer_partition_mode, layer_replicate_flags);
-            }
-
-            // 发送 ACK
-            char ack = 1;
-            send_all(client_fd, &ack, 1);
-            // Partition 结束后使用 FIN 关闭，避免客户端 recv_all 因 RST 失败
-            close_connection_soft(client_fd);
-        }
-        else if (msg_type == MSG_LOAD_CLUSTER)
-        {
-            std::string filepath = buf.read_string();
-            bool ok = false;
-            if (cluster)
-            {
-                Cluster<T> *loaded = nullptr;
-                try
-                {
-                    loaded = Cluster<T>::load(filepath);
-                }
-                catch (...)
-                {
-                    loaded = nullptr;
-                }
-
-                if (loaded && loaded->node_num == cluster->node_num)
-                {
-                    cluster->bandwidth = loaded->bandwidth;
-                    cluster->partition_mode = loaded->partition_mode;
-                    cluster->outer_ring_max_iterations = loaded->outer_ring_max_iterations;
-                    cluster->redundancy_level = loaded->redundancy_level;
-                    cluster->redundancy_num = loaded->redundancy_num;
-                    cluster->is_distributed = loaded->is_distributed;
-                    cluster->is_reduce = loaded->is_reduce;
-                    cluster->add_round_robin_counter = loaded->add_round_robin_counter;
-                    cluster->vector_node_map = std::move(loaded->vector_node_map);
-                    cluster->layer_config = std::move(loaded->layer_config);
-                    cluster->layer_replicate_flags = std::move(loaded->layer_replicate_flags);
-
-                    if (cluster->hnsw && cluster->hnsw != loaded->hnsw)
+                char ack = 1;  // Success by default
+                try {
+                    if (cluster && cluster->is_reduce)
                     {
-                        delete cluster->hnsw;
+                        // Reduce 模式：调用 cluster->add_vector 进行轮询分发到各节点
+                        cluster->add_vector(vid, vec);
                     }
-                    cluster->hnsw = loaded->hnsw;
-                    loaded->hnsw = nullptr;
-
-                    for (int i = 0; i < cluster->node_num && i < (int)loaded->nodes.size(); i++)
+                    else if (cluster && !cluster->is_reduce)
                     {
-                        cluster->nodes[i].num_queries = loaded->nodes[i].num_queries;
-                        cluster->nodes[i].is_remote_node = loaded->nodes[i].is_remote_node;
-                        cluster->nodes[i].ip_addr = loaded->nodes[i].ip_addr;
-                        cluster->nodes[i].port = loaded->nodes[i].port;
-
-                        if (cluster->nodes[i].local_hnsw != nullptr && cluster->nodes[i].local_hnsw != cluster->hnsw)
+                        if (cluster->hnsw)
                         {
-                            delete cluster->nodes[i].local_hnsw;
+                            cluster->hnsw->add_vector(vid, vec);
                         }
-                        cluster->nodes[i].local_hnsw = loaded->nodes[i].local_hnsw;
-                        loaded->nodes[i].local_hnsw = nullptr;
                     }
-
-                    ok = true;
+                } catch (const std::exception &e) {
+                    LOG_DEBUG_STREAM("[Node " << node_id << "] Error adding vector " << vid << ": " << e.what());
+                    ack = 0;  // Failure
+                } catch (...) {
+                    LOG_DEBUG_STREAM("[Node " << node_id << "] Unknown error adding vector " << vid);
+                    ack = 0;  // Failure
                 }
 
-                if (loaded)
-                {
-                    delete loaded;
-                }
+                // 发送 ACK 确认 (always send, even on error)
+                send_all(client_fd, &ack, 1);
+                // 非持久连接：主动关闭
+                break;
             }
-            char ack = ok ? 1 : 0;
-            send_all(client_fd, &ack, 1);
-            close_connection_hard(client_fd);
-        }
-        else if (msg_type == MSG_LOAD_HNSW)
-        {
-            std::string filepath = buf.read_string();
-            bool ok = false;
-            if (cluster)
+            else if (msg_type == MSG_ADD_VECTOR_LOCAL)
             {
-                HNSWGraph<T> *loaded_hnsw = nullptr;
-                try
-                {
-                    loaded_hnsw = HNSWGraph<T>::load(filepath);
-                }
-                catch (...)
-                {
-                    loaded_hnsw = nullptr;
-                }
+                // 来自其他节点的添加请求，直接添加到本地 local_hnsw（不再路由）
+                int vid = buf.read_val<int>();
+                std::vector<T> vec = buf.read_vec<T>();
 
-                if (loaded_hnsw)
-                {
-                    if (cluster->hnsw && cluster->hnsw != loaded_hnsw)
+                char ack = 1;  // Success by default
+                try {
+                    if (local_hnsw == nullptr && cluster && cluster->is_reduce)
                     {
-                        delete cluster->hnsw;
+                        std::lock_guard<std::mutex> lk(local_hnsw_mutex);
+                        if (local_hnsw == nullptr)
+                        {
+                            local_hnsw = new HNSWGraph<T>(
+                                cluster->hnsw->dim, cluster->hnsw->m, cluster->hnsw->ef_construction,
+                                cluster->hnsw->ef_search, cluster->hnsw->limited_level, cluster->hnsw->seed);
+                        }
                     }
-                    cluster->hnsw = loaded_hnsw;
-
-                    ok = true;
+                    if (local_hnsw)
+                    {
+                        local_hnsw->add_vector(vid, vec);
+                    }
+                } catch (const std::exception &e) {
+                    LOG_DEBUG_STREAM("[Node " << node_id << "] Error adding local vector " << vid << ": " << e.what());
+                    ack = 0;  // Failure
+                } catch (...) {
+                    LOG_DEBUG_STREAM("[Node " << node_id << "] Unknown error adding local vector " << vid);
+                    ack = 0;  // Failure
                 }
+
+                // 发送 ACK 确认 (always send, even on error)
+                send_all(client_fd, &ack, 1);
+                // 非持久连接：主动关闭
+                break;
             }
-            char ack = ok ? 1 : 0;
-            send_all(client_fd, &ack, 1);
-            close_connection_hard(client_fd);
-        }
-        else if (msg_type == MSG_SAVE_HNSW)
-        {
-            std::string filepath = buf.read_string();
-            bool ok = false;
-            if (cluster && cluster->hnsw)
+            else if (msg_type == MSG_QUERY)
             {
-                try
-                {
-                    cluster->hnsw->save(filepath);
-                    ok = true;
-                }
-                catch (...) {}
-            }
-            char ack = ok ? 1 : 0;
-            send_all(client_fd, &ack, 1);
-            close_connection_hard(client_fd);
-        }
-        else if (msg_type == MSG_GET_INFORMATION)
-        {
-            json info;
-            if (cluster)
-            {
-                json cj;
-                cj["node_num"] = cluster->node_num;
-                cj["bandwidth"] = cluster->bandwidth;
-                cj["partition_mode"] = cluster->partition_mode;
-                cj["redundancy_level"] = cluster->redundancy_level;
-                cj["redundancy_num"] = cluster->redundancy_num;
-                cj["is_distributed"] = cluster->is_distributed;
-                cj["is_reduce"] = cluster->is_reduce;
-                cj["layer_config"] = cluster->layer_config;
-                cj["layer_replicate_flags"] = cluster->layer_replicate_flags;
+                int query_id = buf.read_val<int>();
+                int k = buf.read_val<int>();
+                std::vector<T> query_vector = buf.read_vec<T>();
 
-                json nodes_json = json::array();
-                for (int i = 0; i < cluster->node_num && i < (int)cluster->nodes.size(); i++)
-                {
-                    json nj;
-                    nj["node_id"] = i;
-                    nj["ip_addr"] = cluster->nodes[i].ip_addr;
-                    nj["port"] = cluster->nodes[i].port;
-                    nj["is_remote_node"] = cluster->nodes[i].is_remote_node;
-                    nodes_json.push_back(std::move(nj));
-                }
-                cj["nodes"] = std::move(nodes_json);
-                info["cluster"] = std::move(cj);
+                Payload<T> payload;
+                deserialize_payload(buf, payload);
 
-                if (cluster->hnsw)
+                std::vector<int> results;
+                
+                // Reduce模式：调用cluster级别查询，并行向所有节点发送查询并合并结果
+                if (cluster && cluster->is_reduce)
                 {
-                    json hj;
-                    hj["dim"] = cluster->hnsw->dim;
-                    hj["m"] = cluster->hnsw->m;
-                    hj["ef_construction"] = cluster->hnsw->ef_construction;
-                    hj["ef_search"] = cluster->hnsw->ef_search;
-                    hj["limited_level"] = cluster->hnsw->limited_level;
-                    hj["max_level"] = cluster->hnsw->max_level;
-                    info["hnsw"] = std::move(hj);
+                    results = cluster->query(query_id, query_vector, payload, k);
                 }
                 else
                 {
+                    // 非Reduce模式：执行本地查询
+                    this->query(query_id, query_vector, payload, k);
+                    results = payload.topk_ids(k);
+                }
+                
+                LOG_DEBUG_STREAM("[Node " << node_id << "] MSG_QUERY: results.size=" << results.size());
+
+                Buffer resp_buf;
+                resp_buf.write_val((int)results.size());
+                for (const auto &id : results)
+                {
+                    resp_buf.write_val((T)0.0); // distance placeholder
+                    resp_buf.write_val(id);
+                }
+                serialize_payload(resp_buf, payload);
+
+                uint64_t resp_size = resp_buf.data.size();
+                send_all(client_fd, &resp_size, sizeof(uint64_t));
+                send_all(client_fd, resp_buf.data.data(), resp_size);
+                continue;
+            }
+            else if (msg_type == MSG_QUERY_LOCAL)
+            {
+                // Reduce模式下的本地查询请求（来自其他节点，避免递归）
+                int query_id = buf.read_val<int>();
+                int k = buf.read_val<int>();
+                std::vector<T> query_vector = buf.read_vec<T>();
+
+                Payload<T> payload;
+                deserialize_payload(buf, payload);
+
+                std::vector<pair<T, int>> results;
+                
+                // 只执行本地HNSW查询
+                if (local_hnsw)
+                {
+                    local_hnsw->query(query_vector, payload, k);
+                    auto pq = payload.results;
+                    while (!pq.empty())
+                    {
+                        results.push_back(pq.top());
+                        pq.pop();
+                    }
+                }
+                
+                LOG_DEBUG_STREAM("[Node " << node_id << "] MSG_QUERY_LOCAL: results.size=" << results.size());
+
+                Buffer resp_buf;
+                resp_buf.write_val((int)results.size());
+                for (const auto &p : results)
+                {
+                    resp_buf.write_val(p.first);   // distance
+                    resp_buf.write_val(p.second);  // id
+                }
+                serialize_payload(resp_buf, payload);
+
+                uint64_t resp_size = resp_buf.data.size();
+                send_all(client_fd, &resp_size, sizeof(uint64_t));
+                send_all(client_fd, resp_buf.data.data(), resp_size);
+                continue;
+            }
+            else if (msg_type == MSG_PARTITION)
+            {
+                std::string mode = buf.read_string();
+                int redundancy = buf.read_val<int>();
+                std::unordered_map<int, std::vector<int>> layer_config;
+                std::string layer_partition_mode = "round_robin";
+                std::vector<bool> layer_replicate_flags;
+                if (mode == "layer")
+                {
+                    deserialize_layer_config(buf, layer_config);
+                    layer_partition_mode = buf.read_string();
+                    deserialize_layer_replicate_flags(buf, layer_replicate_flags);
+                }
+
+                if (cluster)
+                {
+                    cluster->partition(mode, redundancy, layer_config, layer_partition_mode, layer_replicate_flags);
+                }
+
+                char ack = 1;
+                send_all(client_fd, &ack, 1);
+                // 一次性操作，退出循环
+                break;
+            }
+            else if (msg_type == MSG_LOAD_CLUSTER)
+            {
+                std::string filepath = buf.read_string();
+                bool ok = false;
+                if (cluster)
+                {
+                    Cluster<T> *loaded = nullptr;
+                    try
+                    {
+                        loaded = Cluster<T>::load(filepath);
+                    }
+                    catch (...)
+                    {
+                        loaded = nullptr;
+                    }
+
+                    if (loaded && loaded->node_num == cluster->node_num)
+                    {
+                        cluster->bandwidth = loaded->bandwidth;
+                        cluster->partition_mode = loaded->partition_mode;
+                        cluster->outer_ring_max_iterations = loaded->outer_ring_max_iterations;
+                        cluster->redundancy_level = loaded->redundancy_level;
+                        cluster->redundancy_num = loaded->redundancy_num;
+                        cluster->is_distributed = loaded->is_distributed;
+                        cluster->is_reduce = loaded->is_reduce;
+                        cluster->add_round_robin_counter.store(loaded->add_round_robin_counter.load());
+                        cluster->vector_node_map = std::move(loaded->vector_node_map);
+                        cluster->layer_config = std::move(loaded->layer_config);
+                        cluster->layer_replicate_flags = std::move(loaded->layer_replicate_flags);
+
+                        if (cluster->hnsw && cluster->hnsw != loaded->hnsw)
+                        {
+                            delete cluster->hnsw;
+                        }
+                        cluster->hnsw = loaded->hnsw;
+                        loaded->hnsw = nullptr;
+
+                        for (int i = 0; i < cluster->node_num && i < (int)loaded->nodes.size(); i++)
+                        {
+                            cluster->nodes[i].num_queries = loaded->nodes[i].num_queries;
+                            cluster->nodes[i].is_remote_node = loaded->nodes[i].is_remote_node;
+                            cluster->nodes[i].ip_addr = loaded->nodes[i].ip_addr;
+                            cluster->nodes[i].port = loaded->nodes[i].port;
+
+                            if (cluster->nodes[i].local_hnsw != nullptr && cluster->nodes[i].local_hnsw != cluster->hnsw)
+                            {
+                                delete cluster->nodes[i].local_hnsw;
+                            }
+                            cluster->nodes[i].local_hnsw = loaded->nodes[i].local_hnsw;
+                            loaded->nodes[i].local_hnsw = nullptr;
+                        }
+
+                        ok = true;
+                    }
+
+                    if (loaded)
+                    {
+                        delete loaded;
+                    }
+                }
+                char ack = ok ? 1 : 0;
+                send_all(client_fd, &ack, 1);
+                // 一次性操作，退出循环
+                break;
+            }
+            else if (msg_type == MSG_LOAD_HNSW)
+            {
+                std::string filepath = buf.read_string();
+                bool ok = false;
+                if (cluster)
+                {
+                    HNSWGraph<T> *loaded_hnsw = nullptr;
+                    try
+                    {
+                        loaded_hnsw = HNSWGraph<T>::load(filepath);
+                    }
+                    catch (...)
+                    {
+                        loaded_hnsw = nullptr;
+                    }
+
+                    if (loaded_hnsw)
+                    {
+                        if (cluster->hnsw && cluster->hnsw != loaded_hnsw)
+                        {
+                            delete cluster->hnsw;
+                        }
+                        cluster->hnsw = loaded_hnsw;
+
+                        ok = true;
+                    }
+                }
+                char ack = ok ? 1 : 0;
+                send_all(client_fd, &ack, 1);
+                // 一次性操作，退出循环
+                break;
+            }
+            else if (msg_type == MSG_SAVE_HNSW)
+            {
+                std::string filepath = buf.read_string();
+                bool ok = false;
+                if (cluster && cluster->hnsw)
+                {
+                    try
+                    {
+                        cluster->hnsw->save(filepath);
+                        ok = true;
+                    }
+                    catch (...) {}
+                }
+                char ack = ok ? 1 : 0;
+                send_all(client_fd, &ack, 1);
+                // 一次性操作，退出循环
+                break;
+            }
+            else if (msg_type == MSG_GET_INFORMATION)
+            {
+                json info;
+                if (cluster)
+                {
+                    json cj;
+                    cj["node_num"] = cluster->node_num;
+                    cj["bandwidth"] = cluster->bandwidth;
+                    cj["partition_mode"] = cluster->partition_mode;
+                    cj["redundancy_level"] = cluster->redundancy_level;
+                    cj["redundancy_num"] = cluster->redundancy_num;
+                    cj["is_distributed"] = cluster->is_distributed;
+                    cj["is_reduce"] = cluster->is_reduce;
+                    cj["layer_config"] = cluster->layer_config;
+                    cj["layer_replicate_flags"] = cluster->layer_replicate_flags;
+
+                    json nodes_json = json::array();
+                    for (int i = 0; i < cluster->node_num && i < (int)cluster->nodes.size(); i++)
+                    {
+                        json nj;
+                        nj["node_id"] = i;
+                        nj["ip_addr"] = cluster->nodes[i].ip_addr;
+                        nj["port"] = cluster->nodes[i].port;
+                        nj["is_remote_node"] = cluster->nodes[i].is_remote_node;
+                        // 只有本地节点才有 vector_count
+                        if (!cluster->nodes[i].is_remote_node && cluster->nodes[i].local_hnsw)
+                        {
+                            nj["vector_count"] = (int)cluster->nodes[i].local_hnsw->vectors.size();
+                        }
+                        nodes_json.push_back(std::move(nj));
+                    }
+                    cj["nodes"] = std::move(nodes_json);
+                    info["cluster"] = std::move(cj);
+
+                    if (cluster->hnsw)
+                    {
+                        json hj;
+                        hj["dim"] = cluster->hnsw->dim;
+                        hj["m"] = cluster->hnsw->m;
+                        hj["ef_construction"] = cluster->hnsw->ef_construction;
+                        hj["ef_search"] = cluster->hnsw->ef_search;
+                        hj["limited_level"] = cluster->hnsw->limited_level;
+                        hj["max_level"] = cluster->hnsw->max_level;
+                        info["hnsw"] = std::move(hj);
+                    }
+                    else
+                    {
+                        info["hnsw"] = nullptr;
+                    }
+                }
+                else
+                {
+                    info["cluster"] = nullptr;
                     info["hnsw"] = nullptr;
                 }
-            }
-            else
-            {
-                info["cluster"] = nullptr;
-                info["hnsw"] = nullptr;
-            }
 
-            std::string out = info.dump();
-            Buffer resp_buf;
-            resp_buf.write_string(out);
-            uint64_t resp_size = resp_buf.data.size();
-            send_all(client_fd, &resp_size, sizeof(uint64_t));
-            send_all(client_fd, resp_buf.data.data(), resp_size);
-            close_connection_soft(client_fd);
-        }
-        else if (msg_type == MSG_SAVE_CLUSTER)
-        {
-            std::string filepath = buf.read_string();
-            char ack = 0;
-            if (cluster)
-            {
-                ack = cluster->save(filepath) ? 1 : 0;
+                std::string out = info.dump();
+                Buffer resp_buf;
+                resp_buf.write_string(out);
+                uint64_t resp_size = resp_buf.data.size();
+                send_all(client_fd, &resp_size, sizeof(uint64_t));
+                send_all(client_fd, resp_buf.data.data(), resp_size);
+                // 一次性操作，退出循环
+                break;
             }
-            send_all(client_fd, &ack, 1);
-            close_connection_hard(client_fd);
-        }
-        else if (msg_type == MSG_SEARCH_RESULT)
-        {
-            // 接收异步查询结果
-            int query_id = buf.read_val<int>();
-            std::vector<int> results = buf.read_vec<int>();
-            
-            LOG_DEBUG_STREAM("[Node " << node_id << "] Received MSG_SEARCH_RESULT for query " << query_id);
-            
-            Payload<T> payload;
-            deserialize_payload(buf, payload);
-            
-            // 设置到 pending_queries
-            std::lock_guard<std::mutex> lk(pending_queries_mu);
-            auto& pq = pending_queries[query_id];
-            pq.results = std::move(results);
-            pq.payload = std::move(payload);
-            pq.completed = true;
-            pending_queries_cv.notify_all();
+            else if (msg_type == MSG_SAVE_CLUSTER)
+            {
+                std::string filepath = buf.read_string();
+                char ack = 0;
+                if (cluster)
+                {
+                    ack = cluster->save(filepath) ? 1 : 0;
+                }
+                send_all(client_fd, &ack, 1);
+                // 一次性操作，退出循环
+                break;
+            }
+            else if (msg_type == MSG_SEARCH_RESULT)
+            {
+                // 接收异步查询结果
+                int query_id = buf.read_val<int>();
+                std::vector<int> results = buf.read_vec<int>();
 
-            LOG_DEBUG_STREAM("[Node " << node_id << "] Notified waiting thread for query " << query_id);
-            
-            // MSG_SEARCH_RESULT 不需要回复，直接关闭连接
-            close_connection_hard(client_fd);
+                LOG_DEBUG_STREAM("[Node " << node_id << "] Received MSG_SEARCH_RESULT for query " << query_id);
+
+                Payload<T> payload;
+                deserialize_payload(buf, payload);
+
+                // 设置到 pending_queries
+                std::lock_guard<std::mutex> lk(pending_queries_mu);
+                auto& pq = pending_queries[query_id];
+                pq.results = std::move(results);
+                pq.payload = std::move(payload);
+                pq.completed = true;
+                pending_queries_cv.notify_all();
+
+                LOG_DEBUG_STREAM("[Node " << node_id << "] Notified waiting thread for query " << query_id);
+                // 持久连接：继续等待下一个消息
+                continue;
+            }
+        }
+        catch (const std::exception &e)
+        {
+            LOG_DEBUG_STREAM("Error handling client: " << e.what());
+            break;
+        }
+        catch (...)
+        {
+            break;
         }
     }
-    catch (const std::exception &e)
-    {
-        LOG_DEBUG_STREAM("Error handling client: " << e.what());
-        close_connection_hard(client_fd);
-    }
-    catch (...)
-    {
-        close_connection_hard(client_fd);
-    }
-    
+
+    close_connection_hard(client_fd);
     active_handlers--;
-    return;
 }
 
 template <typename T>
@@ -2258,54 +2520,11 @@ void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& result
     // origin_node 是远程节点，通过网络发送结果
     LOG_DEBUG_STREAM("[Node " << node_id << "] Sending result to remote origin node " << payload.origin_node_id);
     
-    // 创建新连接发送结果
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    // 使用连接池获取连接
+    int sock = g_connection_pool.acquire(payload.origin_node_id);
     if (sock < 0)
     {
-        LOG_DEBUG_STREAM("[Node " << node_id << "] Failed to create socket to origin node");
-        return;
-    }
-
-    // 设置SO_REUSEADDR允许重用TIME_WAIT状态的端口
-    int reuse = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    struct sockaddr_in serv_addr;
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(origin_node.port);
-    if (inet_pton(AF_INET, origin_node.ip_addr.c_str(), &serv_addr.sin_addr) <= 0)
-    {
-        LOG_DEBUG_STREAM("[Node " << node_id << "] Invalid address for origin node");
-        close(sock);
-        return;
-    }
-
-    // 重试连接,防止高并发时连接失败
-    int max_retries = 5;
-    int retry_delay_ms = 10;
-    bool connected = false;
-    
-    for (int retry = 0; retry < max_retries; retry++)
-    {
-        if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0)
-        {
-            connected = true;
-            break;
-        }
-        
-        if (retry < max_retries - 1)
-        {
-            LOG_DEBUG_STREAM("[Node " << node_id << "] Failed to connect to origin node (attempt " << (retry + 1) << "/" << max_retries << "), retrying...");
-            std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay_ms));
-            retry_delay_ms *= 2;  // 指数退避
-        }
-    }
-    
-    if (!connected)
-    {
-        LOG_DEBUG_STREAM("[Node " << node_id << "] ERROR: Failed to connect to origin node after " << max_retries << " attempts for query " << query_id);
-        close(sock);
+        LOG_DEBUG_STREAM("[Node " << node_id << "] Failed to get connection to origin node");
         return;
     }
     
@@ -2321,13 +2540,14 @@ void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& result
         send_all(sock, &msg_size, sizeof(uint64_t));
         send_all(sock, buf.data.data(), msg_size);
         
-        close(sock);
+        // 非持久连接：远程节点已关闭，标记为无效
+        g_connection_pool.release(payload.origin_node_id, sock, false);
         LOG_DEBUG_STREAM("[Node " << node_id << "] Result sent to origin node " << payload.origin_node_id);
     }
     catch (...)
     {
         LOG_DEBUG_STREAM("[Node " << node_id << "] Exception sending result to origin node");
-        close(sock);
+        g_connection_pool.release(payload.origin_node_id, sock, false);
     }
 }
 
@@ -2433,34 +2653,16 @@ void Node<T>::add_vector(int vid, const std::vector<T> &vec)
 {
     if (is_remote_node)
     {
-        // 通过网络发送到远程节点
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        // 使用连接池获取连接
+        int sock = g_connection_pool.acquire(node_id);
         if (sock < 0)
         {
-            LOG_DEBUG_STREAM("Failed to create socket for add_vector");
-            return;
-        }
-
-        struct sockaddr_in serv_addr;
-        memset(&serv_addr, 0, sizeof(serv_addr));
-        serv_addr.sin_family = AF_INET;
-        serv_addr.sin_port = htons(port);
-        if (inet_pton(AF_INET, ip_addr.c_str(), &serv_addr.sin_addr) <= 0)
-        {
-            LOG_DEBUG_STREAM("Invalid address for add_vector: " << ip_addr);
-            close(sock);
-            return;
-        }
-
-        if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-        {
-            LOG_DEBUG_STREAM("Failed to connect for add_vector");
-            close(sock);
+            LOG_DEBUG_STREAM("Failed to get connection for add_vector");
             return;
         }
 
         Buffer buf;
-        buf.write_val((int)MSG_ADD_VECTOR);
+        buf.write_val((int)MSG_ADD_VECTOR_LOCAL);  // 使用 LOCAL 消息类型，避免递归路由
         buf.write_val(vid);
         buf.write_vec(vec);
 
@@ -2473,22 +2675,28 @@ void Node<T>::add_vector(int vid, const std::vector<T> &vec)
             // Wait for ACK
             char ack = 0;
             recv_all(sock, &ack, 1);
-            close(sock);
+            // 远程节点在发送ACK后会关闭连接，所以这里标记为无效
+            g_connection_pool.release(node_id, sock, false);
         }
         catch (const std::exception &e)
         {
             LOG_DEBUG_STREAM("Error sending add_vector: " << e.what());
-            close(sock);
+            g_connection_pool.release(node_id, sock, false);
         }
     }
     else
     {
         // 确保 local_hnsw 已初始化（reduce模式下按需初始化）
+        // 双重检查锁定：只保护指针创建，add_vector 内部已有线程安全保护
         if (local_hnsw == nullptr && cluster->is_reduce)
         {
-            local_hnsw = new HNSWGraph<T>(
-                cluster->hnsw->dim, cluster->hnsw->m, cluster->hnsw->ef_construction,
-                cluster->hnsw->ef_search, cluster->hnsw->limited_level, cluster->hnsw->seed);
+            std::lock_guard<std::mutex> lk(local_hnsw_mutex);
+            if (local_hnsw == nullptr)
+            {
+                local_hnsw = new HNSWGraph<T>(
+                    cluster->hnsw->dim, cluster->hnsw->m, cluster->hnsw->ef_construction,
+                    cluster->hnsw->ef_search, cluster->hnsw->limited_level, cluster->hnsw->seed);
+            }
         }
 
         if (local_hnsw)

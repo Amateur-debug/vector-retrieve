@@ -19,6 +19,7 @@ private:
     bool connected;
     int timeout_sec;
     std::vector<QueryEndpoint> query_endpoints;
+    size_t current_endpoint_idx;  // 当前连接的端点索引，-1 表示无效
 
 public:
     bool init_routes()
@@ -85,6 +86,10 @@ public:
                 std::string ip = node.value("ip_addr", "");
                 int port = node.value("port", -1);
                 if (node_id >= 0 && !ip.empty() && port > 0) {
+                    // 如果节点端口等于 host_port，说明是本机节点
+                    if (port == host_port) {
+                        ip = host_ip;
+                    }
                     node_addr[node_id] = {ip, port};
                 }
             }
@@ -92,102 +97,107 @@ public:
                 return false;
             }
 
-            std::vector<int> entry_nodes;
-            bool entry_replicated = false;
-            int selected_entry_level = -1;
             const std::string partition_mode = cluster.value("partition_mode", "");
-            if (partition_mode != "layer" || !cluster.contains("layer_config")) {
-                return false;
-            }
-
-            const auto &layer_config = cluster["layer_config"];
-            std::vector<int> configured_levels;
-            std::unordered_map<int, std::vector<int>> parsed_layer_config;
-
-            if (layer_config.is_object()) {
-                configured_levels.reserve(layer_config.size());
-                for (auto it = layer_config.begin(); it != layer_config.end(); ++it) {
-                    try {
-                        int level = std::stoi(it.key());
-                        if (level >= 0 && it.value().is_array()) {
-                            parsed_layer_config[level] = it.value().get<std::vector<int>>();
-                            configured_levels.push_back(level);
-                        }
-                    } catch (...) {
-                        continue;
-                    }
-                }
-            } else if (layer_config.is_array()) {
-                configured_levels.reserve(layer_config.size());
-                for (const auto &item : layer_config) {
-                    if (!item.is_array() || item.size() != 2) {
-                        continue;
-                    }
-                    int level = -1;
-                    try {
-                        level = item[0].get<int>();
-                    } catch (...) {
-                        continue;
-                    }
-                    if (level < 0 || !item[1].is_array()) {
-                        continue;
-                    }
-                    try {
-                        parsed_layer_config[level] = item[1].get<std::vector<int>>();
-                        configured_levels.push_back(level);
-                    } catch (...) {
-                        continue;
-                    }
-                }
-            } else {
-                return false;
-            }
-
-            if (configured_levels.empty()) {
-                return false;
-            }
-
-            std::sort(configured_levels.begin(), configured_levels.end(), std::greater<int>());
-            for (int level : configured_levels) {
-                std::vector<int> level_nodes;
-                const auto it = parsed_layer_config.find(level);
-                if (it == parsed_layer_config.end()) {
-                    continue;
-                }
-                for (int nid : it->second) {
-                    if (node_addr.count(nid)) {
-                        level_nodes.push_back(nid);
-                    }
-                }
-                if (!level_nodes.empty()) {
-                    selected_entry_level = level;
-                    entry_nodes = std::move(level_nodes);
-                    break;
-                }
-            }
-
-            if (selected_entry_level < 0 || entry_nodes.empty()) {
-                return false;
-            }
-
-            if (cluster.contains("layer_replicate_flags") && cluster["layer_replicate_flags"].is_array()) {
-                const auto &flags = cluster["layer_replicate_flags"];
-                if (selected_entry_level < (int)flags.size()) {
-                    entry_replicated = flags[selected_entry_level].get<bool>();
-                }
-            }
-
             std::vector<std::string> ips;
             std::vector<int> ports;
-            if (entry_replicated) {
-                for (int nid : entry_nodes) {
-                    ips.push_back(node_addr[nid].first);
-                    ports.push_back(node_addr[nid].second);
+
+            if (partition_mode == "layer" && cluster.contains("layer_config")) {
+                // Layer 模式：根据 layer_config 和 layer_replicate_flags 选择入口节点
+                const auto &layer_config = cluster["layer_config"];
+                std::vector<int> configured_levels;
+                std::unordered_map<int, std::vector<int>> parsed_layer_config;
+
+                if (layer_config.is_object()) {
+                    configured_levels.reserve(layer_config.size());
+                    for (auto it = layer_config.begin(); it != layer_config.end(); ++it) {
+                        try {
+                            int level = std::stoi(it.key());
+                            if (level >= 0 && it.value().is_array()) {
+                                parsed_layer_config[level] = it.value().get<std::vector<int>>();
+                                configured_levels.push_back(level);
+                            }
+                        } catch (...) {
+                            continue;
+                        }
+                    }
+                } else if (layer_config.is_array()) {
+                    configured_levels.reserve(layer_config.size());
+                    for (const auto &item : layer_config) {
+                        if (!item.is_array() || item.size() != 2) {
+                            continue;
+                        }
+                        int level = -1;
+                        try {
+                            level = item[0].get<int>();
+                        } catch (...) {
+                            continue;
+                        }
+                        if (level < 0 || !item[1].is_array()) {
+                            continue;
+                        }
+                        try {
+                            parsed_layer_config[level] = item[1].get<std::vector<int>>();
+                            configured_levels.push_back(level);
+                        } catch (...) {
+                            continue;
+                        }
+                    }
+                }
+
+                if (!configured_levels.empty()) {
+                    std::sort(configured_levels.begin(), configured_levels.end(), std::greater<int>());
+                    std::vector<int> entry_nodes;
+                    int selected_entry_level = -1;
+                    
+                    for (int level : configured_levels) {
+                        std::vector<int> level_nodes;
+                        const auto it = parsed_layer_config.find(level);
+                        if (it == parsed_layer_config.end()) {
+                            continue;
+                        }
+                        for (int nid : it->second) {
+                            if (node_addr.count(nid)) {
+                                level_nodes.push_back(nid);
+                            }
+                        }
+                        if (!level_nodes.empty()) {
+                            selected_entry_level = level;
+                            entry_nodes = std::move(level_nodes);
+                            break;
+                        }
+                    }
+
+                    if (selected_entry_level >= 0 && !entry_nodes.empty()) {
+                        bool entry_replicated = false;
+                        if (cluster.contains("layer_replicate_flags") && cluster["layer_replicate_flags"].is_array()) {
+                            const auto &flags = cluster["layer_replicate_flags"];
+                            if (selected_entry_level < (int)flags.size()) {
+                                entry_replicated = flags[selected_entry_level].get<bool>();
+                            }
+                        }
+
+                        if (entry_replicated) {
+                            for (int nid : entry_nodes) {
+                                ips.push_back(node_addr[nid].first);
+                                ports.push_back(node_addr[nid].second);
+                            }
+                        } else {
+                            int nid = entry_nodes.front();
+                            ips.push_back(node_addr[nid].first);
+                            ports.push_back(node_addr[nid].second);
+                        }
+                    }
                 }
             } else {
-                int nid = entry_nodes.front();
-                ips.push_back(node_addr[nid].first);
-                ports.push_back(node_addr[nid].second);
+                // 非 Layer 模式（k-means, round_robin, reduce 等）：所有节点作为入口点
+                for (const auto &kv : node_addr) {
+                    ips.push_back(kv.second.first);
+                    ports.push_back(kv.second.second);
+                }
+            }
+
+            if (ips.empty()) {
+                return false;
             }
 
             set_query_endpoints(ips, ports);
@@ -199,22 +209,31 @@ public:
     }
 
     ClusterSDKClient(const std::string &ip = "127.0.0.1", int port = 19000, int timeout = 5)
-        : host_ip(ip), host_port(port), sockfd(-1), connected(false), timeout_sec(timeout) {}
+        : host_ip(ip), host_port(port), sockfd(-1), connected(false), timeout_sec(timeout), current_endpoint_idx((size_t)-1) {}
 
     ~ClusterSDKClient() { disconnect(); }
 
-    bool connect()
+    bool connect(const std::string &ip = "", int port = -1)
     {
         if (connected) return true;
+
+        // 使用传入参数或默认成员变量
+        const std::string &target_ip = ip.empty() ? host_ip : ip;
+        int target_port = (port >= 0) ? port : host_port;
 
         sockfd = socket(AF_INET, SOCK_STREAM, 0);
         if (sockfd < 0) return false;
 
+        // 设置 socket 选项
+        int opt = 1;
+        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
         struct sockaddr_in serv_addr;
         memset(&serv_addr, 0, sizeof(serv_addr));
         serv_addr.sin_family = AF_INET;
-        serv_addr.sin_port = htons(host_port);
-        if (inet_pton(AF_INET, host_ip.c_str(), &serv_addr.sin_addr) <= 0) {
+        serv_addr.sin_port = htons(target_port);
+        if (inet_pton(AF_INET, target_ip.c_str(), &serv_addr.sin_addr) <= 0) {
             close(sockfd); sockfd = -1; return false;
         }
 
@@ -233,6 +252,7 @@ public:
             close(sockfd);
             sockfd = -1;
             connected = false;
+            current_endpoint_idx = (size_t)-1;
         }
     }
 
@@ -277,22 +297,33 @@ public:
             disconnect();
             throw;
         }
-        disconnect();
+        disconnect();  // 非持久连接：每次调用后断开
     }
 
     std::vector<int> query(int query_id, const std::vector<T> &query_vector, Payload<T> &payload, int k = 10)
     {
+        size_t target_idx = (size_t)-1;
+        std::string target_ip = host_ip;
+        int target_port = host_port;
+        
         if (!query_endpoints.empty()) {
             static thread_local std::mt19937 gen(std::random_device{}());
             std::uniform_int_distribution<size_t> dist(0, query_endpoints.size() - 1);
-            const QueryEndpoint &ep = query_endpoints[dist(gen)];
-            host_ip = ep.ip;
-            host_port = ep.port;
+            target_idx = dist(gen);
+            const QueryEndpoint &ep = query_endpoints[target_idx];
+            target_ip = ep.ip;
+            target_port = ep.port;
         }
 
-        if (!connected && !connect()) {
+        // 如果连接的端点不是目标端点，断开重连
+        if (connected && current_endpoint_idx != target_idx) {
+            disconnect();
+        }
+
+        if (!connected && !connect(target_ip, target_port)) {
             throw std::runtime_error("Failed to connect to cluster");
         }
+        current_endpoint_idx = target_idx;
 
         try {
             Buffer buf;
@@ -323,7 +354,7 @@ public:
             }
             deserialize_payload(resp_buf, payload);
 
-            disconnect();
+            // 持久连接：不断开，复用连接
             return results;
         } catch (...) {
             disconnect();

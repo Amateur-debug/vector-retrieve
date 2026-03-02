@@ -181,28 +181,33 @@ class VectorRetrieveRunner:
                 print(f"Host machine identified as node {self.host_id} with IP {self.host_ip}.")
                 # We already attempted local cleanup; continue to next
                 continue
-            # Escape backslashes in username (e.g., DOMAIN\user) for safe usage
-            esc_user = self.user_name.replace("\\", "\\\\") if "\\" in self.user_name else self.user_name
             # Remote two-stage kill: find PIDs, TERM, wait, then KILL if still present
             remote_cmd = (
-                "pids=$(pgrep -f node_start.py || true); "
-                "if [ -n \"$pids\" ]; then kill -TERM $pids 2>/dev/null || true; sleep 1; "
-                "pids2=$(pgrep -f node_start.py || true); if [ -n \"$pids2\" ]; then kill -KILL $pids2 2>/dev/null || true; fi; fi"
+                f"pids=$(pgrep -f node_start.py || true); "
+                f"if [ -n \"$pids\" ]; then echo \"Killing PIDs: $pids on {ip}\"; kill -TERM $pids 2>/dev/null || true; sleep 1; "
+                f"pids2=$(pgrep -f node_start.py || true); if [ -n \"$pids2\" ]; then echo \"Force killing PIDs: $pids2 on {ip}\"; kill -KILL $pids2 2>/dev/null || true; fi; fi"
             )
             cmd = [
                 "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                f"{esc_user}@{ip}",
+                f"{self.user_name}@{ip}",
                 remote_cmd
             ]
-            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            cleanup_procs.append(proc)
+            print(f"  Cleaning node {i} on {ip}...")
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            cleanup_procs.append((proc, ip))
         # Wait for cleanup commands to finish (with timeout) and ensure remote processes are killed
-        for proc in cleanup_procs:
+        for proc, ip in cleanup_procs:
             try:
-                proc.wait(timeout=15)
+                stdout, stderr = proc.communicate(timeout=30)
+                if stdout:
+                    print(f"  [{ip}] {stdout.decode().strip()}")
+                if stderr:
+                    print(f"  [{ip}] ERROR: {stderr.decode().strip()}")
             except subprocess.TimeoutExpired:
                 proc.kill()
-        time.sleep(1)  # Short wait to ensure remote kills completed
+                print(f"  [{ip}] Cleanup command timed out")
+        print("Waiting for ports to be released...")
+        time.sleep(3)  # Wait for ports to be fully released
 
         # Launch all workers (including local host machine)
         current_dir = os.getcwd()
@@ -333,6 +338,10 @@ class VectorRetrieveRunner:
 
             build_time = time.time() - start_time
             print(f"Building Time: {build_time:.4f} seconds (using {self.num_construction_threads} threads via SDK).")
+
+            # 分布式模式下打印各节点的向量数量
+            if self.args.distributed and self.args.reduce:
+                self._print_node_vector_counts()
             return build_time
 
         print(f"Building in {mode_label} via SDK...")
@@ -345,9 +354,41 @@ class VectorRetrieveRunner:
                 thread_client.add_vector(idx, vector)
             build_time = time.time() - start_time
             print(f"Building Time: {build_time:.4f} seconds.")
+
+            # 分布式模式下打印各节点的向量数量
+            if self.args.distributed and self.args.reduce:
+                self._print_node_vector_counts()
             return build_time
         finally:
             thread_client.disconnect()
+
+    def _print_node_vector_counts(self):
+        """打印各节点的向量数量（分布式reduce模式）"""
+        print("Node vector counts:")
+        # 通过 SDK 获取每个节点的信息
+        for i, ip in enumerate(self.node_ips):
+            try:
+                port = 19000 + i
+                # 对于本地节点使用 127.0.0.1
+                connect_ip = "127.0.0.1" if i == self.host_id else ip
+                client = ClusterSDKClient(ip=connect_ip, port=port, timeout=2)
+                if client.connect():
+                    info = client.get_information()
+                    client.disconnect()
+                    if info and "cluster" in info and "nodes" in info["cluster"]:
+                        nodes = info["cluster"]["nodes"]
+                        # 找到当前连接节点的信息（is_remote_node=False 的那个）
+                        count = None
+                        for node_info in nodes:
+                            if node_info.get("is_remote_node") == False:
+                                count = node_info.get("vector_count", 0)
+                                break
+                        if count is not None:
+                            print(f"  Node {i}: {count} vectors")
+                            continue
+                print(f"  Node {i}: (failed to get info)")
+            except Exception as e:
+                print(f"  Node {i}: (error: {e})")
 
     def prepare(self):
         # 在分布式模式下，不创建cluster和hnsw，直接使用SDK
@@ -513,6 +554,13 @@ class VectorRetrieveRunner:
 
                     build_time = time.time() - start_time
                     print(f"Building Machine Time: {build_time:.4f} seconds (using {num_threads} threads).")
+
+                    # 打印每个节点的向量数量
+                    if not self.args.distributed:
+                        print("Node vector counts:")
+                        for i, node in enumerate(self.cluster.nodes):
+                            count = len(node.local_hnsw.vectors) if node.local_hnsw else 0
+                            print(f"  Node {i}: {count} vectors")
                 else:
                     print("Building cluster in reduce mode...")
                     start_time = time.time()
@@ -520,6 +568,13 @@ class VectorRetrieveRunner:
                         self.cluster.add_vector(idx, vector)  # 轮询添加到各节点
                     build_time = time.time() - start_time
                     print(f"Building Machine Time: {build_time:.4f} seconds.")
+
+                    # 打印每个节点的向量数量
+                    if not self.args.distributed:
+                        print("Node vector counts:")
+                        for i, node in enumerate(self.cluster.nodes):
+                            count = len(node.local_hnsw.vectors) if node.local_hnsw else 0
+                            print(f"  Node {i}: {count} vectors")
             else:
                 # 传统模式（非分布式）：先建统一图，再分区
                 num_threads = self.num_construction_threads
@@ -587,6 +642,13 @@ class VectorRetrieveRunner:
 
                     build_time = time.time() - start_time
                     print(f"Building Machine Time: {build_time:.4f} seconds (using {num_threads} threads).")
+
+                    # 打印每个节点的向量数量
+                    if not self.args.distributed:
+                        print("Node vector counts:")
+                        for i, node in enumerate(self.cluster.nodes):
+                            count = len(node.local_hnsw.vectors) if node.local_hnsw else 0
+                            print(f"  Node {i}: {count} vectors")
                 else:
                     print("Building HNSW index (single-threaded)...")
                     start_time = time.time()
@@ -625,7 +687,7 @@ class VectorRetrieveRunner:
                 }
             print("Distributed query entry nodes are initialized by SDK from cluster info.")
 
-        def query(worker_id, stats_list):
+        def query(worker_id, stats_list, progress_counter=None):
             local_recall = {}
             local_remote_transfer_cnt = {}
             local_remote_transfer_latency = {}
@@ -638,9 +700,10 @@ class VectorRetrieveRunner:
                     ip=self.sdk_config['ip'],
                     port=self.sdk_config['port']
                 )
-                if self.use_layer:
-                    if not thread_sdk_client.init_routes():
-                        raise RuntimeError("Failed to initialize distributed query routes in SDK")
+                # 所有分布式模式都需要初始化路由（包括 reduce 模式）
+                if not thread_sdk_client.init_routes():
+                    # init_routes 失败时回退到默认地址
+                    print(f"[Worker {worker_id}] Warning: init_routes failed, using default endpoint")
 
             try:
                 # 打乱查询顺序，每个线程使用不同的随机顺序
@@ -649,6 +712,7 @@ class VectorRetrieveRunner:
                 random.seed(worker_id)  # 每个线程使用不同的种子
                 random.shuffle(query_indices)
                 
+                local_count = 0
                 for idx, i in enumerate(query_indices):
                     query_vec = queries[i]
                     start_time = time.time()
@@ -665,7 +729,7 @@ class VectorRetrieveRunner:
                         # 非分布式模式。
                         if self.args.reduce:
                             # Reduce 模式：向所有节点查询并聚合结果。
-                            results = self.cluster.query(i + worker_id * self.num_queries, query_vec, payload, self.k)
+                            results = self.cluster.query(i + worker_id * self.num_queries, query_vec, payload, self.K)
                             results = set(results)
                             local_remote_transfer_cnt[i] = 0
                             local_remote_transfer_latency[i] = 0.0
@@ -689,12 +753,17 @@ class VectorRetrieveRunner:
                     correct = len(results.intersection(true_ids))
                     local_recall[i] = correct / self.k
 
-                    # print(f"\nQuery({worker_id}, {i}) Machine time: {query_time * 1000:.4f} ms")
-                    # print(f"  - Network latency: {local_remote_transfer_latency[i]:.4f} ms")
-                    # print(f"  - Remote transfers cnt: {local_remote_transfer_cnt[i]}")
-                    # print(f"  - Average remote transfer latency: {avg_remote_transfer_latency:.4f} ms")
-                    # print(f"  - Distance computations: {local_distance_cnt[i]}")
-                    # print(f"  - Recall@{self.k}: {local_recall[i]:.4f}")
+                    # 更新进度（无锁，丢失少量计数不影响显示准确性）
+                    local_count += 1
+                    if progress_counter is not None:
+                        if local_count % 10 == 0:
+                            progress_counter[0] += 10
+                            local_count = 0
+                
+                # 更新剩余的进度
+                if progress_counter is not None and local_count > 0:
+                    progress_counter[0] += local_count
+
             finally:
                 # 每个进程完成查询后主动释放连接。
                 if thread_sdk_client:
@@ -708,22 +777,132 @@ class VectorRetrieveRunner:
             }
 
         total_query_start_time = time.time()
+        total_queries = self.num_queries * self.num_query_threads
 
         if self.num_query_threads > 1:
-            ctx = mp.get_context("fork")
-            manager = ctx.Manager()
-            stats_list = manager.list([None] * self.num_query_threads)
-            procs = []
+            # 使用多线程（C++层已释放GIL，可以并行）
+            stats_list = [None] * self.num_query_threads
+            progress_counter = [0]
+            threads = []
             for i in range(self.num_query_threads):
-                p = ctx.Process(target=query, args=(i, stats_list))
-                p.start()
-                procs.append(p)
-            for p in procs:
-                p.join()
-            thread_stats = list(stats_list)
+                t = threading.Thread(target=query, args=(i, stats_list, progress_counter))
+                t.start()
+                threads.append(t)
+            
+            # 进度条显示
+            with tqdm(total=total_queries, desc="Querying", unit="qry", 
+                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] QPS: {postfix}') as pbar:
+                pbar.set_postfix_str("0.0")
+                last_value = 0
+                last_update_time = time.time()
+                
+                while any(t.is_alive() for t in threads):
+                    current = progress_counter[0]
+                    now = time.time()
+                    # 每0.5秒更新一次进度条
+                    if now - last_update_time >= 0.5:
+                        elapsed = now - total_query_start_time
+                        current_qps = current / elapsed if elapsed > 0 else 0.0
+                        pbar.update(current - last_value)
+                        pbar.set_postfix_str(f"{current_qps:.1f}")
+                        last_value = current
+                        last_update_time = now
+                    time.sleep(0.1)
+                
+                # 等待所有线程完成
+                for t in threads:
+                    t.join()
+                
+                # 最终更新
+                current = progress_counter[0]
+                elapsed = time.time() - total_query_start_time
+                current_qps = current / elapsed if elapsed > 0 else 0.0
+                pbar.update(current - last_value)
+                pbar.set_postfix_str(f"{current_qps:.1f}")
+            
+            thread_stats = stats_list
         else:
-            thread_stats = [None]
-            query(0, thread_stats)
+            # 单线程模式也显示进度条
+            progress_counter = [0]
+            progress_lock = threading.Lock()
+            
+            # 包装query函数以显示进度
+            stats_list = [None]
+            
+            with tqdm(total=total_queries, desc="Querying", unit="qry",
+                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] QPS: {postfix}') as pbar:
+                pbar.set_postfix_str("0.0")
+                last_update_time = time.time()
+                
+                # 在主线程中执行查询
+                thread_sdk_client = None
+                if self.args.distributed:
+                    thread_sdk_client = ClusterSDKClient(
+                        ip=self.sdk_config['ip'],
+                        port=self.sdk_config['port']
+                    )
+                    # 所有分布式模式都需要初始化路由（包括 reduce 模式）
+                    if not thread_sdk_client.init_routes():
+                        print("[Query] Warning: init_routes failed, using default endpoint")
+
+                local_recall = {}
+                local_remote_transfer_cnt = {}
+                local_remote_transfer_latency = {}
+                local_distance_cnt = {}
+
+                try:
+                    import random
+                    query_indices = list(range(self.num_queries))
+                    random.seed(0)
+                    random.shuffle(query_indices)
+                    
+                    for idx, i in enumerate(query_indices):
+                        query_vec = queries[i]
+                        start_time = time.time()
+
+                        payload = Payload()
+                        if self.args.distributed:
+                            results = thread_sdk_client.query(i, query_vec, payload, k=self.k)
+                            results = set(results)
+                            local_remote_transfer_cnt[i] = payload.remote_transfer_cnt
+                            local_remote_transfer_latency[i] = payload.remote_transfer_latency
+                        else:
+                            if self.args.reduce:
+                                results = self.cluster.query(i, query_vec, payload, self.k)
+                                results = set(results)
+                                local_remote_transfer_cnt[i] = 0
+                                local_remote_transfer_latency[i] = 0.0
+                            else:
+                                results = self.cluster.nodes[self.host_id].query(i, query_vec, payload, k=self.k)
+                                results = set(results)
+                                local_remote_transfer_cnt[i] = payload.remote_transfer_cnt
+                                local_remote_transfer_latency[i] = payload.remote_transfer_latency
+
+                        local_distance_cnt[i] = payload.distance_cnt
+                        true_ids = set(groundtruth[i][:self.k])
+                        correct = len(results.intersection(true_ids))
+                        local_recall[i] = correct / self.k
+
+                        # 更新进度条
+                        pbar.update(1)
+                        now = time.time()
+                        if now - last_update_time >= 0.5:
+                            elapsed = now - total_query_start_time
+                            current_qps = pbar.n / elapsed if elapsed > 0 else 0.0
+                            pbar.set_postfix_str(f"{current_qps:.1f}")
+                            last_update_time = now
+                finally:
+                    if thread_sdk_client:
+                        thread_sdk_client.disconnect()
+
+                stats_list[0] = {
+                    "recall": local_recall,
+                    "remote_transfer_cnt": local_remote_transfer_cnt,
+                    "remote_transfer_latency": local_remote_transfer_latency,
+                    "distance_cnt": local_distance_cnt,
+                }
+            
+            thread_stats = stats_list
 
         # 注意：每个进程自己的连接已经在 query() 函数结束时断开
 
@@ -936,7 +1115,7 @@ if __name__ == "__main__":
     parser.add_argument("--cluster_path", type=str, default=None, help="Path to save/load the cluster")
     parser.add_argument("--k", type=int, default=10, help="Number of nearest neighbors to retrieve")
     parser.add_argument("--m", type=int, default=16, help="Max number of connections per element")
-    parser.add_argument("--ef_construction", type=int, default=32, help="Size of the dynamic candidate list for construction")
+    parser.add_argument("--ef_construction", type=int, default=200, help="Size of the dynamic candidate list for construction")
     parser.add_argument("--ef_search", type=int, default=16, help="Size of the dynamic candidate list for search")
     parser.add_argument("--limited_level", type=int, default=5, help="Level limit for HNSW")
     parser.add_argument("--node_num", type=int, default=6, help="Number of cluster nodes")
@@ -944,20 +1123,22 @@ if __name__ == "__main__":
     parser.add_argument("--layer", action='store_true', default=False, help="Enable layer-based partitioning")
     parser.add_argument("--layer_config", type=str, default="{}", help="Layer configuration in JSON format")
     parser.add_argument("--layer_replicate_flags", type=str, default="[]", help="Layer replicate flags in JSON list; default behavior is [false,false,true,...] based on limited_level")
-    parser.add_argument("--redundancy", type=int, default=1, help="Redundancy level for data replication across nodes")
+    parser.add_argument("--redundancy", type=int, default=2, help="Redundancy level for data replication across nodes")
     parser.add_argument("--distributed", default=False, action='store_true', help="Enable distributed mode")
     parser.add_argument("--reduce", default=False, action='store_true', help="Enable reduce mode (independent graphs per node)")
     parser.add_argument("--num_construction_threads", type=int, default=64, help="Number of threads for parallel graph construction (0=auto detect)")
-    parser.add_argument("--num_query_threads", type=int, default=64, help="Number of threads for querying (each thread does all queries)")
+    parser.add_argument("--num_query_threads", type=int, default=32, help="Number of threads for querying (each thread does all queries)")
     parser.add_argument("--num_cpu", type=int, default=8, help="Limit CPU cores per node process (0=unlimited)")
     parser.add_argument("--save", action='store_true', default=False, help="Save the built graph to disk after construction")
 
     args = parser.parse_args(rest)
 
     runner = VectorRetrieveRunner(args, use_cpp)
-    runner.setup_distributed_nodes()
-    runner.prepare()
-    runner.save_graph()  # 建图完成后立即保存
-    thread_stats, total_query_time, qps = runner.run_queries()
-    runner.save_results(thread_stats, total_query_time, qps)
-    runner.cleanup_workers()
+    try:
+        runner.setup_distributed_nodes()
+        runner.prepare()
+        runner.save_graph()  # 建图完成后立即保存
+        thread_stats, total_query_time, qps = runner.run_queries()
+        runner.save_results(thread_stats, total_query_time, qps)
+    finally:
+        runner.cleanup_workers()
