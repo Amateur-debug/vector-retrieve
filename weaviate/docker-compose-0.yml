@@ -4,21 +4,23 @@ services:
     - --host
     - 0.0.0.0
     - --port
-    - '8080'
+    - '19603'
     - --scheme
     - http
     environment:
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
-      CLUSTER_DATA_BIND_PORT: '7101'
-      CLUSTER_GOSSIP_BIND_PORT: '7100'
+      CLUSTER_DATA_BIND_PORT: '19602'
+      CLUSTER_GOSSIP_BIND_PORT: '19601'
       CLUSTER_HOSTNAME: node0
-      CLUSTER_JOIN: 192.168.200.204:7100
+      CLUSTER_JOIN: 192.168.200.204:19601
       ENABLE_MODULES: ''
+      GRPC_PORT: '19604'
       PERSISTENCE_DATA_PATH: /var/lib/weaviate
       PROMETHEUS_MONITORING_ENABLED: 'true'
       QUERY_DEFAULTS_LIMIT: 25
       RAFT_BOOTSTRAP_EXPECT: 1
       RAFT_JOIN: node0
+      RAFT_PORT: '19600'
     image: cr.weaviate.io/semitechnologies/weaviate:1.34.2
     network_mode: host
     restart: on-failure
@@ -28,6 +30,7 @@ volumes:
   weaviate_node0_data:
     driver: local
     driver_opts:
-      device: /home/CONNECT/xchen740/workspace/vector-retrieve/weaviate/volumes/weaviate_node0_data
+      device: /local-ssd/CONNECT\xchen740/weaviate/weaviate_node0_data
       o: bind
       type: none
+    name: weaviate_node0_data

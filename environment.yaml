@@ -1,0 +1,24 @@
+name: vector-retrieve
+channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+dependencies:
+  - python=3.10
+  - numpy
+  - tqdm
+  - scikit-learn
+  - matplotlib
+  - pyyaml
+  - pybind11
+  - cmake
+  - requests
+  # gRPC dependencies (for --use_grpc option)
+  - grpcio
+  - grpcio-tools
+  - protobuf
+  - libgrpc
+  - libprotobuf
+  - libabseil
+  - pip
+  - pip:
+    - weaviate-client
