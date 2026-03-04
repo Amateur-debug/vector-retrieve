@@ -138,6 +138,12 @@ class VectorRetrieveRunner:
 
         self.redundancy = args.redundancy
 
+        # 通信模式参数
+        self.comm_mode = getattr(args, 'comm_mode', 'tcp')
+        self.ib_dev = getattr(args, 'ib_dev', '')
+        self.ib_port = getattr(args, 'ib_port', 1)
+        self.gid_index = getattr(args, 'gid_index', -1)
+
         self.cluster = None
         self.hnsw = None
         self.sdk_config = None
@@ -233,6 +239,7 @@ class VectorRetrieveRunner:
                     "--ef_construction", str(self.args.ef_construction),
                     "--ef_search", str(self.args.ef_search),
                     "--limited_level", str(self.args.limited_level),
+                    "--comm_mode", self.comm_mode,
                 ]
                 if self.num_cpu and self.num_cpu > 0:
                     local_cmd = ["taskset", "-c", f"0-{self.num_cpu - 1}"] + local_cmd
@@ -261,6 +268,7 @@ class VectorRetrieveRunner:
                     f"--node_id {i} --node_ips {self.default_ips} "
                     f"--m {self.args.m} --ef_construction {self.args.ef_construction} "
                     f"--ef_search {self.args.ef_search} --limited_level {self.args.limited_level} "
+                    f"--comm_mode {self.comm_mode} "
                     f"{distributed_flag} {reduce_flag} "
                     f"> {log_file} 2>&1 &"
                 )
@@ -292,7 +300,7 @@ class VectorRetrieveRunner:
             progress_lock = threading.Lock()
 
             def add_chunk_via_sdk(chunk, counter, lock, config):
-                thread_client = ClusterSDKClient(ip=config["ip"], port=config["port"])
+                thread_client = ClusterSDKClient(ip=config["ip"], port=config["port"], comm_mode=self.comm_mode)
                 if not thread_client.connect():
                     raise RuntimeError("Thread failed to connect to local node for building")
                 try:
@@ -346,7 +354,7 @@ class VectorRetrieveRunner:
 
         print(f"Building in {mode_label} via SDK...")
         start_time = time.time()
-        thread_client = ClusterSDKClient(ip=self.sdk_config["ip"], port=self.sdk_config["port"])
+                thread_client = ClusterSDKClient(ip=self.sdk_config["ip"], port=self.sdk_config["port"], comm_mode=self.comm_mode)
         if not thread_client.connect():
             raise RuntimeError("Failed to connect SDK to local node for building")
         try:
@@ -371,7 +379,7 @@ class VectorRetrieveRunner:
                 port = 19000 + i
                 # 对于本地节点使用 127.0.0.1
                 connect_ip = "127.0.0.1" if i == self.host_id else ip
-                client = ClusterSDKClient(ip=connect_ip, port=port, timeout=2)
+                client = ClusterSDKClient(ip=connect_ip, port=port, timeout=2, comm_mode=self.comm_mode)
                 if client.connect():
                     info = client.get_information()
                     client.disconnect()
@@ -407,7 +415,7 @@ class VectorRetrieveRunner:
 
             if self.graph_path is not None and os.path.exists(self.graph_path):
                 print(f"Loading HNSW graph via SDK from {self.graph_path}...")
-                sdk_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'])
+                sdk_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
                 if not sdk_client.connect():
                     raise RuntimeError("Failed to connect SDK to local node for load_hnsw")
                 try:
@@ -430,7 +438,7 @@ class VectorRetrieveRunner:
                 print("Partitioning data across cluster nodes via SDK...")
                 start_time = time.time()
                 # 创建 SDK 客户端连接到本机
-                partition_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'])
+                partition_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
                 if not partition_client.connect():
                     raise RuntimeError("Failed to connect SDK to local node for partition")
                 try:
@@ -465,7 +473,7 @@ class VectorRetrieveRunner:
             self.hnsw = HNSWGraph.load(self.graph_path)
             self.hnsw.ef_search = self.ef_search
             print("Partitioning data across cluster nodes...")
-            self.cluster = Cluster(self.hnsw, self.node_num)
+            self.cluster = Cluster(self.hnsw, self.node_num, comm_mode=self.comm_mode, ib_dev=self.ib_dev, ib_port=self.ib_port, gid_index=self.gid_index)
 
             start_time = time.time()
             if self.use_layer:
@@ -484,7 +492,7 @@ class VectorRetrieveRunner:
             num_elements = max_num_elements
 
             self.hnsw = HNSWGraph(dim=dim, m=self.m, ef_construction=self.ef_construction, ef_search=self.ef_search, limited_level=self.limited_level)
-            self.cluster = Cluster(self.hnsw, self.node_num)
+            self.cluster = Cluster(self.hnsw, self.node_num, comm_mode=self.comm_mode, ib_dev=self.ib_dev, ib_port=self.ib_port, gid_index=self.gid_index)
 
             if self.args.reduce:
                 # Reduce模式：先创建cluster，轮询添加向量到各节点独立建图
@@ -698,7 +706,8 @@ class VectorRetrieveRunner:
             if self.args.distributed:
                 thread_sdk_client = ClusterSDKClient(
                     ip=self.sdk_config['ip'],
-                    port=self.sdk_config['port']
+                    port=self.sdk_config['port'],
+                    comm_mode=self.comm_mode
                 )
                 # 所有分布式模式都需要初始化路由（包括 reduce 模式）
                 if not thread_sdk_client.init_routes():
@@ -839,7 +848,8 @@ class VectorRetrieveRunner:
                 if self.args.distributed:
                     thread_sdk_client = ClusterSDKClient(
                         ip=self.sdk_config['ip'],
-                        port=self.sdk_config['port']
+                        port=self.sdk_config['port'],
+                        comm_mode=self.comm_mode
                     )
                     # 所有分布式模式都需要初始化路由（包括 reduce 模式）
                     if not thread_sdk_client.init_routes():
@@ -923,7 +933,7 @@ class VectorRetrieveRunner:
             cluster_path = f"{base}-cluster.json"
             hnsw_path = f"{base}.json"
 
-            sdk_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'])
+            sdk_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
             if not sdk_client.connect():
                 raise RuntimeError("Failed to connect SDK to local node for save")
             try:
@@ -983,7 +993,7 @@ class VectorRetrieveRunner:
         # 构建统计参数
         if self.args.distributed:
             # 分布式模式：通过 SDK 获取与非分布式一致的参数
-            info_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'])
+            info_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
             if not info_client.connect():
                 raise RuntimeError("Failed to connect SDK to local node for get_information")
             try:
@@ -1130,6 +1140,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_query_threads", type=int, default=32, help="Number of threads for querying (each thread does all queries)")
     parser.add_argument("--num_cpu", type=int, default=8, help="Limit CPU cores per node process (0=unlimited)")
     parser.add_argument("--save", action='store_true', default=False, help="Save the built graph to disk after construction")
+    # 通信模式和 RDMA 参数
+    parser.add_argument("--comm_mode", type=str, default="tcp", choices=["tcp", "rdma"], help="Communication mode: tcp or rdma")
+    parser.add_argument("--ib_dev", type=str, default="", help="RDMA IB device name (auto-detect if empty)")
+    parser.add_argument("--ib_port", type=int, default=1, help="RDMA IB port number")
+    parser.add_argument("--gid_index", type=int, default=-1, help="RDMA GID index (-1 for auto-detect)")
 
     args = parser.parse_args(rest)
 

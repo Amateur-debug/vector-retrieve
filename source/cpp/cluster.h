@@ -38,231 +38,12 @@
 #include "hnsw.h"
 #include "log.h"
 #include "payload.h"
+#include "tcp_transport.h"
 
 using namespace std;
 
-// ==================== TCP Connection Pool ====================
-// 无限大小连接池，避免固定大小导致的死锁
-class TcpConnectionPool {
-private:
-    struct NodeConnections {
-        std::deque<int> idle_sockets;
-        std::mutex mutex;
-        std::string ip;
-        int port = 0;
-        int active_count = 0;  // 正在使用的连接数
-    };
-    
-    std::unordered_map<int, NodeConnections> node_pools;
-    std::mutex pools_mutex;
-    
-    // 创建新连接
-    int create_connection(const std::string& ip, int port) {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) return -1;
-        
-        // 设置非阻塞连接超时
-        struct timeval timeout;
-        timeout.tv_sec = 5;
-        timeout.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        
-        // 禁用 Nagle 算法，减少延迟
-        int flag = 1;
-        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-        
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
-        
-        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            close(sock);
-            return -1;
-        }
-        
-        return sock;
-    }
-    
-    // 检查 socket 是否有效
-    bool is_socket_valid(int sock) {
-        struct pollfd pfd;
-        pfd.fd = sock;
-        pfd.events = POLLIN | POLLOUT;
-        pfd.revents = 0;
-        
-        int ret = poll(&pfd, 1, 0);
-        if (ret <= 0) return true;  // 超时或无事件，认为连接正常
-        
-        // 有事件，检查是否为错误
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            return false;
-        }
-        return true;
-    }
-    
-public:
-    // 注册节点
-    void register_node(int node_id, const std::string& ip, int port) {
-        std::lock_guard<std::mutex> lock(pools_mutex);
-        // try_emplace: 如果不存在则默认构造
-        auto result = node_pools.try_emplace(node_id);
-        NodeConnections& nc = result.first->second;
-        nc.ip = ip;
-        nc.port = port;
-    }
-    
-    // 获取连接（优先复用，无可用则创建新连接）
-    int acquire(int node_id) {
-        std::string ip;
-        int port = 0;
-        int reused_sock = -1;
-        
-        // 第一阶段：获取连接或地址（持锁时间短）
-        {
-            std::lock_guard<std::mutex> lock(pools_mutex);
-            auto it = node_pools.find(node_id);
-            if (it == node_pools.end()) {
-                return -1;
-            }
-            
-            NodeConnections& nc = it->second;
-            std::lock_guard<std::mutex> nc_lock(nc.mutex);
-            
-            // 尝试复用空闲连接
-            while (!nc.idle_sockets.empty()) {
-                int sock = nc.idle_sockets.front();
-                nc.idle_sockets.pop_front();
-                
-                if (is_socket_valid(sock)) {
-                    nc.active_count++;
-                    int idle = (int)nc.idle_sockets.size();
-                    int active = nc.active_count;
-                    LOG_DEBUG_STREAM("[ConnectionPool] Acquired (reused) connection for node " << node_id 
-                        << ", socket=" << sock 
-                        << ", idle=" << idle
-                        << ", active=" << active
-                        << ", total=" << (idle + active));
-                    return sock;  // 找到有效连接，直接返回
-                }
-                // 无效连接，关闭并继续
-                close(sock);
-            }
-            
-            // 无可用连接，记录地址用于创建
-            ip = nc.ip;
-            port = nc.port;
-        }
-        // 锁已释放，在锁外创建连接
-        if (!ip.empty() && port > 0) {
-            int new_sock = create_connection(ip, port);
-            if (new_sock >= 0) {
-                // 创建成功，增加active_count
-                std::lock_guard<std::mutex> lock(pools_mutex);
-                auto it = node_pools.find(node_id);
-                if (it != node_pools.end()) {
-                    std::lock_guard<std::mutex> nc_lock(it->second.mutex);
-                    it->second.active_count++;
-                    int idle = (int)it->second.idle_sockets.size();
-                    int active = it->second.active_count;
-                    LOG_DEBUG_STREAM("[ConnectionPool] Acquired (created) connection for node " << node_id 
-                        << ", socket=" << new_sock 
-                        << ", idle=" << idle
-                        << ", active=" << active
-                        << ", total=" << (idle + active));
-                }
-            }
-            return new_sock;
-        }
-        return -1;
-    }
-    
-    // 释放连接回池
-    void release(int node_id, int sock, bool valid = true) {
-        if (sock < 0) return;
-        
-        std::lock_guard<std::mutex> lock(pools_mutex);
-        auto it = node_pools.find(node_id);
-        if (it == node_pools.end()) {
-            close(sock);
-            return;
-        }
-        
-        NodeConnections& nc = it->second;
-        std::lock_guard<std::mutex> nc_lock(nc.mutex);
-        
-        // 如果连接无效或检测到已关闭，直接关闭而不是放回池中
-        if (!valid || !is_socket_valid(sock)) {
-            close(sock);
-            if (nc.active_count > 0) nc.active_count--;
-            LOG_DEBUG_STREAM("[ConnectionPool] Closed invalid connection for node " << node_id << ", socket=" << sock);
-            return;
-        }
-        
-        nc.idle_sockets.push_back(sock);
-        if (nc.active_count > 0) nc.active_count--;
-        
-        int idle = (int)nc.idle_sockets.size();
-        int active = nc.active_count;
-        LOG_DEBUG_STREAM("[ConnectionPool] Released connection for node " << node_id 
-            << ", socket=" << sock 
-            << ", idle=" << idle
-            << ", active=" << active
-            << ", total=" << (idle + active));
-    }
-    
-    // 关闭指定节点的所有连接
-    void close_node(int node_id) {
-        std::lock_guard<std::mutex> lock(pools_mutex);
-        auto it = node_pools.find(node_id);
-        if (it == node_pools.end()) return;
-        
-        NodeConnections& nc = it->second;
-        std::lock_guard<std::mutex> nc_lock(nc.mutex);
-        size_t closed_count = nc.idle_sockets.size();
-        for (int sock : nc.idle_sockets) {
-            close(sock);
-        }
-        nc.idle_sockets.clear();
-        nc.active_count = 0;
-        
-        LOG_DEBUG_STREAM("[ConnectionPool] Closed all connections for node " << node_id 
-            << ", closed_idle=" << closed_count);
-    }
-    
-    // 获取统计信息
-    std::string get_stats() {
-        std::lock_guard<std::mutex> lock(pools_mutex);
-        std::string stats;
-        for (const auto& kv : node_pools) {
-            stats += "Node " + std::to_string(kv.first) + 
-                     ": " + std::to_string(kv.second.idle_sockets.size()) + " idle\n";
-        }
-        return stats;
-    }
-    
-    // 清空所有连接
-    void clear() {
-        std::lock_guard<std::mutex> lock(pools_mutex);
-        size_t total_closed = 0;
-        for (auto& kv : node_pools) {
-            std::lock_guard<std::mutex> nc_lock(kv.second.mutex);
-            total_closed += kv.second.idle_sockets.size();
-            for (int sock : kv.second.idle_sockets) {
-                close(sock);
-            }
-            kv.second.idle_sockets.clear();
-            kv.second.active_count = 0;
-        }
-        node_pools.clear();
-        LOG_DEBUG_STREAM("[ConnectionPool] Cleared all connections, total_closed=" << total_closed);
-    }
-};
-
-// 全局连接池实例
-static TcpConnectionPool g_connection_pool;
+// 注意: TcpConnectionPool 已迁移到 tcp_transport.h
+// g_connection_pool 已被 Cluster::transport 成员替代
 
 template <typename T>
 class Cluster; // Forward declaration
@@ -746,9 +527,14 @@ public:
 
     std::atomic<int> add_round_robin_counter{0};
 
-    Cluster(HNSWGraph<T> *hnsw, int node_num = 4)
-        : hnsw(hnsw), node_num(node_num)
+    // 通信中间层配置和实例
+    TransportConfig transport_config;
+    std::shared_ptr<ITransport> transport;
+
+    Cluster(HNSWGraph<T> *hnsw, int node_num = 4, const TransportConfig& config = TransportConfig())
+        : hnsw(hnsw), node_num(node_num), transport_config(config)
     {
+        transport = TransportFactory::create(transport_config);
         nodes.reserve(node_num);
         for (int i = 0; i < node_num; i++)
         {
@@ -762,12 +548,16 @@ public:
         for (int i = 0; i < node_num; i++)
         {
             nodes[i].stop_server.store(true);
-            if (nodes[i].sockfd != -1)
-            {
-                shutdown(nodes[i].sockfd, SHUT_RDWR);
-                close(nodes[i].sockfd);
-                nodes[i].sockfd = -1;
-            }
+        }
+        // 通过通信中间层停止服务端
+        if (transport)
+        {
+            transport->stop_server();
+        }
+        // 重置节点的 sockfd
+        for (int i = 0; i < node_num; i++)
+        {
+            nodes[i].sockfd = -1;
         }
         // 等待所有服务器线程退出
         for (int i = 0; i < node_num; i++)
@@ -827,8 +617,8 @@ public:
             nodes[node_id].ip_addr = ip;
             nodes[node_id].port = port;
             nodes[node_id].is_remote_node = is_remote;
-            // 注册到连接池
-            g_connection_pool.register_node(node_id, ip, port);
+            // 注册到通信中间层
+            transport->register_node(node_id, ip, port);
         }
     }
 
@@ -1379,8 +1169,8 @@ public:
             Node<T> &target_node = nodes[i];
             if (target_node.is_remote_node)
             {
-                // 使用连接池获取连接
-                int sock = g_connection_pool.acquire(i);
+                // 使用通信中间层获取连接
+                int sock = transport->acquire_connection(i);
                 if (sock < 0)
                 {
                     LOG_DEBUG_STREAM("Failed to get connection to node " << i);
@@ -1393,14 +1183,14 @@ public:
                 serialize_hnsw(buf, target_node.local_hnsw);
 
                 uint64_t msg_size = buf.data.size();
-                send_all(sock, &msg_size, sizeof(uint64_t));
-                send_all(sock, buf.data.data(), msg_size);
+                transport->send_raw(sock, &msg_size, sizeof(uint64_t));
+                transport->send_raw(sock, buf.data.data(), msg_size);
 
                 // Wait for ACK from worker node
                 char ack = 0;
                 try
                 {
-                    recv_all(sock, &ack, 1);
+                    transport->recv_raw(sock, &ack, 1);
                     if (ack == 1)
                     {
                         LOG_DEBUG_STREAM("Partition sent to node " << i << " - ACK received");
@@ -1415,7 +1205,7 @@ public:
                     LOG_DEBUG_STREAM("Warning: No ACK from node " << i);
                 }
                 // MSG_INIT_GRAPH 后服务器会关闭连接，不复用
-                close(sock);
+                transport->close_connection(sock);
             }
             else
             {
@@ -1458,8 +1248,8 @@ public:
 
                     if (is_distributed && node.is_remote_node)
                     {
-                        // 使用连接池获取连接
-                        int sock = g_connection_pool.acquire(i);
+                        // 使用通信中间层获取连接
+                        int sock = transport->acquire_connection(i);
                         if (sock < 0)
                         {
                             out.payload = std::move(node_payload);
@@ -1478,19 +1268,19 @@ public:
                         uint64_t msg_size = buf.data.size();
                         try
                         {
-                            send_all(sock, &msg_size, sizeof(uint64_t));
-                            send_all(sock, buf.data.data(), msg_size);
+                            transport->send_raw(sock, &msg_size, sizeof(uint64_t));
+                            transport->send_raw(sock, buf.data.data(), msg_size);
 
                             uint64_t resp_size = 0;
-                            recv_all(sock, &resp_size, sizeof(uint64_t));
+                            transport->recv_raw(sock, &resp_size, sizeof(uint64_t));
 
                             std::vector<char> resp_data(resp_size);
-                            recv_all(sock, resp_data.data(), resp_size);
+                            transport->recv_raw(sock, resp_data.data(), resp_size);
 
                             LOG_DEBUG_STREAM("[Cluster] Received response for query " << query_id << " from remote node " << i);
 
                             // 非持久连接：远程节点已关闭，标记为无效
-                            g_connection_pool.release(i, sock, false);
+                            transport->release_connection(i, sock, false);
 
                             Buffer resp_buf;
                             resp_buf.data = std::move(resp_data);
@@ -1507,7 +1297,7 @@ public:
                         }
                         catch (...)
                         {
-                            g_connection_pool.release(i, sock, false);
+                            transport->release_connection(i, sock, false);
                             out.payload = std::move(node_payload);
                             return out;
                         }
@@ -1618,8 +1408,8 @@ public:
             auto now = std::chrono::system_clock::now();
             payload.send_timestamp = std::chrono::duration<double, std::milli>(now.time_since_epoch()).count();
 
-            // 使用连接池获取连接
-            int sock = g_connection_pool.acquire(target_node_id);
+            // 使用通信中间层获取连接
+            int sock = transport->acquire_connection(target_node_id);
             if (sock < 0)
             {
                 LOG_DEBUG_STREAM("[Cluster] ERROR: Failed to get connection for query " << query_id << " to node " << target_node_id);
@@ -1639,11 +1429,11 @@ public:
             
             try
             {
-                send_all(sock, &msg_size, sizeof(uint64_t));
-                send_all(sock, buf.data.data(), msg_size);
+                transport->send_raw(sock, &msg_size, sizeof(uint64_t));
+                transport->send_raw(sock, buf.data.data(), msg_size);
 
                 // 非持久连接：远程节点已关闭，标记为无效
-                g_connection_pool.release(target_node_id, sock, false);
+                transport->release_connection(target_node_id, sock, false);
                 
                 LOG_DEBUG_STREAM("[Cluster] MSG_SEARCH successfully sent to node " << target_node_id << " for query " << query_id);
                 
@@ -1651,7 +1441,7 @@ public:
             }
             catch (...)
             {
-                g_connection_pool.release(target_node_id, sock, false);
+                transport->release_connection(target_node_id, sock, false);
                 return {};
             }
         }
@@ -1935,13 +1725,8 @@ void Node<T>::close_connection_hard(int fd)
 {
     if (fd < 0) return;
     
-    // 设置 SO_LINGER 为 0，发送 RST 而不是 FIN，立即关闭连接
-    struct linger so_linger;
-    so_linger.l_onoff = 1;   // 启用 linger
-    so_linger.l_linger = 0;  // 超时时间为 0，立即发送 RST
-    setsockopt(fd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
-    
-    close(fd);
+    // 通过通信中间层关闭连接（硬关闭，发送 RST）
+    cluster->transport->close_connection(fd);
 }
 
 template <typename T>
@@ -1951,34 +1736,11 @@ void Node<T>::start_server()
     if (is_remote_node)
         return;
 
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    // 使用通信中间层启动服务端
+    sockfd = cluster->transport->start_server(port);
     if (sockfd < 0)
     {
-        perror("socket");
-        return;
-    }
-
-    int opt = 1;
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    memset(&sock_addr, 0, sizeof(sock_addr));
-    sock_addr.sin_family = AF_INET;
-    sock_addr.sin_addr.s_addr = INADDR_ANY;
-    sock_addr.sin_port = htons(port);
-
-    if (bind(sockfd, (struct sockaddr *)&sock_addr, sizeof(sock_addr)) < 0)
-    {
-        perror("bind");
-        close(sockfd);
-        sockfd = -1;
-        return;
-    }
-
-    if (listen(sockfd, 1024) < 0)
-    {
-        perror("listen");
-        close(sockfd);
-        sockfd = -1;
+        LOG_DEBUG_STREAM("Failed to start server on port " << port);
         return;
     }
 
@@ -1989,7 +1751,7 @@ void Node<T>::start_server()
     catch (const std::exception &e)
     {
         LOG_DEBUG_STREAM("Failed to start server thread: " << e.what());
-        close(sockfd);
+        cluster->transport->stop_server();
         sockfd = -1;
     }
 }
@@ -2001,9 +1763,7 @@ void Node<T>::tcp_server_loop()
 
     while (!stop_server.load())
     {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(sockfd, (struct sockaddr *)&client_addr, &client_len);
+        int client_fd = cluster->transport->accept_client();
         if (client_fd < 0)
         {
             LOG_DEBUG_STREAM("[Node " << node_id << "] Failed to accept");
@@ -2520,8 +2280,8 @@ void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& result
     // origin_node 是远程节点，通过网络发送结果
     LOG_DEBUG_STREAM("[Node " << node_id << "] Sending result to remote origin node " << payload.origin_node_id);
     
-    // 使用连接池获取连接
-    int sock = g_connection_pool.acquire(payload.origin_node_id);
+    // 使用通信中间层获取连接
+    int sock = cluster->transport->acquire_connection(payload.origin_node_id);
     if (sock < 0)
     {
         LOG_DEBUG_STREAM("[Node " << node_id << "] Failed to get connection to origin node");
@@ -2541,13 +2301,13 @@ void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& result
         send_all(sock, buf.data.data(), msg_size);
         
         // 非持久连接：远程节点已关闭，标记为无效
-        g_connection_pool.release(payload.origin_node_id, sock, false);
+        cluster->transport->release_connection(payload.origin_node_id, sock, false);
         LOG_DEBUG_STREAM("[Node " << node_id << "] Result sent to origin node " << payload.origin_node_id);
     }
     catch (...)
     {
         LOG_DEBUG_STREAM("[Node " << node_id << "] Exception sending result to origin node");
-        g_connection_pool.release(payload.origin_node_id, sock, false);
+        cluster->transport->release_connection(payload.origin_node_id, sock, false);
     }
 }
 
@@ -2653,8 +2413,8 @@ void Node<T>::add_vector(int vid, const std::vector<T> &vec)
 {
     if (is_remote_node)
     {
-        // 使用连接池获取连接
-        int sock = g_connection_pool.acquire(node_id);
+        // 使用通信中间层获取连接
+        int sock = cluster->transport->acquire_connection(node_id);
         if (sock < 0)
         {
             LOG_DEBUG_STREAM("Failed to get connection for add_vector");
@@ -2676,12 +2436,12 @@ void Node<T>::add_vector(int vid, const std::vector<T> &vec)
             char ack = 0;
             recv_all(sock, &ack, 1);
             // 远程节点在发送ACK后会关闭连接，所以这里标记为无效
-            g_connection_pool.release(node_id, sock, false);
+            cluster->transport->release_connection(node_id, sock, false);
         }
         catch (const std::exception &e)
         {
             LOG_DEBUG_STREAM("Error sending add_vector: " << e.what());
-            g_connection_pool.release(node_id, sock, false);
+            cluster->transport->release_connection(node_id, sock, false);
         }
     }
     else
