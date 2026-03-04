@@ -45,6 +45,31 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(pybind11 REQUIRED)
 
 # =============================================================================
+# RDMA Support Detection
+# =============================================================================
+
+# 检测 RDMA 依赖库（libibverbs 和 librdmacm）
+find_library(IBVERBS_LIB ibverbs)
+find_library(RDMACM_LIB rdmacm)
+
+set(HAVE_RDMA OFF)
+set(RDMA_LIBS "")
+
+if(IBVERBS_LIB AND RDMACM_LIB)
+    set(HAVE_RDMA ON)
+    set(RDMA_LIBS ${IBVERBS_LIB} ${RDMACM_LIB})
+    message(STATUS "RDMA support: ENABLED (libibverbs: ${IBVERBS_LIB}, librdmacm: ${RDMACM_LIB})")
+else()
+    message(STATUS "RDMA support: DISABLED (libibverbs or librdmacm not found)")
+    if(NOT IBVERBS_LIB)
+        message(STATUS "  - libibverbs: NOT FOUND")
+    endif()
+    if(NOT RDMACM_LIB)
+        message(STATUS "  - librdmacm: NOT FOUND")
+    endif()
+endif()
+
+# =============================================================================
 # Include Directories
 # =============================================================================
 
@@ -126,6 +151,12 @@ pybind11_add_module(vector_retrieve
 # Apply optimization flags to the target
 target_compile_options(vector_retrieve PRIVATE ${OPT_FLAGS})
 
+# RDMA 条件编译支持
+if(HAVE_RDMA)
+    target_compile_definitions(vector_retrieve PRIVATE HAVE_RDMA)
+    target_link_libraries(vector_retrieve PRIVATE ${RDMA_LIBS})
+endif()
+
 # =============================================================================
 # Link Libraries (if needed)
 # =============================================================================
@@ -146,6 +177,11 @@ message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Optimization Flags: ${OPT_FLAGS}")
+if(HAVE_RDMA)
+    message(STATUS "RDMA Support: ENABLED")
+else()
+    message(STATUS "RDMA Support: DISABLED")
+endif()
 message(STATUS "========================================")
 message(STATUS "")
 

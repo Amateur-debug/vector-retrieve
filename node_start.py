@@ -40,6 +40,11 @@ if __name__ == "__main__":
 
     parser.add_argument("--distributed", default=False, action='store_true', help="Enable distributed mode")
     parser.add_argument("--reduce", default=False, action='store_true', help="Enable reduce mode (independent graphs per node)")
+    # 通信模式和 RDMA 参数
+    parser.add_argument("--comm_mode", type=str, default="tcp", choices=["tcp", "rdma"], help="Communication mode: tcp or rdma")
+    parser.add_argument("--ib_dev", type=str, default="", help="RDMA IB device name (auto-detect if empty)")
+    parser.add_argument("--ib_port", type=int, default=1, help="RDMA IB port number")
+    parser.add_argument("--gid_index", type=int, default=-1, help="RDMA GID index (-1 for auto-detect)")
 
 
     args = parser.parse_args()
@@ -67,7 +72,7 @@ if __name__ == "__main__":
     hnsw = HNSWGraph(dim=128, m=args.m, ef_construction=args.ef_construction, 
                      ef_search=args.ef_search, limited_level=args.limited_level)
 
-    cluster = Cluster(hnsw, node_num)
+    cluster = Cluster(hnsw, node_num, comm_mode=args.comm_mode, ib_dev=args.ib_dev, ib_port=args.ib_port, gid_index=args.gid_index)
     cluster.is_distributed = args.distributed
     cluster.is_reduce = args.reduce
 

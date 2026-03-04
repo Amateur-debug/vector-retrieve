@@ -6,12 +6,21 @@
 #include "hnsw.h"
 #include "payload.h"
 #include "sdk.h"
+#include "transport.h"
 
 namespace py = pybind11;
 
 PYBIND11_MODULE(vector_retrieve, m)
 {
     m.doc() = "Pybind11 bindings for Cluster and related classes";
+
+    // 绑定 TransportConfig 配置类
+    py::class_<TransportConfig>(m, "TransportConfig")
+        .def(py::init<>())
+        .def_readwrite("comm_mode", &TransportConfig::comm_mode)
+        .def_readwrite("ib_dev", &TransportConfig::ib_dev)
+        .def_readwrite("ib_port", &TransportConfig::ib_port)
+        .def_readwrite("gid_index", &TransportConfig::gid_index);
 
     py::class_<Payload<float>>(m, "PayloadFloat")
         .def(py::init<>())
@@ -120,8 +129,20 @@ PYBIND11_MODULE(vector_retrieve, m)
 
     // 绑定 Cluster 类（float 版本）
     py::class_<Cluster<float>, std::unique_ptr<Cluster<float>>>(m, "ClusterFloat")
-        .def(py::init<HNSWGraph<float> *, int>(),
-             py::arg("hnsw"), py::arg("node_num") = 4)
+        .def(py::init([](HNSWGraph<float> *hnsw, int node_num, const std::string &comm_mode,
+                         const std::string &ib_dev, int ib_port, int gid_index) {
+                TransportConfig config;
+                config.comm_mode = comm_mode;
+                config.ib_dev = ib_dev;
+                config.ib_port = ib_port;
+                config.gid_index = gid_index;
+                return new Cluster<float>(hnsw, node_num, config);
+             }),
+             py::arg("hnsw"), py::arg("node_num") = 4,
+             py::arg("comm_mode") = "tcp",
+             py::arg("ib_dev") = "",
+             py::arg("ib_port") = 1,
+             py::arg("gid_index") = -1)
         .def_property_readonly("nodes", [](Cluster<float> &c)
                                {
             std::vector<Node<float> *> ptrs;
@@ -165,8 +186,20 @@ PYBIND11_MODULE(vector_retrieve, m)
 
     // 绑定 Cluster 类（double 版本）
     py::class_<Cluster<double>, std::unique_ptr<Cluster<double>>>(m, "ClusterDouble")
-        .def(py::init<HNSWGraph<double> *, int>(),
-             py::arg("hnsw"), py::arg("node_num") = 4)
+        .def(py::init([](HNSWGraph<double> *hnsw, int node_num, const std::string &comm_mode,
+                         const std::string &ib_dev, int ib_port, int gid_index) {
+                TransportConfig config;
+                config.comm_mode = comm_mode;
+                config.ib_dev = ib_dev;
+                config.ib_port = ib_port;
+                config.gid_index = gid_index;
+                return new Cluster<double>(hnsw, node_num, config);
+             }),
+             py::arg("hnsw"), py::arg("node_num") = 4,
+             py::arg("comm_mode") = "tcp",
+             py::arg("ib_dev") = "",
+             py::arg("ib_port") = 1,
+             py::arg("gid_index") = -1)
         .def_property_readonly("nodes", [](Cluster<double> &c)
                                {
             std::vector<Node<double> *> ptrs;
@@ -210,8 +243,9 @@ PYBIND11_MODULE(vector_retrieve, m)
 
     // 绑定 ClusterSDKClient 类（float 版本）
     py::class_<ClusterSDKClient<float>>(m, "ClusterSDKClientFloat")
-        .def(py::init<const std::string &, int, int>(),
-             py::arg("ip") = "127.0.0.1", py::arg("port") = 19000, py::arg("timeout") = 5)
+        .def(py::init<const std::string &, int, int, const std::string &>(),
+             py::arg("ip") = "127.0.0.1", py::arg("port") = 19000, py::arg("timeout") = 5,
+             py::arg("comm_mode") = "tcp")
         .def("connect", &ClusterSDKClient<float>::connect,
              py::arg("ip") = "", py::arg("port") = -1)
         .def("init_routes", &ClusterSDKClient<float>::init_routes)
@@ -250,8 +284,9 @@ PYBIND11_MODULE(vector_retrieve, m)
 
     // 绑定 ClusterSDKClient 类（double 版本）
     py::class_<ClusterSDKClient<double>>(m, "ClusterSDKClientDouble")
-        .def(py::init<const std::string &, int, int>(),
-             py::arg("ip") = "127.0.0.1", py::arg("port") = 19000, py::arg("timeout") = 5)
+        .def(py::init<const std::string &, int, int, const std::string &>(),
+             py::arg("ip") = "127.0.0.1", py::arg("port") = 19000, py::arg("timeout") = 5,
+             py::arg("comm_mode") = "tcp")
         .def("connect", &ClusterSDKClient<double>::connect,
              py::arg("ip") = "", py::arg("port") = -1)
         .def("init_routes", &ClusterSDKClient<double>::init_routes)

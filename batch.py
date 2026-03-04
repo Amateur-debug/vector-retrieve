@@ -41,6 +41,7 @@ PARAM_GRID = {
     "reduce":             [False, True],
     "distributed":        [True],
     "layer":              [True, False],
+    "comm_mode":          ["tcp"],  # 通信模式："tcp" 或 "rdma"
 }
 
 # 等待 graph 文件的最长秒数 (0 = 无限等待)
@@ -107,6 +108,9 @@ def build_command(dataset, params):
         cmd.append('--distributed')
     if params.get('layer'):
         cmd.append('--layer')
+    # 通信模式参数
+    if params.get('comm_mode') and params['comm_mode'] != 'tcp':
+        cmd += ['--comm_mode', params['comm_mode']]
 
     return cmd
 

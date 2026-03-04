@@ -2,7 +2,7 @@
 
 #include "cluster.h"
 
-// SDK Client: TCP client for querying cluster via network
+// SDK Client: 通过通信中间层与集群交互的客户端
 template <typename T>
 class ClusterSDKClient
 {
@@ -21,47 +21,54 @@ private:
     std::vector<QueryEndpoint> query_endpoints;
     size_t current_endpoint_idx;  // 当前连接的端点索引，-1 表示无效
 
+    // 通信中间层配置和实例
+    TransportConfig transport_config;
+    std::unique_ptr<ITransport> transport;
+
+    // SDK 使用虚拟 node_id 来管理连接
+    static constexpr int SDK_HOST_NODE_ID = 99999;
+    int next_virtual_node_id = SDK_HOST_NODE_ID;
+
+    int get_virtual_node_id() {
+        return next_virtual_node_id++;
+    }
+
 public:
     bool init_routes()
     {
         try {
-            int info_sock = socket(AF_INET, SOCK_STREAM, 0);
+            // 使用 transport 进行路由初始化通信
+            int virtual_id = get_virtual_node_id();
+            transport->register_node(virtual_id, host_ip, host_port);
+            int info_sock = transport->acquire_connection(virtual_id);
             if (info_sock < 0) {
                 return false;
             }
-            struct InfoSockGuard {
+
+            // 使用 RAII 确保资源释放
+            struct SockGuard {
+                ITransport* t;
+                int node_id;
                 int fd;
-                ~InfoSockGuard() {
+                ~SockGuard() {
                     if (fd >= 0) {
-                        shutdown(fd, SHUT_RDWR);
-                        close(fd);
+                        t->release_connection(node_id, fd, false);
                     }
                 }
-            } info_guard{info_sock};
-
-            struct sockaddr_in serv_addr;
-            memset(&serv_addr, 0, sizeof(serv_addr));
-            serv_addr.sin_family = AF_INET;
-            serv_addr.sin_port = htons(host_port);
-            if (inet_pton(AF_INET, host_ip.c_str(), &serv_addr.sin_addr) <= 0) {
-                return false;
-            }
-            if (::connect(info_sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-                return false;
-            }
+            } guard{transport.get(), virtual_id, info_sock};
 
             Buffer buf;
             buf.write_val((int)MSG_GET_INFORMATION);
 
             uint64_t msg_size = buf.data.size();
-            send_all(info_sock, &msg_size, sizeof(uint64_t));
-            send_all(info_sock, buf.data.data(), msg_size);
+            transport->send_raw(info_sock, &msg_size, sizeof(uint64_t));
+            transport->send_raw(info_sock, buf.data.data(), msg_size);
 
             uint64_t resp_size = 0;
-            recv_all(info_sock, &resp_size, sizeof(uint64_t));
+            transport->recv_raw(info_sock, &resp_size, sizeof(uint64_t));
 
             std::vector<char> resp_data(resp_size);
-            recv_all(info_sock, resp_data.data(), resp_size);
+            transport->recv_raw(info_sock, resp_data.data(), resp_size);
 
             Buffer resp_buf;
             resp_buf.data = std::move(resp_data);
@@ -86,7 +93,6 @@ public:
                 std::string ip = node.value("ip_addr", "");
                 int port = node.value("port", -1);
                 if (node_id >= 0 && !ip.empty() && port > 0) {
-                    // 如果节点端口等于 host_port，说明是本机节点
                     if (port == host_port) {
                         ip = host_ip;
                     }
@@ -102,7 +108,6 @@ public:
             std::vector<int> ports;
 
             if (partition_mode == "layer" && cluster.contains("layer_config")) {
-                // Layer 模式：根据 layer_config 和 layer_replicate_flags 选择入口节点
                 const auto &layer_config = cluster["layer_config"];
                 std::vector<int> configured_levels;
                 std::unordered_map<int, std::vector<int>> parsed_layer_config;
@@ -189,7 +194,6 @@ public:
                     }
                 }
             } else {
-                // 非 Layer 模式（k-means, round_robin, reduce 等）：所有节点作为入口点
                 for (const auto &kv : node_addr) {
                     ips.push_back(kv.second.first);
                     ports.push_back(kv.second.second);
@@ -203,13 +207,18 @@ public:
             set_query_endpoints(ips, ports);
             return true;
         } catch (...) {
-            // 自动路由初始化失败时，保留默认 host_ip/host_port 作为回退路径。
             return false;
         }
     }
 
-    ClusterSDKClient(const std::string &ip = "127.0.0.1", int port = 19000, int timeout = 5)
-        : host_ip(ip), host_port(port), sockfd(-1), connected(false), timeout_sec(timeout), current_endpoint_idx((size_t)-1) {}
+    ClusterSDKClient(const std::string &ip = "127.0.0.1", int port = 19000, int timeout = 5, const std::string &comm_mode = "tcp")
+        : host_ip(ip), host_port(port), sockfd(-1), connected(false), timeout_sec(timeout), current_endpoint_idx((size_t)-1)
+    {
+        transport_config.comm_mode = comm_mode;
+        transport = TransportFactory::create(transport_config);
+        // 注册默认 host 节点
+        transport->register_node(SDK_HOST_NODE_ID, host_ip, host_port);
+    }
 
     ~ClusterSDKClient() { disconnect(); }
 
@@ -217,29 +226,14 @@ public:
     {
         if (connected) return true;
 
-        // 使用传入参数或默认成员变量
         const std::string &target_ip = ip.empty() ? host_ip : ip;
         int target_port = (port >= 0) ? port : host_port;
 
-        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        // 通过 transport 建立连接
+        int virtual_id = get_virtual_node_id();
+        transport->register_node(virtual_id, target_ip, target_port);
+        sockfd = transport->acquire_connection(virtual_id);
         if (sockfd < 0) return false;
-
-        // 设置 socket 选项
-        int opt = 1;
-        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-        struct sockaddr_in serv_addr;
-        memset(&serv_addr, 0, sizeof(serv_addr));
-        serv_addr.sin_family = AF_INET;
-        serv_addr.sin_port = htons(target_port);
-        if (inet_pton(AF_INET, target_ip.c_str(), &serv_addr.sin_addr) <= 0) {
-            close(sockfd); sockfd = -1; return false;
-        }
-
-        if (::connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-            close(sockfd); sockfd = -1; return false;
-        }
 
         connected = true;
         return true;
@@ -248,8 +242,7 @@ public:
     void disconnect()
     {
         if (connected && sockfd >= 0) {
-            shutdown(sockfd, SHUT_RDWR);
-            close(sockfd);
+            transport->close_connection(sockfd);
             sockfd = -1;
             connected = false;
             current_endpoint_idx = (size_t)-1;
@@ -284,12 +277,11 @@ public:
             buf.write_vec(vec);
 
             uint64_t msg_size = buf.data.size();
-            send_all(sockfd, &msg_size, sizeof(uint64_t));
-            send_all(sockfd, buf.data.data(), msg_size);
+            transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
+            transport->send_raw(sockfd, buf.data.data(), msg_size);
 
-            // Receive ACK
             char ack = 0;
-            recv_all(sockfd, &ack, 1);
+            transport->recv_raw(sockfd, &ack, 1);
             if (ack != 1) {
                 throw std::runtime_error("Failed to add vector");
             }
@@ -297,7 +289,7 @@ public:
             disconnect();
             throw;
         }
-        disconnect();  // 非持久连接：每次调用后断开
+        disconnect();
     }
 
     std::vector<int> query(int query_id, const std::vector<T> &query_vector, Payload<T> &payload, int k = 10)
@@ -315,7 +307,6 @@ public:
             target_port = ep.port;
         }
 
-        // 如果连接的端点不是目标端点，断开重连
         if (connected && current_endpoint_idx != target_idx) {
             disconnect();
         }
@@ -334,14 +325,14 @@ public:
             serialize_payload(buf, payload);
 
             uint64_t msg_size = buf.data.size();
-            send_all(sockfd, &msg_size, sizeof(uint64_t));
-            send_all(sockfd, buf.data.data(), msg_size);
+            transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
+            transport->send_raw(sockfd, buf.data.data(), msg_size);
 
             uint64_t resp_size = 0;
-            recv_all(sockfd, &resp_size, sizeof(uint64_t));
+            transport->recv_raw(sockfd, &resp_size, sizeof(uint64_t));
 
             std::vector<char> resp_data(resp_size);
-            recv_all(sockfd, resp_data.data(), resp_size);
+            transport->recv_raw(sockfd, resp_data.data(), resp_size);
 
             Buffer resp_buf;
             resp_buf.data = std::move(resp_data);
@@ -354,7 +345,6 @@ public:
             }
             deserialize_payload(resp_buf, payload);
 
-            // 持久连接：不断开，复用连接
             return results;
         } catch (...) {
             disconnect();
@@ -373,14 +363,14 @@ public:
             buf.write_val((int)MSG_GET_INFORMATION);
 
             uint64_t msg_size = buf.data.size();
-            send_all(sockfd, &msg_size, sizeof(uint64_t));
-            send_all(sockfd, buf.data.data(), msg_size);
+            transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
+            transport->send_raw(sockfd, buf.data.data(), msg_size);
 
             uint64_t resp_size = 0;
-            recv_all(sockfd, &resp_size, sizeof(uint64_t));
+            transport->recv_raw(sockfd, &resp_size, sizeof(uint64_t));
 
             std::vector<char> resp_data(resp_size);
-            recv_all(sockfd, resp_data.data(), resp_size);
+            transport->recv_raw(sockfd, resp_data.data(), resp_size);
 
             Buffer resp_buf;
             resp_buf.data = std::move(resp_data);
@@ -410,12 +400,11 @@ public:
             serialize_layer_replicate_flags(buf, layer_replicate_flags);
 
             uint64_t msg_size = buf.data.size();
-            send_all(sockfd, &msg_size, sizeof(uint64_t));
-            send_all(sockfd, buf.data.data(), msg_size);
+            transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
+            transport->send_raw(sockfd, buf.data.data(), msg_size);
 
-            // Receive ACK
             char ack = 0;
-            recv_all(sockfd, &ack, 1);
+            transport->recv_raw(sockfd, &ack, 1);
             if (ack != 1) {
                 throw std::runtime_error("Failed to partition");
             }
@@ -438,12 +427,11 @@ public:
             buf.write_string(filepath);
 
             uint64_t msg_size = buf.data.size();
-            send_all(sockfd, &msg_size, sizeof(uint64_t));
-            send_all(sockfd, buf.data.data(), msg_size);
+            transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
+            transport->send_raw(sockfd, buf.data.data(), msg_size);
 
-            // Receive ACK
             char ack = 0;
-            recv_all(sockfd, &ack, 1);
+            transport->recv_raw(sockfd, &ack, 1);
             if (ack != 1) {
                 throw std::runtime_error("Failed to load cluster");
             }
@@ -466,12 +454,11 @@ public:
             buf.write_string(filepath);
 
             uint64_t msg_size = buf.data.size();
-            send_all(sockfd, &msg_size, sizeof(uint64_t));
-            send_all(sockfd, buf.data.data(), msg_size);
+            transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
+            transport->send_raw(sockfd, buf.data.data(), msg_size);
 
-            // Receive ACK
             char ack = 0;
-            recv_all(sockfd, &ack, 1);
+            transport->recv_raw(sockfd, &ack, 1);
             if (ack != 1) {
                 throw std::runtime_error("Failed to save cluster");
             }
@@ -494,11 +481,11 @@ public:
             buf.write_string(filepath);
 
             uint64_t msg_size = buf.data.size();
-            send_all(sockfd, &msg_size, sizeof(uint64_t));
-            send_all(sockfd, buf.data.data(), msg_size);
+            transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
+            transport->send_raw(sockfd, buf.data.data(), msg_size);
 
             char ack = 0;
-            recv_all(sockfd, &ack, 1);
+            transport->recv_raw(sockfd, &ack, 1);
             if (ack != 1) {
                 throw std::runtime_error("Failed to save hnsw");
             }
@@ -521,12 +508,11 @@ public:
             buf.write_string(filepath);
 
             uint64_t msg_size = buf.data.size();
-            send_all(sockfd, &msg_size, sizeof(uint64_t));
-            send_all(sockfd, buf.data.data(), msg_size);
+            transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
+            transport->send_raw(sockfd, buf.data.data(), msg_size);
 
-            // Receive ACK
             char ack = 0;
-            recv_all(sockfd, &ack, 1);
+            transport->recv_raw(sockfd, &ack, 1);
             if (ack != 1) {
                 throw std::runtime_error("Failed to load hnsw");
             }
@@ -537,4 +523,3 @@ public:
         disconnect();
     }
 };
-
