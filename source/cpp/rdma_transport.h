@@ -498,6 +498,8 @@ private:
     struct ibv_pd *pd = nullptr;
     struct ibv_cq *send_cq = nullptr;
     struct ibv_cq *recv_cq = nullptr;
+    uint8_t ib_port = 1;
+    int gid_index = -1;
     
     // 连接池
     RdmaConnectionPool conn_pool;
