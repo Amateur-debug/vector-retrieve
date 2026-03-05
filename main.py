@@ -491,7 +491,7 @@ class VectorRetrieveRunner:
             max_num_elements = data.shape[0]
             num_elements = max_num_elements
 
-            self.hnsw = HNSWGraph(dim=dim, m=self.m, ef_construction=self.ef_construction, ef_search=self.ef_search, limited_level=self.limited_level)
+            self.hnsw = HNSWGraph(dim=dim, m=self.m, ef_construction=self.ef_construction, ef_search=self.ef_search, limited_level=self.limited_level, max_elements=num_elements)
             self.cluster = Cluster(self.hnsw, self.node_num, comm_mode=self.comm_mode, ib_dev=self.ib_dev, ib_port=self.ib_port, gid_index=self.gid_index)
 
             if self.args.reduce:
@@ -567,7 +567,7 @@ class VectorRetrieveRunner:
                     if not self.args.distributed:
                         print("Node vector counts:")
                         for i, node in enumerate(self.cluster.nodes):
-                            count = len(node.local_hnsw.vectors) if node.local_hnsw else 0
+count = node.local_hnsw.get_cur_element_count() if node.local_hnsw else 0
                             print(f"  Node {i}: {count} vectors")
                 else:
                     print("Building cluster in reduce mode...")
@@ -581,7 +581,7 @@ class VectorRetrieveRunner:
                     if not self.args.distributed:
                         print("Node vector counts:")
                         for i, node in enumerate(self.cluster.nodes):
-                            count = len(node.local_hnsw.vectors) if node.local_hnsw else 0
+count = node.local_hnsw.get_cur_element_count() if node.local_hnsw else 0
                             print(f"  Node {i}: {count} vectors")
             else:
                 # 传统模式（非分布式）：先建统一图，再分区
@@ -655,7 +655,7 @@ class VectorRetrieveRunner:
                     if not self.args.distributed:
                         print("Node vector counts:")
                         for i, node in enumerate(self.cluster.nodes):
-                            count = len(node.local_hnsw.vectors) if node.local_hnsw else 0
+count = node.local_hnsw.get_cur_element_count() if node.local_hnsw else 0
                             print(f"  Node {i}: {count} vectors")
                 else:
                     print("Building HNSW index (single-threaded)...")

@@ -1,81 +1,130 @@
 /**
  * @file visited.h
- * @brief 已访问节点集合实现
- * 
- * 使用epoch机制实现O(1)清空，避免逐项清零
+ * @brief VisitedListPool 实现（参考 hnswlib visited_list_pool.h）
+ *
+ * 池化管理的 visited 数组，O(1) 检查/标记/重置，多线程友好。
+ * 替代旧的基于 epoch 的 Visited 类。
  */
 
 #pragma once
 
 #include <vector>
-#include <cstdint>
-#include <algorithm>
+#include <cstring>
+#include <mutex>
 
 /**
- * @brief 已访问节点集合
- * 
- * 通过epoch计数器实现快速清空，适合多次搜索复用
+ * @brief 单个 visited 列表
+ *
+ * 使用 unsigned short 数组 + tag 机制实现 O(1) 检查和标记。
+ * 重置时只需递增 cur_tag，溢出时 memset 清零。
  */
-class Visited {
+class VisitedList {
 public:
-    Visited() : cur_epoch_(1), visited_count_(0) {}
+    unsigned short cur_tag;
+    unsigned short* visited_array;
+    int numelements;
 
-    explicit Visited(std::size_t n) : cur_epoch_(1), visited_count_(0) {
-        ensure_capacity(n);
+    VisitedList(int numelements)
+        : cur_tag(1), numelements(numelements) {
+        visited_array = new unsigned short[numelements]();
     }
 
-    // 确保容量足够
-    void ensure_capacity(std::size_t n) {
-        if (visited_epoch_.size() < n) visited_epoch_.resize(n, 0);
-    }
-
-    // 标记节点为已访问，返回是否首次标记
-    bool insert(int id) {
-        if (id < 0) return false;
-        std::size_t uid = static_cast<std::size_t>(id);
-        if (uid >= visited_epoch_.size()) visited_epoch_.resize(uid + 1, 0);
-        if (visited_epoch_[uid] == cur_epoch_) return false;
-        visited_epoch_[uid] = cur_epoch_;
-        ++visited_count_;
-        return true;
+    // 标记节点为已访问
+    void mark(int id) {
+        visited_array[id] = cur_tag;
     }
 
     // 检查节点是否已访问
-    bool find(int id) const {
-        if (id < 0) return false;
-        std::size_t uid = static_cast<std::size_t>(id);
-        return uid < visited_epoch_.size() && visited_epoch_[uid] == cur_epoch_;
+    bool is_visited(int id) const {
+        return visited_array[id] == cur_tag;
     }
 
-    // 快速清空(epoch++)，无需逐项清零
-    void clear() {
-        ++cur_epoch_;
-        visited_count_ = 0;
-        // 防止epoch溢出后回绕
-        if (cur_epoch_ == 0) {
-            std::fill(visited_epoch_.begin(), visited_epoch_.end(), 0);
-            cur_epoch_ = 1;
+    // O(1) 重置：递增 tag，溢出时 memset
+    void reset() {
+        cur_tag++;
+        if (cur_tag == 0) {
+            memset(visited_array, 0, sizeof(unsigned short) * numelements);
+            cur_tag = 1;
         }
     }
 
-    // 转换为vector(用于序列化)
-    std::vector<int> to_vector() const {
-        std::vector<int> vec;
-        vec.reserve(visited_count_);
-        for (size_t i = 0; i < visited_epoch_.size(); ++i) {
-            if (visited_epoch_[i] == cur_epoch_) vec.push_back(static_cast<int>(i));
+    ~VisitedList() {
+        delete[] visited_array;
+    }
+};
+
+/**
+ * @brief VisitedList 对象池
+ *
+ * 线程安全的 VisitedList 池，每个搜索线程从池中获取一个 VisitedList，
+ * 搜索结束后归还。避免多线程竞争和频繁内存分配。
+ */
+class VisitedListPool {
+public:
+    /**
+     * @param initial_pool_size 初始池大小（预创建的 VisitedList 数量）
+     * @param numelements 每个 VisitedList 支持的最大元素数量
+     */
+    VisitedListPool(int initial_pool_size, int numelements)
+        : numelements_(numelements) {
+        for (int i = 0; i < initial_pool_size; i++) {
+            pool_.push_back(new VisitedList(numelements));
         }
-        return vec;
     }
 
-    std::size_t size() const { return visited_count_; }
+    /**
+     * @brief 从池中获取一个空闲的 VisitedList
+     *
+     * 如果池为空则动态创建新的 VisitedList。
+     * 获取后自动 reset（O(1)），调用方独占使用。
+     */
+    VisitedList* get_free_list() {
+        VisitedList* vl;
+        {
+            std::unique_lock<std::mutex> lock(pool_mutex_);
+            if (pool_.empty()) {
+                vl = new VisitedList(numelements_);
+            } else {
+                vl = pool_.back();
+                pool_.pop_back();
+            }
+        }
+        vl->reset();
+        return vl;
+    }
 
-    std::uint64_t capacity_bytes() const {
-        return static_cast<std::uint64_t>(visited_epoch_.capacity()) * sizeof(std::uint32_t);
+    /**
+     * @brief 将 VisitedList 归还到池中
+     */
+    void release_list(VisitedList* vl) {
+        std::unique_lock<std::mutex> lock(pool_mutex_);
+        pool_.push_back(vl);
+    }
+
+    /**
+     * @brief 调整池中所有 VisitedList 的容量
+     *
+     * 当 max_elements 扩容时调用，重建所有池内的 VisitedList。
+     * 注意：调用时确保没有 VisitedList 正在被使用。
+     */
+    void resize(int new_numelements) {
+        std::unique_lock<std::mutex> lock(pool_mutex_);
+        numelements_ = new_numelements;
+        for (auto& vl : pool_) {
+            delete vl;
+            vl = new VisitedList(new_numelements);
+        }
+    }
+
+    ~VisitedListPool() {
+        for (auto* vl : pool_) {
+            delete vl;
+        }
+        pool_.clear();
     }
 
 private:
-    std::vector<std::uint32_t> visited_epoch_;  // 每个节点的epoch标记
-    std::uint32_t cur_epoch_;                   // 当前epoch
-    std::size_t visited_count_;                 // 已访问节点数
+    std::vector<VisitedList*> pool_;
+    std::mutex pool_mutex_;
+    int numelements_;
 };

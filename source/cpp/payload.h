@@ -1,13 +1,11 @@
 #pragma once
 
-#include <unordered_set>
-#include <queue>
 #include <vector>
+#include <queue>
 #include <utility>
 #include <functional>
 #include <cstdint>
-
-#include "visited.h"
+#include <algorithm>
 
 using namespace std;
 
@@ -23,7 +21,9 @@ struct Payload {
     double send_timestamp = 0.0;    // 发送时间戳(毫秒)
     int distance_cnt = 0;        // 计算距离次数
 
-    Visited visited;
+    // 跨节点序列化传输使用的 visited vid 列表（外部 ID）
+    // 搜索内部的 visited 逻辑由 VisitedListPool 管理（基于 internal_id）
+    std::vector<int> visited_vids;
 
     // candidates as min-heap: (distance, id) with smallest distance on top
     priority_queue<pair<T,int>, vector<pair<T,int>>, greater<pair<T,int>>> candidates;
@@ -32,8 +32,7 @@ struct Payload {
     priority_queue<pair<T,int>> results;
 
     void clear() {
-        // clear 
-        visited.clear();
+        visited_vids.clear();
         candidates = decltype(candidates)();
         results = decltype(results)();
         send_timestamp = 0.0;
@@ -42,9 +41,9 @@ struct Payload {
     // 估算当前 Payload 的大小 (bits)，用于计算网络延迟
     uint64_t size_bits() const {
 
-        uint64_t visited_size = visited.size() * sizeof(int) * 8;
+        uint64_t visited_size = visited_vids.size() * sizeof(int) * 8;
 
-        uint64_t candidates_size = candidates.size() * (sizeof(T) + sizeof(int)) * 8;;
+        uint64_t candidates_size = candidates.size() * (sizeof(T) + sizeof(int)) * 8;
 
         uint64_t results_size = results.size() * (sizeof(T) + sizeof(int)) * 8;
 

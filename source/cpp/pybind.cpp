@@ -51,8 +51,8 @@ PYBIND11_MODULE(vector_retrieve, m)
 
     // 绑定 HNSWGraph 类（float 版本）
     py::class_<HNSWGraph<float>>(m, "HNSWGraphFloat")
-        .def(py::init<int, int, int, int, int, unsigned int>(),
-             py::arg("dim"), py::arg("m"), py::arg("ef_construction"), py::arg("ef_search"), py::arg("limited_level"), py::arg("seed") = 123)
+        .def(py::init<int, int, int, int, int, size_t, unsigned int>(),
+             py::arg("dim"), py::arg("m"), py::arg("ef_construction"), py::arg("ef_search"), py::arg("limited_level"), py::arg("max_elements") = 100000, py::arg("seed") = 123)
         .def_readwrite("dim", &HNSWGraph<float>::dim)
         .def_readwrite("m", &HNSWGraph<float>::m)
         .def_readwrite("ef_construction", &HNSWGraph<float>::ef_construction)
@@ -60,9 +60,12 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("limited_level", &HNSWGraph<float>::limited_level)
         .def_readwrite("max_level", &HNSWGraph<float>::max_level)
         .def_readwrite("seed", &HNSWGraph<float>::seed)
-        .def_readwrite("vectors", &HNSWGraph<float>::vectors)
-        .def_readwrite("neighbors", &HNSWGraph<float>::neighbors)
         .def_readwrite("entry_point_id", &HNSWGraph<float>::entry_point_id)
+        .def("get_vector", &HNSWGraph<float>::get_vector, py::arg("vid"))
+        .def("get_neighbors", &HNSWGraph<float>::get_neighbors, py::arg("vid"), py::arg("level") = 0)
+        .def("get_all_vectors", &HNSWGraph<float>::get_all_vectors)
+        .def("get_all_neighbors", &HNSWGraph<float>::get_all_neighbors)
+        .def("get_cur_element_count", &HNSWGraph<float>::get_cur_element_count)
         .def("add_vector", &HNSWGraph<float>::add_vector, py::arg("vid"), py::arg("vec"),
              py::call_guard<py::gil_scoped_release>())  // 释放GIL，允许真正的多线程并行
         .def("query", &HNSWGraph<float>::query, py::call_guard<py::gil_scoped_release>())
@@ -71,8 +74,8 @@ PYBIND11_MODULE(vector_retrieve, m)
 
     // 绑定 HNSWGraph 类（double 版本）
     py::class_<HNSWGraph<double>>(m, "HNSWGraphDouble")
-        .def(py::init<int, int, int, int, int, unsigned int>(),
-             py::arg("dim"), py::arg("m"), py::arg("ef_construction"), py::arg("ef_search"), py::arg("limited_level"), py::arg("seed") = 123)
+        .def(py::init<int, int, int, int, int, size_t, unsigned int>(),
+             py::arg("dim"), py::arg("m"), py::arg("ef_construction"), py::arg("ef_search"), py::arg("limited_level"), py::arg("max_elements") = 100000, py::arg("seed") = 123)
         .def_readwrite("dim", &HNSWGraph<double>::dim)
         .def_readwrite("m", &HNSWGraph<double>::m)
         .def_readwrite("ef_construction", &HNSWGraph<double>::ef_construction)
@@ -80,9 +83,12 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("limited_level", &HNSWGraph<double>::limited_level)
         .def_readwrite("max_level", &HNSWGraph<double>::max_level)
         .def_readwrite("seed", &HNSWGraph<double>::seed)
-        .def_readwrite("vectors", &HNSWGraph<double>::vectors)
-        .def_readwrite("neighbors", &HNSWGraph<double>::neighbors)
         .def_readwrite("entry_point_id", &HNSWGraph<double>::entry_point_id)
+        .def("get_vector", &HNSWGraph<double>::get_vector, py::arg("vid"))
+        .def("get_neighbors", &HNSWGraph<double>::get_neighbors, py::arg("vid"), py::arg("level") = 0)
+        .def("get_all_vectors", &HNSWGraph<double>::get_all_vectors)
+        .def("get_all_neighbors", &HNSWGraph<double>::get_all_neighbors)
+        .def("get_cur_element_count", &HNSWGraph<double>::get_cur_element_count)
         .def("add_vector", &HNSWGraph<double>::add_vector, py::arg("vid"), py::arg("vec"),
              py::call_guard<py::gil_scoped_release>())  // 释放GIL，允许真正的多线程并行
         .def("query", &HNSWGraph<double>::query, py::call_guard<py::gil_scoped_release>())

@@ -40,6 +40,9 @@
 #include "payload.h"
 #include "tcp_transport.h"
 
+#include "json.hpp"
+using json = nlohmann::json;
+
 using namespace std;
 
 // 注意: TcpConnectionPool 已迁移到 tcp_transport.h
@@ -161,8 +164,7 @@ void serialize_payload(Buffer &buf, Payload<T> &payload)
     buf.write_val(payload.send_timestamp);
     buf.write_val(payload.distance_cnt);
 
-    std::vector<int> visited_vec = payload.visited.to_vector();
-    buf.write_vec(visited_vec);
+    buf.write_vec(payload.visited_vids);
 
     auto cand_copy = payload.candidates;
     std::vector<pair<T, int>> cand_vec;
@@ -206,10 +208,7 @@ void deserialize_payload(Buffer &buf, Payload<T> &payload)
     payload.send_timestamp = buf.read_val<double>();
     payload.distance_cnt = buf.read_val<int>();
 
-    std::vector<int> visited_vec = buf.read_vec<int>();
-    payload.visited.clear();
-    for (int v : visited_vec)
-        payload.visited.insert(v);
+    payload.visited_vids = buf.read_vec<int>();
 
     int cand_size = buf.read_val<int>();
     payload.candidates = decltype(payload.candidates)();
@@ -233,6 +232,9 @@ void deserialize_payload(Buffer &buf, Payload<T> &payload)
 template <typename T>
 void serialize_hnsw(Buffer &buf, const HNSWGraph<T> *hnsw)
 {
+    size_t cur_count = hnsw->cur_element_count_.load();
+
+    // 写入参数头
     buf.write_val(hnsw->dim);
     buf.write_val(hnsw->m);
     buf.write_val(hnsw->ef_construction);
@@ -241,29 +243,31 @@ void serialize_hnsw(Buffer &buf, const HNSWGraph<T> *hnsw)
     buf.write_val(hnsw->max_level);
     buf.write_val(hnsw->entry_point_id);
     buf.write_val(hnsw->seed);
+    buf.write_val((uint64_t)hnsw->max_elements_);
+    buf.write_val((uint64_t)cur_count);
+    buf.write_val((uint64_t)hnsw->size_per_element_);
+    buf.write_val((uint64_t)hnsw->links_level0_size_);
+    buf.write_val((uint64_t)hnsw->data_offset_);
+    buf.write_val((uint64_t)hnsw->label_offset_);
+    buf.write_val((uint64_t)hnsw->size_links_per_element_);
+    buf.write_val(hnsw->max_m_);
+    buf.write_val(hnsw->max_m0_);
+    buf.write_val(hnsw->level_mult_);
 
-    // vectors
-    buf.write_val((uint64_t)hnsw->vectors.size());
-    LOG_DEBUG_STREAM("Serializing HNSW: " << hnsw->vectors.size() << " vectors, " << hnsw->neighbors.size() << " levels.");
-    for (const auto &kv : hnsw->vectors)
-    {
-        buf.write_val(kv.first);  // id
-        buf.write_vec(kv.second); // vector
-    }
+    LOG_DEBUG_STREAM("Serializing HNSW: " << cur_count << " elements.");
 
-    // neighbors
-    buf.write_val((uint64_t)hnsw->neighbors.size()); // num levels
-    for (const auto &level_kv : hnsw->neighbors)
+    // 写入 level 0 数据块
+    buf.write(hnsw->data_level0_, cur_count * hnsw->size_per_element_);
+
+    // 写入高层链接数据
+    for (size_t i = 0; i < cur_count; i++)
     {
-        buf.write_val(level_kv.first); // level
-        const auto &node_map = level_kv.second;
-        buf.write_val((uint64_t)node_map.size()); // num nodes in this level
-        for (const auto &node_kv : node_map)
+        int link_level = hnsw->element_levels_[i];
+        buf.write_val(link_level);
+        if (link_level > 0)
         {
-            buf.write_val(node_kv.first); // node id
-            const auto &nbrs = node_kv.second;
-            std::vector<int> nbr_vec(nbrs.begin(), nbrs.end());
-            buf.write_vec(nbr_vec);
+            size_t link_size = hnsw->size_links_per_element_ * link_level;
+            buf.write(hnsw->link_lists_[i], link_size);
         }
     }
 }
@@ -279,30 +283,45 @@ HNSWGraph<T> *deserialize_hnsw(Buffer &buf)
     int max_l = buf.read_val<int>();
     int ep = buf.read_val<int>();
     unsigned int seed = buf.read_val<unsigned int>();
+    uint64_t max_elements = buf.read_val<uint64_t>();
+    uint64_t cur_count = buf.read_val<uint64_t>();
+    uint64_t size_per_element = buf.read_val<uint64_t>();
+    uint64_t links_level0_size = buf.read_val<uint64_t>();
+    uint64_t data_offset = buf.read_val<uint64_t>();
+    uint64_t label_offset = buf.read_val<uint64_t>();
+    uint64_t size_links_per_element = buf.read_val<uint64_t>();
+    int max_m = buf.read_val<int>();
+    int max_m0 = buf.read_val<int>();
+    double level_mult = buf.read_val<double>();
 
-    HNSWGraph<T> *hnsw = new HNSWGraph<T>(dim, m, ef_c, ef_s, lim, seed);
+    HNSWGraph<T> *hnsw = new HNSWGraph<T>(dim, m, ef_c, ef_s, lim, max_elements, seed);
     hnsw->max_level = max_l;
     hnsw->entry_point_id = ep;
+    hnsw->cur_element_count_ = (size_t)cur_count;
 
-    uint64_t vec_size = buf.read_val<uint64_t>();
-    for (uint64_t i = 0; i < vec_size; ++i)
-    {
-        int id = buf.read_val<int>();
-        hnsw->vectors[id] = buf.read_vec<T>();
-    }
+    // 读取 level 0 数据块
+    buf.read(hnsw->data_level0_, cur_count * hnsw->size_per_element_);
 
-    uint64_t levels = buf.read_val<uint64_t>();
-    for (uint64_t i = 0; i < levels; ++i)
+    // 读取高层链接数据并重建 label_lookup_
+    for (uint64_t i = 0; i < cur_count; i++)
     {
-        int level = buf.read_val<int>();
-        uint64_t nodes = buf.read_val<uint64_t>();
-        for (uint64_t j = 0; j < nodes; ++j)
+        int link_level = buf.read_val<int>();
+        hnsw->element_levels_[i] = link_level;
+
+        if (link_level > 0)
         {
-            int nid = buf.read_val<int>();
-            std::vector<int> nbrs = buf.read_vec<int>();
-            hnsw->neighbors[level][nid] = std::unordered_set<int>(nbrs.begin(), nbrs.end());
+            size_t link_size = hnsw->size_links_per_element_ * link_level;
+            hnsw->link_lists_[i] = (char *)malloc(link_size);
+            if (!hnsw->link_lists_[i])
+                throw std::runtime_error("deserialize_hnsw: failed to allocate link_lists_");
+            buf.read(hnsw->link_lists_[i], link_size);
         }
+
+        // 重建 label_lookup_
+        int vid = hnsw->get_external_label((int)i);
+        hnsw->label_lookup_[vid] = (int)i;
     }
+
     return hnsw;
 }
 
@@ -734,6 +753,10 @@ public:
 
     int outer_ring(vector<unordered_map<int, vector<T>>> &local_vectors)
     {
+        // 缓存全局邻居关系和向量数据用于 outer_ring 操作
+        auto all_neighbors = hnsw->get_all_neighbors();
+        auto all_vectors = hnsw->get_all_vectors();
+
         // 1. 找出所有有跨节点邻居的候选 boundary vectors（及其跨节点邻居数）
         unordered_map<int, vector<pair<int, int>>> boundary_candidates; // node -> [(vid, cross_cnt)]
         for (int node_id = 0; node_id < node_num; node_id++)
@@ -742,15 +765,22 @@ public:
             {
                 int vid = kv.first;
                 int cross_cnt = 0;
-                const auto &neighbor_set = hnsw->neighbors[0][vid];
-                for (int nid : neighbor_set)
+                auto level_it = all_neighbors.find(0);
+                if (level_it != all_neighbors.end())
                 {
-                    auto route_it = vector_node_map[0].find(nid);
-                    if (route_it == vector_node_map[0].end() || route_it->second.empty())
-                        continue;
-                    if (route_it->second[0] != node_id)
+                    auto vid_it = level_it->second.find(vid);
+                    if (vid_it != level_it->second.end())
                     {
-                        cross_cnt++;
+                        for (int nid : vid_it->second)
+                        {
+                            auto route_it = vector_node_map[0].find(nid);
+                            if (route_it == vector_node_map[0].end() || route_it->second.empty())
+                                continue;
+                            if (route_it->second[0] != node_id)
+                            {
+                                cross_cnt++;
+                            }
+                        }
                     }
                 }
                 if (cross_cnt > 0)
@@ -800,7 +830,14 @@ public:
         for (int vid : removed)
         {
             unordered_map<int, int> counts; // node -> count
-            const auto &neighbor_set = hnsw->neighbors[0][vid];
+            auto level_it = all_neighbors.find(0);
+            std::unordered_set<int> neighbor_set;
+            if (level_it != all_neighbors.end())
+            {
+                auto vid_it = level_it->second.find(vid);
+                if (vid_it != level_it->second.end())
+                    neighbor_set = vid_it->second;
+            }
             for (int nid : neighbor_set)
             {
                 auto route_it = vector_node_map[0].find(nid);
@@ -842,7 +879,7 @@ public:
                 }
             }
             // 将向量数据放回到选定节点
-            local_vectors[best_node][vid] = hnsw->vectors[vid];
+            local_vectors[best_node][vid] = all_vectors[vid];
             vector_node_map[0][vid] = {best_node};
         }
 
@@ -857,8 +894,8 @@ public:
         this->layer_replicate_flags = layer_replicate_flags;
 
         int max_level = hnsw->max_level;
-        auto &vectors = hnsw->vectors;
-        auto &neighbors = hnsw->neighbors;
+        auto vectors = hnsw->get_all_vectors();
+        auto neighbors = hnsw->get_all_neighbors();
 
         // local_vectors: node_id -> map<vid, vector<T>>
         vector<unordered_map<int, vector<T>>> local_vectors(node_num);
@@ -881,9 +918,9 @@ public:
         }
         else if (mode == "k-means")
         {
-            auto labels = kmeans(hnsw->vectors, node_num, 100, hnsw->seed);
+            auto labels = kmeans(vectors, node_num, 100, hnsw->seed);
             int idx = 0;
-            for (const auto &kv : hnsw->vectors)
+            for (const auto &kv : vectors)
             {
                 int vid = kv.first;
                 int target = labels[idx++];
@@ -894,9 +931,9 @@ public:
         else if (mode == "outer_ring")
         {
             // 先用 k-means 分配
-            auto labels = kmeans(hnsw->vectors, node_num, 100, hnsw->seed);
+            auto labels = kmeans(vectors, node_num, 100, hnsw->seed);
             int idx = 0;
-            for (const auto &kv : hnsw->vectors)
+            for (const auto &kv : vectors)
             {
                 int vid = kv.first;
                 int target = labels[idx++];
@@ -1155,11 +1192,13 @@ public:
                 delete nodes[i].local_hnsw;
                 nodes[i].local_hnsw = nullptr;
             }
-            HNSWGraph<T> *local_hnsw = new HNSWGraph<T>(hnsw->dim, hnsw->m, hnsw->ef_construction, hnsw->ef_search, hnsw->limited_level, hnsw->seed);
-            local_hnsw->max_level = max_level;
-            local_hnsw->vectors = local_vectors[i];
-            local_hnsw->neighbors = hnsw->neighbors;
-            local_hnsw->entry_point_id = hnsw->entry_point_id;
+            size_t local_max_elements = std::max(local_vectors[i].size(), (size_t)1000);
+            HNSWGraph<T> *local_hnsw = new HNSWGraph<T>(hnsw->dim, hnsw->m, hnsw->ef_construction, hnsw->ef_search, hnsw->limited_level, local_max_elements, hnsw->seed);
+            // 通过 add_vector 逐个添加（建立连续内存布局和邻居关系）
+            for (const auto &kv : local_vectors[i])
+            {
+                local_hnsw->add_vector(kv.first, kv.second);
+            }
             nodes[i].local_hnsw = local_hnsw;
         }
 
@@ -1505,7 +1544,7 @@ public:
             }
 
             // 保存主 HNSW 图
-            string hnsw_path = filepath + ".hnsw.json";
+            string hnsw_path = filepath + ".hnsw.bin";
             if (hnsw)
             {
                 hnsw->save(hnsw_path);
@@ -1529,7 +1568,7 @@ public:
 
                 if (nodes[i].local_hnsw && nodes[i].local_hnsw != hnsw)
                 {
-                    string local_hnsw_path = filepath + ".node" + std::to_string(i) + ".json";
+                    string local_hnsw_path = filepath + ".node" + std::to_string(i) + ".bin";
                     nodes[i].local_hnsw->save(local_hnsw_path);
                     jnode["local_hnsw_path"] = local_hnsw_path;
                 }
@@ -1839,7 +1878,7 @@ void Node<T>::handle_client(int client_fd)
                     delete local_hnsw;
                 local_hnsw = deserialize_hnsw<T>(buf);
 
-                LOG_DEBUG_STREAM("Node " << node_id << " initialized with " << local_hnsw->vectors.size() << " vectors.");
+                LOG_DEBUG_STREAM("Node " << node_id << " initialized with " << local_hnsw->get_cur_element_count() << " vectors.");
 
                 if (buf.read_pos != buf.data.size())
                 {
@@ -1896,9 +1935,9 @@ void Node<T>::handle_client(int client_fd)
                         std::lock_guard<std::mutex> lk(local_hnsw_mutex);
                         if (local_hnsw == nullptr)
                         {
-                            local_hnsw = new HNSWGraph<T>(
+                        local_hnsw = new HNSWGraph<T>(
                                 cluster->hnsw->dim, cluster->hnsw->m, cluster->hnsw->ef_construction,
-                                cluster->hnsw->ef_search, cluster->hnsw->limited_level, cluster->hnsw->seed);
+                                cluster->hnsw->ef_search, cluster->hnsw->limited_level, 100000, cluster->hnsw->seed);
                         }
                     }
                     if (local_hnsw)
@@ -2163,7 +2202,7 @@ void Node<T>::handle_client(int client_fd)
                         // 只有本地节点才有 vector_count
                         if (!cluster->nodes[i].is_remote_node && cluster->nodes[i].local_hnsw)
                         {
-                            nj["vector_count"] = (int)cluster->nodes[i].local_hnsw->vectors.size();
+                            nj["vector_count"] = (int)cluster->nodes[i].local_hnsw->get_cur_element_count();
                         }
                         nodes_json.push_back(std::move(nj));
                     }
@@ -2455,7 +2494,7 @@ void Node<T>::add_vector(int vid, const std::vector<T> &vec)
             {
                 local_hnsw = new HNSWGraph<T>(
                     cluster->hnsw->dim, cluster->hnsw->m, cluster->hnsw->ef_construction,
-                    cluster->hnsw->ef_search, cluster->hnsw->limited_level, cluster->hnsw->seed);
+                    cluster->hnsw->ef_search, cluster->hnsw->limited_level, 100000, cluster->hnsw->seed);
             }
         }
 
