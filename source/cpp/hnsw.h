@@ -4,7 +4,8 @@
  *
  * 特性:
  *   - 连续内存布局：data_level0_ 存储 level 0 数据，link_lists_ 存储高层链接
- *   - 无锁 query：search_layer_query 完全无 mutex
+ *   - 读写锁保护：resize 时独占锁暂停所有建图线程，建图时共享锁并发执行
+ *   - query 与 add_vector 不会并发，无需额外保护
  *   - 节点级锁：建图时使用 link_locks_ 细粒度锁
  *   - 定长邻居数组：[count | id0 | id1 | ... | id_{max-1}]
  *   - 距离函数指针化：通过 SpaceInterface 运行时选择最优 SIMD 实现
@@ -23,6 +24,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <shared_mutex>
 #include <queue>
 #include <random>
 #include <string>
@@ -59,6 +61,7 @@ public:
     char **link_lists_;                     // 高层邻居指针数组
     std::vector<std::mutex> link_locks_;    // 节点级锁数组
     std::mutex global_mutex_;               // 全局锁（保护 entry_point_id, max_level）
+    std::shared_mutex resize_mutex_;               // 读写锁：resize 时独占，建图线程共享
 
     // === 内存布局参数 ===
     size_t max_elements_;           // 最大元素容量
@@ -225,6 +228,13 @@ public:
     // ========================================================
     void resize_index(size_t new_max_elements)
     {
+        if (new_max_elements <= max_elements_)
+            return;
+
+        // 获取独占锁，暂停所有并发读操作（建图搜索、查询等）
+        std::unique_lock<std::shared_mutex> resize_lock(resize_mutex_);
+
+        // 双重检查：获取锁后再次确认是否需要扩容（可能其他线程已经扩容过了）
         if (new_max_elements <= max_elements_)
             return;
 
@@ -429,6 +439,7 @@ public:
     std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>, std::greater<std::pair<T, int>>>
     search_layer_build(const void *query_data, int ep_id, int ef, int level)
     {
+        // 注意：调用方（add_vector）已持有 resize_mutex_ 的共享锁，此处无需再获取
         VisitedList *vl = visited_pool_->get_free_list();
         unsigned short *visited_array = vl->visited_array;
         unsigned short visited_tag = vl->cur_tag;
@@ -509,12 +520,13 @@ public:
     }
 
     // ========================================================
-    // search_layer_query - query 搜索（完全无锁 + 预取优化）
-    // 参考 hnswlib searchBaseLayerST
+    // search_layer_query - query 搜索（预取优化）
+    // query 与 add_vector 不会并发，无需加锁
     // ========================================================
     std::priority_queue<std::pair<T, int>>
     search_layer_query(const void *query_data, int ep_id, int ef)
     {
+        // query 与 add_vector 不会并发，无需加锁
         VisitedList *vl = visited_pool_->get_free_list();
         unsigned short *visited_array = vl->visited_array;
         unsigned short visited_tag = vl->cur_tag;
@@ -602,6 +614,7 @@ public:
     {
         int cur_c;  // 新节点的 internal_id
         int curlevel;
+        bool need_resize = false;
 
         {
             std::unique_lock<std::mutex> lock(global_mutex_);
@@ -610,16 +623,47 @@ public:
             auto it = label_lookup_.find(vid);
             if (it != label_lookup_.end())
             {
-                // 已存在则更新向量数据
+                // 已存在则更新向量数据（需要共享锁保护内存访问）
                 int existing_id = it->second;
+                lock.unlock();
+                std::shared_lock<std::shared_mutex> resize_shared_lock(resize_mutex_);
                 memcpy(get_data_by_id(existing_id), vec.data(), dim * sizeof(T));
                 return;
             }
 
-            // 检查容量，必要时扩容
+            // 检查容量，标记是否需要扩容（先释放 global_mutex_ 再扩容，避免死锁）
             if (cur_element_count_.load() >= max_elements_)
             {
+                need_resize = true;
+            }
+        }
+
+        // 扩容在 global_mutex_ 外执行，resize_index 内部会获取 resize_mutex_ 独占锁
+        if (need_resize)
+        {
+            resize_index(max_elements_ * 2);
+        }
+
+        {
+            std::unique_lock<std::mutex> lock(global_mutex_);
+
+            // 再次检查是否已存在（可能在释放锁期间被其他线程插入）
+            auto it = label_lookup_.find(vid);
+            if (it != label_lookup_.end())
+            {
+                int existing_id = it->second;
+                lock.unlock();
+                std::shared_lock<std::shared_mutex> resize_shared_lock(resize_mutex_);
+                memcpy(get_data_by_id(existing_id), vec.data(), dim * sizeof(T));
+                return;
+            }
+
+            // 再次检查容量（可能扩容不够或其他线程消耗了空间）
+            if (cur_element_count_.load() >= max_elements_)
+            {
+                lock.unlock();
                 resize_index(max_elements_ * 2);
+                lock.lock();
             }
 
             cur_c = (int)cur_element_count_.load();
@@ -629,6 +673,9 @@ public:
             element_levels_[cur_c] = curlevel;
             label_lookup_[vid] = cur_c;
         }
+
+        // 获取共享锁，保证 resize 期间不访问内存
+        std::shared_lock<std::shared_mutex> resize_shared_lock(resize_mutex_);
 
         // 将向量数据写入 data_level0_
         memcpy(get_data_by_id(cur_c), vec.data(), dim * sizeof(T));
@@ -728,6 +775,7 @@ public:
     // ========================================================
     void search_layer_ef(const std::vector<T> &query_vector, int level, int ef, Payload<T> &payload)
     {
+        // query 与 add_vector 不会并发，无需加锁
         int ep_internal_id = -1;
 
         // 将 payload.entry_point_id (vid) 转为 internal_id
@@ -1046,7 +1094,7 @@ public:
             }
         }
 
-        // level 0 搜索（使用 search_layer_query，完全无锁）
+        // level 0 搜索
         int actual_ef = std::max(ef_search, k);
         auto top_candidates = search_layer_query(query_data, ep, actual_ef);
 
