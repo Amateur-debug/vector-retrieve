@@ -354,7 +354,7 @@ class VectorRetrieveRunner:
 
         print(f"Building in {mode_label} via SDK...")
         start_time = time.time()
-                thread_client = ClusterSDKClient(ip=self.sdk_config["ip"], port=self.sdk_config["port"], comm_mode=self.comm_mode)
+        thread_client = ClusterSDKClient(ip=self.sdk_config["ip"], port=self.sdk_config["port"], comm_mode=self.comm_mode)
         if not thread_client.connect():
             raise RuntimeError("Failed to connect SDK to local node for building")
         try:
@@ -567,7 +567,7 @@ class VectorRetrieveRunner:
                     if not self.args.distributed:
                         print("Node vector counts:")
                         for i, node in enumerate(self.cluster.nodes):
-count = node.local_hnsw.get_cur_element_count() if node.local_hnsw else 0
+                            count = node.local_hnsw.get_cur_element_count() if node.local_hnsw else 0
                             print(f"  Node {i}: {count} vectors")
                 else:
                     print("Building cluster in reduce mode...")
@@ -581,7 +581,7 @@ count = node.local_hnsw.get_cur_element_count() if node.local_hnsw else 0
                     if not self.args.distributed:
                         print("Node vector counts:")
                         for i, node in enumerate(self.cluster.nodes):
-count = node.local_hnsw.get_cur_element_count() if node.local_hnsw else 0
+                            count = node.local_hnsw.get_cur_element_count() if node.local_hnsw else 0
                             print(f"  Node {i}: {count} vectors")
             else:
                 # 传统模式（非分布式）：先建统一图，再分区
@@ -655,7 +655,7 @@ count = node.local_hnsw.get_cur_element_count() if node.local_hnsw else 0
                     if not self.args.distributed:
                         print("Node vector counts:")
                         for i, node in enumerate(self.cluster.nodes):
-count = node.local_hnsw.get_cur_element_count() if node.local_hnsw else 0
+                            count = node.local_hnsw.get_cur_element_count() if node.local_hnsw else 0
                             print(f"  Node {i}: {count} vectors")
                 else:
                     print("Building HNSW index (single-threaded)...")
