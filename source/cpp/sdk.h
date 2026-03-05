@@ -289,7 +289,7 @@ public:
             disconnect();
             throw;
         }
-        disconnect();
+        // 持久连接：不断开，下次 add_vector 复用同一连接
     }
 
     std::vector<int> query(int query_id, const std::vector<T> &query_vector, Payload<T> &payload, int k = 10)

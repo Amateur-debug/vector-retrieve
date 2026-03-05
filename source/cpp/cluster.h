@@ -1920,8 +1920,8 @@ void Node<T>::handle_client(int client_fd)
 
                 // 发送 ACK 确认 (always send, even on error)
                 send_all(client_fd, &ack, 1);
-                // 非持久连接：主动关闭
-                break;
+                // 持久连接：继续等待下一个消息
+                continue;
             }
             else if (msg_type == MSG_ADD_VECTOR_LOCAL)
             {
@@ -1955,8 +1955,8 @@ void Node<T>::handle_client(int client_fd)
 
                 // 发送 ACK 确认 (always send, even on error)
                 send_all(client_fd, &ack, 1);
-                // 非持久连接：主动关闭
-                break;
+                // 持久连接：继续等待下一个消息
+                continue;
             }
             else if (msg_type == MSG_QUERY)
             {
@@ -2475,8 +2475,8 @@ void Node<T>::add_vector(int vid, const std::vector<T> &vec)
             // Wait for ACK
             char ack = 0;
             cluster->transport->recv_raw(sock, &ack, 1);
-            // 远程节点在发送ACK后会关闭连接，所以这里标记为无效
-            cluster->transport->release_connection(node_id, sock, false);
+            // 持久连接：远程节点不会关闭连接，归还到连接池复用
+            cluster->transport->release_connection(node_id, sock, true);
         }
         catch (const std::exception &e)
         {
