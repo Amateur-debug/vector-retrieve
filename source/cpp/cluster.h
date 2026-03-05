@@ -2297,8 +2297,8 @@ void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& result
         serialize_payload(buf, payload);
         
         uint64_t msg_size = buf.data.size();
-        send_all(sock, &msg_size, sizeof(uint64_t));
-        send_all(sock, buf.data.data(), msg_size);
+        cluster->transport->send_raw(sock, &msg_size, sizeof(uint64_t));
+        cluster->transport->send_raw(sock, buf.data.data(), msg_size);
         
         // 非持久连接：远程节点已关闭，标记为无效
         cluster->transport->release_connection(payload.origin_node_id, sock, false);
@@ -2429,12 +2429,12 @@ void Node<T>::add_vector(int vid, const std::vector<T> &vec)
         uint64_t msg_size = buf.data.size();
         try
         {
-            send_all(sock, &msg_size, sizeof(uint64_t));
-            send_all(sock, buf.data.data(), msg_size);
+            cluster->transport->send_raw(sock, &msg_size, sizeof(uint64_t));
+            cluster->transport->send_raw(sock, buf.data.data(), msg_size);
 
             // Wait for ACK
             char ack = 0;
-            recv_all(sock, &ack, 1);
+            cluster->transport->recv_raw(sock, &ack, 1);
             // 远程节点在发送ACK后会关闭连接，所以这里标记为无效
             cluster->transport->release_connection(node_id, sock, false);
         }

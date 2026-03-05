@@ -769,11 +769,22 @@ public:
     
     void close_connection(int conn_id) override {
         auto conn = remove_active_conn(conn_id);
-        // 连接从活跃映射中移除后，shared_ptr 引用计数归零时自动释放
-        // 但 RDMA 资源需要显式释放
-        if (conn && conn->aux_sock >= 0) {
-            close(conn->aux_sock);
-            conn->aux_sock = -1;
+        if (conn) {
+            // RDMA 连接：关闭 TCP 辅助通道
+            if (conn->aux_sock >= 0) {
+                close(conn->aux_sock);
+                conn->aux_sock = -1;
+            }
+        } else {
+            // 不在 RDMA 活跃映射中，可能是 accept 返回的原始 TCP fd
+            // 按 TCP 方式直接关闭
+            if (conn_id >= 0) {
+                struct linger so_linger;
+                so_linger.l_onoff = 1;
+                so_linger.l_linger = 0;
+                setsockopt(conn_id, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
+                close(conn_id);
+            }
         }
     }
     
@@ -838,6 +849,42 @@ public:
         return client_fd;
     }
     
+    // --- 数据传输（带长度头） ---
+
+    void send_message(int conn_id, const void* data, size_t size) override {
+        uint64_t msg_size = size;
+        send_raw(conn_id, &msg_size, sizeof(uint64_t));
+        send_raw(conn_id, data, size);
+    }
+
+    size_t recv_message(int conn_id, std::vector<char>& buffer) override {
+        uint64_t msg_size = 0;
+        recv_raw(conn_id, &msg_size, sizeof(uint64_t));
+        buffer.resize(msg_size);
+        recv_raw(conn_id, buffer.data(), msg_size);
+        return msg_size;
+    }
+
+    // --- 资源管理 ---
+
+    void close_node(int node_id) override {
+        // RDMA 连接池不支持按节点关闭（所有连接统一管理）
+        // 这里仅记录日志
+        LOG_DEBUG_STREAM("[RDMA] close_node 请求: node_id=" << node_id);
+    }
+
+    void clear() override {
+        conn_pool.close_all();
+        std::lock_guard<std::mutex> lock(active_conns_mutex);
+        active_conns.clear();
+    }
+
+    std::string get_stats() override {
+        return "[RdmaTransport] Active connections: " + std::to_string(active_conns.size());
+    }
+
+    // --- 原始数据传输（不带长度头） ---
+
     void send_raw(int conn_id, const void* data, size_t size) override {
         // 尝试查找 RDMA 活跃连接
         auto conn = get_active_conn(conn_id);
