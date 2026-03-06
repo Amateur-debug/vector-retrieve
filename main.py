@@ -263,7 +263,8 @@ class VectorRetrieveRunner:
                 # Build remote command as a single string
                 cpu_prefix = f"taskset -c 0-{self.num_cpu - 1} " if self.num_cpu and self.num_cpu > 0 else ""
                 remote_cmd = (
-                    f"cd {current_dir} && conda activate base && "
+                    f"cd {current_dir} && "
+                    f"conda activate vector-retrieve && "
                     f"nohup {cpu_prefix}python -u node_start.py "
                     f"--node_id {i} --node_ips {self.default_ips} "
                     f"--m {self.args.m} --ef_construction {self.args.ef_construction} "

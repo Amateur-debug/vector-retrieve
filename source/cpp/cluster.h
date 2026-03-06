@@ -1225,6 +1225,7 @@ public:
             Node<T> &target_node = nodes[i];
             if (target_node.is_remote_node)
             {
+                LOG_INFO_STREAM("[partition] Connecting to remote node " << i << " (" << target_node.ip_addr << ":" << (target_node.port + Node<T>::NODE_PORT_OFFSET) << ")...");
                 // 使用通信中间层获取连接
                 int sock = transport->acquire_connection(i);
                 if (sock < 0)
@@ -1232,6 +1233,7 @@ public:
                     LOG_DEBUG_STREAM("Failed to get connection to node " << i);
                     continue;
                 }
+                LOG_INFO_STREAM("[partition] Connected to node " << i << ", sock=" << sock);
 
                 Buffer buf;
                 buf.write_val((int)MSG_INIT_GRAPH);
@@ -1239,8 +1241,11 @@ public:
                 serialize_hnsw(buf, target_node.local_hnsw);
 
                 uint64_t msg_size = buf.data.size();
+                LOG_INFO_STREAM("[partition] Sending MSG_INIT_GRAPH to node " << i << ", msg_size=" << msg_size << " bytes");
                 transport->send_raw(sock, &msg_size, sizeof(uint64_t));
+                LOG_INFO_STREAM("[partition] Sent msg_size header to node " << i << ", now sending payload...");
                 transport->send_raw(sock, buf.data.data(), msg_size);
+                LOG_INFO_STREAM("[partition] Sent payload to node " << i << ", waiting for ACK...");
 
                 // Wait for ACK from worker node
                 char ack = 0;
@@ -1249,12 +1254,16 @@ public:
                     transport->recv_raw(sock, &ack, 1);
                     if (ack == 1)
                     {
-                        LOG_DEBUG_STREAM("Partition sent to node " << i << " - ACK received");
+                        LOG_INFO_STREAM("[partition] Node " << i << " ACK received OK");
                     }
                     else
                     {
-                        LOG_DEBUG_STREAM("Warning: Invalid ACK from node " << i);
+                        LOG_DEBUG_STREAM("Warning: Invalid ACK from node " << i << ", ack=" << (int)ack);
                     }
+                }
+                catch (const std::exception &e)
+                {
+                    LOG_DEBUG_STREAM("Warning: No ACK from node " << i << ": " << e.what());
                 }
                 catch (...)
                 {
@@ -1867,7 +1876,7 @@ template <typename T>
 void Node<T>::tcp_server_loop()
 {
     int node_port = port + NODE_PORT_OFFSET;
-    LOG_DEBUG_STREAM("Node " << node_id << " node-to-node server loop started on port " << node_port);
+    LOG_INFO_STREAM("Node " << node_id << " node-to-node server loop started on port " << node_port);
 
     while (!stop_server.load())
     {
@@ -1876,9 +1885,11 @@ void Node<T>::tcp_server_loop()
         {
             if (stop_server.load())
                 break;
+            LOG_DEBUG_STREAM("[Node " << node_id << "] tcp_server_loop: accept_client returned " << conn_id);
             continue;
         }
 
+        LOG_INFO_STREAM("[Node " << node_id << "] tcp_server_loop: accepted connection, conn_id=" << conn_id);
         std::thread(&Node<T>::handle_node_client, this, conn_id).detach();
     }
 }
@@ -1913,16 +1924,19 @@ template <typename T>
 void Node<T>::handle_node_client(int conn_id)
 {
     active_handlers++;
+    LOG_INFO_STREAM("[Node " << node_id << "] handle_node_client started, conn_id=" << conn_id);
 
     while (true)
     {
         try
         {
             uint64_t msg_size = 0;
+            LOG_DEBUG_STREAM("[Node " << node_id << "] handle_node_client waiting for msg_size, conn_id=" << conn_id);
             cluster->transport->recv_raw(conn_id, &msg_size, sizeof(uint64_t));
             if (msg_size == 0)
                 break;
 
+            LOG_INFO_STREAM("[Node " << node_id << "] handle_node_client received msg_size=" << msg_size << ", conn_id=" << conn_id);
             std::vector<char> buffer(msg_size);
             cluster->transport->recv_raw(conn_id, buffer.data(), msg_size);
 
