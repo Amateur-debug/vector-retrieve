@@ -31,17 +31,18 @@ DATASETS = [
 PARAM_GRID = {
     "node_num":           [1],
     "partition_mode":     ["k-means"],
-    "redundancy":         [2],
+    "redundancy":         [2, 1, 0],
     "m":                  [16],
     "ef_construction":    [200],
-    "ef_search":          [32],
+    "ef_search":          [16, 24, 32],
     "limited_level":      [5],
     "k":                  [10],
-    "num_query_threads":  [128],
+    "num_query_threads":  [8, 32],
     "reduce":             [False, True],
     "distributed":        [True],
     "layer":              [True, False],
     "comm_mode":          ["tcp"],  # 通信模式："tcp" 或 "rdma"
+    "cpus":               [8],       # CPU 核心数
 }
 
 # 等待 graph 文件的最长秒数 (0 = 无限等待)
@@ -121,6 +122,20 @@ def get_graph_path(data_name, params):
     return os.path.join(".", "save", filename)
 
 
+def get_result_path(dataset_name, params):
+    """生成结果文件路径"""
+    filename = f"results-{dataset_name}-m{params['m']}-efc{params['ef_construction']}-efs{params['ef_search']}-ll{params['limited_level']}-node{params['node_num']}-{params['partition_mode']}-red{params['redundancy']}-threads{params['num_query_threads']}"
+    if params.get('distributed'):
+        filename += "-distributed"
+    if params.get('reduce'):
+        filename += "-reduce"
+    if params.get('layer'):
+        filename += "-layer"
+    cpus = params.get('cpus', 8)
+    filename += f"-cpus{cpus}.json"
+    return os.path.join(".", "results", "cpp", filename)
+
+
 def run_batch():
     """批量运行实验"""
     # 原始参数顺序
@@ -174,7 +189,7 @@ def run_batch():
                 cmd.append("--save")
                 description = f"Dataset: {dataset['name']} | Build graph | Params: {params}"
 
-            tasks.append((cmd, description))
+            tasks.append((cmd, description, dataset, params))
 
     total_experiments = len(tasks)
     print("=" * 60)
@@ -182,16 +197,70 @@ def run_batch():
     print(f"Parallel workers: {MAX_WORKERS}")
     print("=" * 60)
 
+    # 第一次运行所有任务
+    failed_tasks = []
     if MAX_WORKERS > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = [
                 executor.submit(run_worker, cmd, i + 1, total_experiments, desc)
-                for i, (cmd, desc) in enumerate(tasks)
+                for i, (cmd, desc, _, _) in enumerate(tasks)
             ]
             concurrent.futures.wait(futures)
     else:
-        for i, (cmd, desc) in enumerate(tasks):
+        for i, (cmd, desc, _, _) in enumerate(tasks):
             run_worker(cmd, i + 1, total_experiments, desc)
+
+    # 检查哪些任务没有生成结果文件
+    print("\n" + "=" * 60)
+    print("Checking results...")
+    print("=" * 60)
+
+    missing_results = []
+    for cmd, desc, dataset, params in tasks:
+        result_path = get_result_path(dataset['name'], params)
+        if not os.path.exists(result_path):
+            print(f"MISSING: {result_path}")
+            missing_results.append((cmd, desc))
+        else:
+            # 检查文件是否为空或损坏
+            try:
+                with open(result_path, 'r') as f:
+                    content = f.read().strip()
+                    if not content or content == '{}':
+                        print(f"EMPTY: {result_path}")
+                        missing_results.append((cmd, desc))
+            except Exception as e:
+                print(f"ERROR reading {result_path}: {e}")
+                missing_results.append((cmd, desc))
+
+    # 重新运行缺失结果的任务
+    if missing_results:
+        print(f"\n{'=' * 60}")
+        print(f"Re-running {len(missing_results)} missing results...")
+        print(f"{'=' * 60}")
+
+        for i, (cmd, desc) in enumerate(missing_results):
+            run_worker(cmd, i + 1, len(missing_results), f"[RETRY] {desc}")
+
+        # 再次检查
+        print(f"\n{'=' * 60}")
+        print("Final check...")
+        print(f"{'=' * 60}")
+
+        still_missing = []
+        for cmd, desc, dataset, params in tasks:
+            result_path = get_result_path(dataset['name'], params)
+            if not os.path.exists(result_path):
+                still_missing.append(result_path)
+
+        if still_missing:
+            print(f"WARNING: {len(still_missing)} results still missing after retry:")
+            for path in still_missing:
+                print(f"  - {path}")
+        else:
+            print("All results generated successfully!")
+    else:
+        print("All results generated successfully!")
 
 
 if __name__ == "__main__":

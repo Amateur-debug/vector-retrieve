@@ -970,6 +970,8 @@ public:
                 _mm_prefetch(get_data_by_id(data[0]), _MM_HINT_T0);
             }
 #endif
+            // 记录第一个遇到的远程邻居，等本地邻居遍历完后再 transfer
+            int first_remote_vid = -1;
 
             for (int j = 0; j < size; j++)
             {
@@ -989,9 +991,10 @@ public:
                     int remote_vid = -(neighbor_id + 1);
                     if (remote_visited_set.count(remote_vid))
                         continue;
-                    // 远程邻居无法在本地计算距离，跳过（不中断搜索）
-                    // 当本地候选都展开完毕后，如果远程 candidate 被弹出堆顶，会触发 transfer
-                    // 此处不加入 candidates，因为没有距离信息
+                    // 记录第一个远程邻居，等本地邻居遍历完后再 transfer
+                    // 不加入 candidates，避免在本地展开
+                    if (first_remote_vid == -1)
+                        first_remote_vid = remote_vid;
                     continue;
                 }
 
@@ -1016,6 +1019,16 @@ public:
                     if (!payload.results.empty())
                         lower_bound = payload.results.top().first;
                 }
+            }
+            
+            // 当前节点的邻居遍历完毕，如果有记录的远程邻居，transfer 到它
+            if (first_remote_vid != -1)
+            {
+                payload.continue_search = true;
+                payload.require_id = first_remote_vid;
+                payload.start_level = level;
+                visited_pool_->release_list(vl);
+                return;
             }
         }
 
