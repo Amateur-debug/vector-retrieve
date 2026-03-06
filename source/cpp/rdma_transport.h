@@ -479,6 +479,98 @@ public:
         }
         node_pools.clear();
     }
+    
+    // 服务端侧：在 accept 到的 TCP fd 上完成 RDMA 握手，返回 RdmaConnection
+    std::shared_ptr<RdmaConnection> accept_rdma_connection(int client_fd) {
+        auto conn = std::make_shared<RdmaConnection>();
+        conn->node_id = -1;
+        conn->aux_sock = client_fd;
+        
+        conn->qp = create_qp();
+        if (!conn->qp) {
+            LOG_DEBUG_STREAM("[RDMA Server] 创建QP失败");
+            return nullptr;
+        }
+        
+        conn->send_buf = malloc(RDMA_BUF_SIZE);
+        conn->recv_buf = malloc(RDMA_BUF_SIZE);
+        if (!conn->send_buf || !conn->recv_buf) {
+            LOG_DEBUG_STREAM("[RDMA Server] 缓冲区分配失败");
+            goto cleanup;
+        }
+        
+        conn->send_mr = ibv_reg_mr(pd, conn->send_buf, RDMA_BUF_SIZE,
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+        conn->recv_mr = ibv_reg_mr(pd, conn->recv_buf, RDMA_BUF_SIZE,
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        
+        if (!conn->send_mr || !conn->recv_mr) {
+            LOG_DEBUG_STREAM("[RDMA Server] 内存注册失败");
+            goto cleanup;
+        }
+        
+        if (modify_qp_to_init(conn->qp)) {
+            LOG_DEBUG_STREAM("[RDMA Server] QP转INIT失败");
+            goto cleanup;
+        }
+        
+        if (!get_local_info(conn->local_info, conn->qp)) {
+            LOG_DEBUG_STREAM("[RDMA Server] 获取本地QP信息失败");
+            goto cleanup;
+        }
+        conn->local_info.rkey = conn->recv_mr->rkey;
+        conn->local_info.vaddr = (uint64_t)conn->recv_buf;
+        
+        if (!exchange_qp_info(client_fd, conn->local_info, conn->remote_info)) {
+            LOG_DEBUG_STREAM("[RDMA Server] QP信息交换失败");
+            goto cleanup;
+        }
+        
+        if (modify_qp_to_rtr(conn->qp, conn->remote_info)) {
+            LOG_DEBUG_STREAM("[RDMA Server] QP转RTR失败");
+            goto cleanup;
+        }
+        
+        if (modify_qp_to_rts(conn->qp)) {
+            LOG_DEBUG_STREAM("[RDMA Server] QP转RTS失败");
+            goto cleanup;
+        }
+        
+        {
+            struct ibv_sge sge;
+            sge.addr = (uint64_t)conn->recv_buf;
+            sge.length = RDMA_BUF_SIZE;
+            sge.lkey = conn->recv_mr->lkey;
+            
+            struct ibv_recv_wr recv_wr, *bad_wr;
+            memset(&recv_wr, 0, sizeof(recv_wr));
+            recv_wr.wr_id = 0;
+            recv_wr.sg_list = &sge;
+            recv_wr.num_sge = 1;
+            
+            if (ibv_post_recv(conn->qp, &recv_wr, &bad_wr)) {
+                LOG_DEBUG_STREAM("[RDMA Server] 预投递接收请求失败");
+                goto cleanup;
+            }
+        }
+        
+        conn->is_valid = true;
+        LOG_DEBUG_STREAM("[RDMA Server] RDMA 握手完成");
+        return conn;
+        
+    cleanup:
+        if (conn->send_mr) ibv_dereg_mr(conn->send_mr);
+        if (conn->recv_mr) ibv_dereg_mr(conn->recv_mr);
+        if (conn->qp) ibv_destroy_qp(conn->qp);
+        if (conn->send_buf) free(conn->send_buf);
+        if (conn->recv_buf) free(conn->recv_buf);
+        return nullptr;
+    }
+    
+    // 销毁 RDMA 连接（释放所有资源）
+    void destroy_rdma_connection(std::shared_ptr<RdmaConnection> conn) {
+        destroy_connection(conn);
+    }
 };
 
 // ==================== RDMA Transport 实现 ====================
@@ -758,14 +850,10 @@ public:
     void close_connection(int conn_id) override {
         auto conn = remove_active_conn(conn_id);
         if (conn) {
-            // RDMA 连接：关闭 TCP 辅助通道
-            if (conn->aux_sock >= 0) {
-                close(conn->aux_sock);
-                conn->aux_sock = -1;
-            }
+            // RDMA 连接：销毁 QP、释放 MR 和缓冲区、关闭辅助通道
+            conn_pool.destroy_rdma_connection(conn);
         } else {
-            // 不在 RDMA 活跃映射中，可能是 accept 返回的原始 TCP fd
-            // 按 TCP 方式直接关闭
+            // 不在 RDMA 活跃映射中，按 TCP 方式直接关闭
             if (conn_id >= 0) {
                 struct linger so_linger;
                 so_linger.l_onoff = 1;
@@ -830,11 +918,17 @@ public:
         int client_fd = accept(server_sockfd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) return -1;
         
-        // 对于 RDMA 模式，接受 TCP 连接后需要完成 RDMA 握手
-        // 但由于服务端的 handle_client 需要处理多种消息类型（包括非RDMA客户端），
-        // 这里直接返回 TCP fd，上层逻辑通过 send_raw/recv_raw 透明处理
-        // 对于需要 RDMA 的长连接场景，可以在后续升级为 RDMA 连接
-        return client_fd;
+        // 节点间端口专用：完成服务端侧 RDMA 握手
+        auto conn = conn_pool.accept_rdma_connection(client_fd);
+        if (!conn) {
+            LOG_DEBUG_STREAM("[RDMA] 服务端 RDMA 握手失败");
+            close(client_fd);
+            return -1;
+        }
+        
+        int conn_id = register_active_conn(conn);
+        LOG_DEBUG_STREAM("[RDMA Server] 成功接受 RDMA 连接, conn_id=" << conn_id);
+        return conn_id;
     }
     
     // --- 数据传输（带长度头） ---

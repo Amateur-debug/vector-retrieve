@@ -446,12 +446,15 @@ public:
 
     bool is_remote_node = false;
 
-    int sockfd = -1;
+    int sockfd = -1;          // 节点间通信 server fd（transport）
+    int sdk_sockfd = -1;      // SDK 通信 server fd（纯 TCP）
     struct sockaddr_in sock_addr;
     std::string ip_addr = "127.0.0.1";
     int port = 9000;
+    static constexpr int NODE_PORT_OFFSET = 1000;  // 节点间端口 = port + NODE_PORT_OFFSET
 
-    std::thread server_thread;
+    std::thread server_thread;      // 节点间通信线程
+    std::thread sdk_server_thread;  // SDK 通信线程
     std::atomic<bool> stop_server{false};
 
     std::atomic<int> active_handlers{0};
@@ -487,10 +490,12 @@ public:
     Node(Node &&other) noexcept
         : node_id(other.node_id), cluster(other.cluster), local_hnsw(other.local_hnsw),
           num_queries(other.num_queries), is_remote_node(other.is_remote_node),
-          sockfd(other.sockfd), sock_addr(other.sock_addr), ip_addr(std::move(other.ip_addr)),
-          port(other.port), server_thread(std::move(other.server_thread)), stop_server(other.stop_server.load())
+          sockfd(other.sockfd), sdk_sockfd(other.sdk_sockfd), sock_addr(other.sock_addr), ip_addr(std::move(other.ip_addr)),
+          port(other.port), server_thread(std::move(other.server_thread)),
+          sdk_server_thread(std::move(other.sdk_server_thread)), stop_server(other.stop_server.load())
     {
         other.sockfd = -1;
+        other.sdk_sockfd = -1;
         other.local_hnsw = nullptr;
     }
 
@@ -503,12 +508,14 @@ public:
         num_queries = 0;
     }
 
-    void tcp_server_loop();
+    void tcp_server_loop();      // 节点间通信 accept 循环
+    void sdk_server_loop();      // SDK 通信 accept 循环
 
     void close_connection_hard(int fd);
     void close_connection_soft(int fd);
 
-    void handle_client(int client_fd);
+    void handle_node_client(int conn_id);   // 处理节点间消息（transport 收发）
+    void handle_sdk_client(int client_fd);  // 处理 SDK 消息（裸 TCP 收发）
 
     std::vector<int> query(int query_id, const vector<T> &query_vector, Payload<T> &payload, int k = 10);
 
@@ -574,10 +581,15 @@ public:
         {
             transport->stop_server();
         }
-        // 重置节点的 sockfd
+        // 关闭 SDK server socket
         for (int i = 0; i < node_num; i++)
         {
             nodes[i].sockfd = -1;
+            if (nodes[i].sdk_sockfd != -1)
+            {
+                shutdown(nodes[i].sdk_sockfd, SHUT_RDWR);
+                nodes[i].sdk_sockfd = -1;
+            }
         }
         // 等待所有服务器线程退出
         for (int i = 0; i < node_num; i++)
@@ -585,6 +597,10 @@ public:
             if (nodes[i].server_thread.joinable())
             {
                 nodes[i].server_thread.join();
+            }
+            if (nodes[i].sdk_server_thread.joinable())
+            {
+                nodes[i].sdk_server_thread.join();
             }
         }
         // 清理 local_hnsw（由 partition 创建）
@@ -629,7 +645,7 @@ public:
         }
     }
 
-    // 新增：配置节点网络信息
+    // 配置节点网络信息
     void set_node_info(int node_id, const std::string &ip, int port, bool is_remote)
     {
         if (node_id >= 0 && node_id < node_num)
@@ -637,8 +653,8 @@ public:
             nodes[node_id].ip_addr = ip;
             nodes[node_id].port = port;
             nodes[node_id].is_remote_node = is_remote;
-            // 注册到通信中间层
-            transport->register_node(node_id, ip, port);
+            // 节点间通信使用 port + NODE_PORT_OFFSET
+            transport->register_node(node_id, ip, port + Node<T>::NODE_PORT_OFFSET);
         }
     }
 
@@ -1746,8 +1762,12 @@ Node<T>::~Node()
     stop_server.store(true);
     if (sockfd != -1)
         close(sockfd);
+    if (sdk_sockfd != -1)
+        close(sdk_sockfd);
     if (server_thread.joinable())
         server_thread.join();
+    if (sdk_server_thread.joinable())
+        sdk_server_thread.join();
 }
 
 template <typename T>
@@ -1776,13 +1796,15 @@ void Node<T>::start_server()
     if (is_remote_node)
         return;
 
-    // 使用通信中间层启动服务端
-    sockfd = cluster->transport->start_server(port);
+    // 1. 启动节点间通信端口（transport），端口 = port + NODE_PORT_OFFSET
+    int node_port = port + NODE_PORT_OFFSET;
+    sockfd = cluster->transport->start_server(node_port);
     if (sockfd < 0)
     {
-        LOG_DEBUG_STREAM("Failed to start server on port " << port);
+        LOG_DEBUG_STREAM("Failed to start node server on port " << node_port);
         return;
     }
+    LOG_DEBUG_STREAM("Node " << node_id << " node-to-node server started on port " << node_port);
 
     try
     {
@@ -1790,60 +1812,122 @@ void Node<T>::start_server()
     }
     catch (const std::exception &e)
     {
-        LOG_DEBUG_STREAM("Failed to start server thread: " << e.what());
+        LOG_DEBUG_STREAM("Failed to start node server thread: " << e.what());
         cluster->transport->stop_server();
         sockfd = -1;
+        return;
+    }
+
+    // 2. 启动 SDK 通信端口（纯 TCP），端口 = port
+    sdk_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sdk_sockfd < 0)
+    {
+        LOG_DEBUG_STREAM("Failed to create SDK server socket");
+        return;
+    }
+    int opt = 1;
+    setsockopt(sdk_sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(sdk_sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
+    {
+        LOG_DEBUG_STREAM("Failed to bind SDK server on port " << port);
+        close(sdk_sockfd);
+        sdk_sockfd = -1;
+        return;
+    }
+    if (listen(sdk_sockfd, 1024) < 0)
+    {
+        LOG_DEBUG_STREAM("Failed to listen SDK server on port " << port);
+        close(sdk_sockfd);
+        sdk_sockfd = -1;
+        return;
+    }
+    LOG_DEBUG_STREAM("Node " << node_id << " SDK server started on port " << port);
+
+    try
+    {
+        sdk_server_thread = std::thread(&Node<T>::sdk_server_loop, this);
+    }
+    catch (const std::exception &e)
+    {
+        LOG_DEBUG_STREAM("Failed to start SDK server thread: " << e.what());
+        close(sdk_sockfd);
+        sdk_sockfd = -1;
     }
 }
 
+// 节点间通信 accept 循环（transport 端口）
 template <typename T>
 void Node<T>::tcp_server_loop()
 {
-    LOG_DEBUG_STREAM("Node " << node_id << " tcp_server_loop started on port " << port);
+    int node_port = port + NODE_PORT_OFFSET;
+    LOG_DEBUG_STREAM("Node " << node_id << " node-to-node server loop started on port " << node_port);
 
     while (!stop_server.load())
     {
-        int client_fd = cluster->transport->accept_client();
-        if (client_fd < 0)
+        int conn_id = cluster->transport->accept_client();
+        if (conn_id < 0)
         {
-            LOG_DEBUG_STREAM("[Node " << node_id << "] Failed to accept");
             if (stop_server.load())
                 break;
             continue;
         }
 
-        // int buf = 4 * 1024 * 1024;
-        // setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
-        // setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
-
-        std::thread(&Node<T>::handle_client, this, client_fd).detach();
+        std::thread(&Node<T>::handle_node_client, this, conn_id).detach();
     }
 }
 
+// SDK 通信 accept 循环（纯 TCP 端口）
 template <typename T>
-void Node<T>::handle_client(int client_fd)
+void Node<T>::sdk_server_loop()
+{
+    LOG_DEBUG_STREAM("Node " << node_id << " SDK server loop started on port " << port);
+
+    while (!stop_server.load())
+    {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(sdk_sockfd, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0)
+        {
+            if (stop_server.load())
+                break;
+            continue;
+        }
+
+        int flag = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+        std::thread(&Node<T>::handle_sdk_client, this, client_fd).detach();
+    }
+}
+
+// ==================== 处理节点间消息（transport 收发） ====================
+template <typename T>
+void Node<T>::handle_node_client(int conn_id)
 {
     active_handlers++;
 
-    // 持久连接模式：循环处理多个消息
-    // SDK 交互始终使用 TCP，直接用裸 socket recv/send
     while (true)
     {
         try
         {
-            // 先读 uint64_t 长度头，再读数据
             uint64_t msg_size = 0;
-            recv_all(client_fd, &msg_size, sizeof(uint64_t));
+            cluster->transport->recv_raw(conn_id, &msg_size, sizeof(uint64_t));
             if (msg_size == 0)
-            {
                 break;
-            }
+
             std::vector<char> buffer(msg_size);
-            recv_all(client_fd, buffer.data(), msg_size);
+            cluster->transport->recv_raw(conn_id, buffer.data(), msg_size);
 
             Buffer buf;
             buf.data = std::move(buffer);
-
             int msg_type = buf.read_val<int>();
 
             if (msg_type == MSG_SEARCH)
@@ -1857,17 +1941,11 @@ void Node<T>::handle_client(int client_fd)
 
                 LOG_DEBUG_STREAM("[Node " << node_id << "] Received MSG_SEARCH for query " << query_id << ", transfer_cnt=" << payload.remote_transfer_cnt << ", origin=" << payload.origin_node_id);
 
-                // 计算网络延迟
                 auto now = std::chrono::system_clock::now();
                 double recv_timestamp = std::chrono::duration<double, std::milli>(now.time_since_epoch()).count();
-                double latency = recv_timestamp - payload.send_timestamp;
-                payload.remote_transfer_latency += latency;
+                payload.remote_transfer_latency += recv_timestamp - payload.send_timestamp;
 
-                std::vector<int> results = this->query(query_id, query_vector, payload, k);
-
-                LOG_DEBUG_STREAM("[Node " << node_id << "] MSG_SEARCH query " << query_id << " returned, results.size=" << results.size() << ", continue_search=" << payload.continue_search << ", transfer_cnt=" << payload.remote_transfer_cnt);
-
-                // 持久连接：不关闭，继续等待下一个消息
+                this->query(query_id, query_vector, payload, k);
                 continue;
             }
             else if (msg_type == MSG_INIT_GRAPH)
@@ -1881,81 +1959,148 @@ void Node<T>::handle_client(int client_fd)
 
                 LOG_DEBUG_STREAM("Node " << node_id << " initialized with " << local_hnsw->get_cur_element_count() << " vectors.");
 
-                if (buf.read_pos != buf.data.size())
-                {
-                    LOG_DEBUG_STREAM("Warning: Buffer not fully consumed! read_pos=" << buf.read_pos << " size=" << buf.data.size());
-                }
-
-                // Send ACK back to master
                 char ack = 1;
-                send_all(client_fd, &ack, 1);
+                cluster->transport->send_raw(conn_id, &ack, 1);
                 break;
-            }
-            else if (msg_type == MSG_ADD_VECTOR)
-            {
-                int vid = buf.read_val<int>();
-                std::vector<T> vec = buf.read_vec<T>();
-
-                char ack = 1;  // Success by default
-                try {
-                    if (cluster && cluster->is_reduce)
-                    {
-                        // Reduce 模式：调用 cluster->add_vector 进行轮询分发到各节点
-                        cluster->add_vector(vid, vec);
-                    }
-                    else if (cluster && !cluster->is_reduce)
-                    {
-                        if (cluster->hnsw)
-                        {
-                            cluster->hnsw->add_vector(vid, vec);
-                        }
-                    }
-                } catch (const std::exception &e) {
-                    LOG_DEBUG_STREAM("[Node " << node_id << "] Error adding vector " << vid << ": " << e.what());
-                    ack = 0;  // Failure
-                } catch (...) {
-                    LOG_DEBUG_STREAM("[Node " << node_id << "] Unknown error adding vector " << vid);
-                    ack = 0;  // Failure
-                }
-
-                // 发送 ACK 确认 (always send, even on error)
-                send_all(client_fd, &ack, 1);
-                // 持久连接：继续等待下一个消息
-                continue;
             }
             else if (msg_type == MSG_ADD_VECTOR_LOCAL)
             {
-                // 来自其他节点的添加请求，直接添加到本地 local_hnsw（不再路由）
                 int vid = buf.read_val<int>();
                 std::vector<T> vec = buf.read_vec<T>();
 
-                char ack = 1;  // Success by default
+                char ack = 1;
                 try {
                     if (local_hnsw == nullptr && cluster && cluster->is_reduce)
                     {
                         std::lock_guard<std::mutex> lk(local_hnsw_mutex);
                         if (local_hnsw == nullptr)
                         {
-                        local_hnsw = new HNSWGraph<T>(
+                            local_hnsw = new HNSWGraph<T>(
                                 cluster->hnsw->dim, cluster->hnsw->m, cluster->hnsw->ef_construction,
                                 cluster->hnsw->ef_search, cluster->hnsw->limited_level, 100000, cluster->hnsw->seed);
                         }
                     }
                     if (local_hnsw)
-                    {
                         local_hnsw->add_vector(vid, vec);
-                    }
-                } catch (const std::exception &e) {
-                    LOG_DEBUG_STREAM("[Node " << node_id << "] Error adding local vector " << vid << ": " << e.what());
-                    ack = 0;  // Failure
                 } catch (...) {
-                    LOG_DEBUG_STREAM("[Node " << node_id << "] Unknown error adding local vector " << vid);
-                    ack = 0;  // Failure
+                    LOG_DEBUG_STREAM("[Node " << node_id << "] Error adding local vector " << vid);
+                    ack = 0;
                 }
 
-                // 发送 ACK 确认 (always send, even on error)
+                cluster->transport->send_raw(conn_id, &ack, 1);
+                continue;
+            }
+            else if (msg_type == MSG_QUERY_LOCAL)
+            {
+                int query_id = buf.read_val<int>();
+                int k = buf.read_val<int>();
+                std::vector<T> query_vector = buf.read_vec<T>();
+
+                Payload<T> payload;
+                deserialize_payload(buf, payload);
+
+                std::vector<pair<T, int>> results;
+                if (local_hnsw)
+                {
+                    local_hnsw->query(query_vector, payload, k);
+                    auto pq = payload.results;
+                    while (!pq.empty())
+                    {
+                        results.push_back(pq.top());
+                        pq.pop();
+                    }
+                }
+
+                Buffer resp_buf;
+                resp_buf.write_val((int)results.size());
+                for (const auto &p : results)
+                {
+                    resp_buf.write_val(p.first);
+                    resp_buf.write_val(p.second);
+                }
+                serialize_payload(resp_buf, payload);
+
+                uint64_t resp_size = resp_buf.data.size();
+                cluster->transport->send_raw(conn_id, &resp_size, sizeof(uint64_t));
+                cluster->transport->send_raw(conn_id, resp_buf.data.data(), resp_size);
+                continue;
+            }
+            else if (msg_type == MSG_SEARCH_RESULT)
+            {
+                int query_id = buf.read_val<int>();
+                std::vector<int> results = buf.read_vec<int>();
+
+                Payload<T> payload;
+                deserialize_payload(buf, payload);
+
+                std::lock_guard<std::mutex> lk(pending_queries_mu);
+                auto& pq = pending_queries[query_id];
+                pq.results = std::move(results);
+                pq.payload = std::move(payload);
+                pq.completed = true;
+                pending_queries_cv.notify_all();
+                continue;
+            }
+            else
+            {
+                LOG_DEBUG_STREAM("[Node " << node_id << "] Unknown node message type: " << msg_type);
+                break;
+            }
+        }
+        catch (const std::exception &e)
+        {
+            LOG_DEBUG_STREAM("[Node " << node_id << "] Error in handle_node_client: " << e.what());
+            break;
+        }
+        catch (...)
+        {
+            break;
+        }
+    }
+
+    cluster->transport->close_connection(conn_id);
+    active_handlers--;
+}
+
+// ==================== 处理 SDK 消息（裸 TCP 收发） ====================
+template <typename T>
+void Node<T>::handle_sdk_client(int client_fd)
+{
+    active_handlers++;
+
+    while (true)
+    {
+        try
+        {
+            uint64_t msg_size = 0;
+            recv_all(client_fd, &msg_size, sizeof(uint64_t));
+            if (msg_size == 0)
+                break;
+
+            std::vector<char> buffer(msg_size);
+            recv_all(client_fd, buffer.data(), msg_size);
+
+            Buffer buf;
+            buf.data = std::move(buffer);
+            int msg_type = buf.read_val<int>();
+
+            if (msg_type == MSG_ADD_VECTOR)
+            {
+                int vid = buf.read_val<int>();
+                std::vector<T> vec = buf.read_vec<T>();
+
+                char ack = 1;
+                try {
+                    if (cluster && cluster->is_reduce)
+                        cluster->add_vector(vid, vec);
+                    else if (cluster && cluster->hnsw)
+                        cluster->hnsw->add_vector(vid, vec);
+                } catch (...) {
+                    LOG_DEBUG_STREAM("[Node " << node_id << "] Error adding vector " << vid);
+                    ack = 0;
+                }
+
                 send_all(client_fd, &ack, 1);
-                // 持久连接：继续等待下一个消息
                 continue;
             }
             else if (msg_type == MSG_QUERY)
@@ -1968,67 +2113,20 @@ void Node<T>::handle_client(int client_fd)
                 deserialize_payload(buf, payload);
 
                 std::vector<int> results;
-                
-                // Reduce模式：调用cluster级别查询，并行向所有节点发送查询并合并结果
                 if (cluster && cluster->is_reduce)
-                {
                     results = cluster->query(query_id, query_vector, payload, k);
-                }
                 else
                 {
-                    // 非Reduce模式：执行本地查询
                     this->query(query_id, query_vector, payload, k);
                     results = payload.topk_ids(k);
                 }
-                
-                LOG_DEBUG_STREAM("[Node " << node_id << "] MSG_QUERY: results.size=" << results.size());
 
                 Buffer resp_buf;
                 resp_buf.write_val((int)results.size());
                 for (const auto &id : results)
                 {
-                    resp_buf.write_val((T)0.0); // distance placeholder
+                    resp_buf.write_val((T)0.0);
                     resp_buf.write_val(id);
-                }
-                serialize_payload(resp_buf, payload);
-
-                uint64_t resp_size = resp_buf.data.size();
-                send_all(client_fd, &resp_size, sizeof(uint64_t));
-                send_all(client_fd, resp_buf.data.data(), resp_size);
-                continue;
-            }
-            else if (msg_type == MSG_QUERY_LOCAL)
-            {
-                // Reduce模式下的本地查询请求（来自其他节点，避免递归）
-                int query_id = buf.read_val<int>();
-                int k = buf.read_val<int>();
-                std::vector<T> query_vector = buf.read_vec<T>();
-
-                Payload<T> payload;
-                deserialize_payload(buf, payload);
-
-                std::vector<pair<T, int>> results;
-                
-                // 只执行本地HNSW查询
-                if (local_hnsw)
-                {
-                    local_hnsw->query(query_vector, payload, k);
-                    auto pq = payload.results;
-                    while (!pq.empty())
-                    {
-                        results.push_back(pq.top());
-                        pq.pop();
-                    }
-                }
-                
-                LOG_DEBUG_STREAM("[Node " << node_id << "] MSG_QUERY_LOCAL: results.size=" << results.size());
-
-                Buffer resp_buf;
-                resp_buf.write_val((int)results.size());
-                for (const auto &p : results)
-                {
-                    resp_buf.write_val(p.first);   // distance
-                    resp_buf.write_val(p.second);  // id
                 }
                 serialize_payload(resp_buf, payload);
 
@@ -2052,13 +2150,10 @@ void Node<T>::handle_client(int client_fd)
                 }
 
                 if (cluster)
-                {
                     cluster->partition(mode, redundancy, layer_config, layer_partition_mode, layer_replicate_flags);
-                }
 
                 char ack = 1;
                 send_all(client_fd, &ack, 1);
-                // 一次性操作，退出循环
                 break;
             }
             else if (msg_type == MSG_LOAD_CLUSTER)
@@ -2068,14 +2163,8 @@ void Node<T>::handle_client(int client_fd)
                 if (cluster)
                 {
                     Cluster<T> *loaded = nullptr;
-                    try
-                    {
-                        loaded = Cluster<T>::load(filepath);
-                    }
-                    catch (...)
-                    {
-                        loaded = nullptr;
-                    }
+                    try { loaded = Cluster<T>::load(filepath); }
+                    catch (...) { loaded = nullptr; }
 
                     if (loaded && loaded->node_num == cluster->node_num)
                     {
@@ -2092,9 +2181,7 @@ void Node<T>::handle_client(int client_fd)
                         cluster->layer_replicate_flags = std::move(loaded->layer_replicate_flags);
 
                         if (cluster->hnsw && cluster->hnsw != loaded->hnsw)
-                        {
                             delete cluster->hnsw;
-                        }
                         cluster->hnsw = loaded->hnsw;
                         loaded->hnsw = nullptr;
 
@@ -2106,24 +2193,16 @@ void Node<T>::handle_client(int client_fd)
                             cluster->nodes[i].port = loaded->nodes[i].port;
 
                             if (cluster->nodes[i].local_hnsw != nullptr && cluster->nodes[i].local_hnsw != cluster->hnsw)
-                            {
                                 delete cluster->nodes[i].local_hnsw;
-                            }
                             cluster->nodes[i].local_hnsw = loaded->nodes[i].local_hnsw;
                             loaded->nodes[i].local_hnsw = nullptr;
                         }
-
                         ok = true;
                     }
-
-                    if (loaded)
-                    {
-                        delete loaded;
-                    }
+                    if (loaded) delete loaded;
                 }
                 char ack = ok ? 1 : 0;
                 send_all(client_fd, &ack, 1);
-                // 一次性操作，退出循环
                 break;
             }
             else if (msg_type == MSG_LOAD_HNSW)
@@ -2133,29 +2212,19 @@ void Node<T>::handle_client(int client_fd)
                 if (cluster)
                 {
                     HNSWGraph<T> *loaded_hnsw = nullptr;
-                    try
-                    {
-                        loaded_hnsw = HNSWGraph<T>::load(filepath);
-                    }
-                    catch (...)
-                    {
-                        loaded_hnsw = nullptr;
-                    }
+                    try { loaded_hnsw = HNSWGraph<T>::load(filepath); }
+                    catch (...) { loaded_hnsw = nullptr; }
 
                     if (loaded_hnsw)
                     {
                         if (cluster->hnsw && cluster->hnsw != loaded_hnsw)
-                        {
                             delete cluster->hnsw;
-                        }
                         cluster->hnsw = loaded_hnsw;
-
                         ok = true;
                     }
                 }
                 char ack = ok ? 1 : 0;
                 send_all(client_fd, &ack, 1);
-                // 一次性操作，退出循环
                 break;
             }
             else if (msg_type == MSG_SAVE_HNSW)
@@ -2164,16 +2233,11 @@ void Node<T>::handle_client(int client_fd)
                 bool ok = false;
                 if (cluster && cluster->hnsw)
                 {
-                    try
-                    {
-                        cluster->hnsw->save(filepath);
-                        ok = true;
-                    }
+                    try { cluster->hnsw->save(filepath); ok = true; }
                     catch (...) {}
                 }
                 char ack = ok ? 1 : 0;
                 send_all(client_fd, &ack, 1);
-                // 一次性操作，退出循环
                 break;
             }
             else if (msg_type == MSG_GET_INFORMATION)
@@ -2200,11 +2264,8 @@ void Node<T>::handle_client(int client_fd)
                         nj["ip_addr"] = cluster->nodes[i].ip_addr;
                         nj["port"] = cluster->nodes[i].port;
                         nj["is_remote_node"] = cluster->nodes[i].is_remote_node;
-                        // 只有本地节点才有 vector_count
                         if (!cluster->nodes[i].is_remote_node && cluster->nodes[i].local_hnsw)
-                        {
                             nj["vector_count"] = (int)cluster->nodes[i].local_hnsw->get_cur_element_count();
-                        }
                         nodes_json.push_back(std::move(nj));
                     }
                     cj["nodes"] = std::move(nodes_json);
@@ -2222,9 +2283,7 @@ void Node<T>::handle_client(int client_fd)
                         info["hnsw"] = std::move(hj);
                     }
                     else
-                    {
                         info["hnsw"] = nullptr;
-                    }
                 }
                 else
                 {
@@ -2238,7 +2297,6 @@ void Node<T>::handle_client(int client_fd)
                 uint64_t resp_size = resp_buf.data.size();
                 send_all(client_fd, &resp_size, sizeof(uint64_t));
                 send_all(client_fd, resp_buf.data.data(), resp_size);
-                // 一次性操作，退出循环
                 break;
             }
             else if (msg_type == MSG_SAVE_CLUSTER)
@@ -2246,40 +2304,19 @@ void Node<T>::handle_client(int client_fd)
                 std::string filepath = buf.read_string();
                 char ack = 0;
                 if (cluster)
-                {
                     ack = cluster->save(filepath) ? 1 : 0;
-                }
                 send_all(client_fd, &ack, 1);
-                // 一次性操作，退出循环
                 break;
             }
-            else if (msg_type == MSG_SEARCH_RESULT)
+            else
             {
-                // 接收异步查询结果
-                int query_id = buf.read_val<int>();
-                std::vector<int> results = buf.read_vec<int>();
-
-                LOG_DEBUG_STREAM("[Node " << node_id << "] Received MSG_SEARCH_RESULT for query " << query_id);
-
-                Payload<T> payload;
-                deserialize_payload(buf, payload);
-
-                // 设置到 pending_queries
-                std::lock_guard<std::mutex> lk(pending_queries_mu);
-                auto& pq = pending_queries[query_id];
-                pq.results = std::move(results);
-                pq.payload = std::move(payload);
-                pq.completed = true;
-                pending_queries_cv.notify_all();
-
-                LOG_DEBUG_STREAM("[Node " << node_id << "] Notified waiting thread for query " << query_id);
-                // 持久连接：继续等待下一个消息
-                continue;
+                LOG_DEBUG_STREAM("[Node " << node_id << "] Unknown SDK message type: " << msg_type);
+                break;
             }
         }
         catch (const std::exception &e)
         {
-            LOG_DEBUG_STREAM("Error handling client: " << e.what());
+            LOG_DEBUG_STREAM("[Node " << node_id << "] Error in handle_sdk_client: " << e.what());
             break;
         }
         catch (...)
