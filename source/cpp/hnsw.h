@@ -90,6 +90,9 @@ public:
     // === 层级记录 ===
     std::vector<int> element_levels_;  // 记录每个 internal_id 的层级
 
+    // === 本地向量子集标记 ===
+    std::unordered_set<int> local_vids_;  // 本地持有向量数据的 vid 集合（空表示持有全部）
+
     // === 随机数生成器 ===
     std::mt19937 rng;
     std::uniform_real_distribution<double> uniform_;
@@ -508,94 +511,8 @@ public:
         visited_pool_->release_list(vl);
 
         // 转换为 min-heap 返回
-        std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>,
-                            std::greater<std::pair<T, int>>>
-            result;
-        while (!top_candidates.empty())
-        {
-            result.push(top_candidates.top());
-            top_candidates.pop();
-        }
-        return result;
-    }
-
     // ========================================================
-    // search_layer_query - query 搜索（预取优化）
-    // query 与 add_vector 不会并发，无需加锁
-    // ========================================================
-    std::priority_queue<std::pair<T, int>>
-    search_layer_query(const void *query_data, int ep_id, int ef)
-    {
-        // query 与 add_vector 不会并发，无需加锁
-        VisitedList *vl = visited_pool_->get_free_list();
-        unsigned short *visited_array = vl->visited_array;
-        unsigned short visited_tag = vl->cur_tag;
-
-        // 结果集 max-heap
-        std::priority_queue<std::pair<T, int>> top_candidates;
-        // 候选集 min-heap
-        std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>,
-                            std::greater<std::pair<T, int>>>
-            candidate_set;
-
-        T dist = dist_func_(query_data, get_data_by_id(ep_id), dist_func_param_);
-        top_candidates.push({dist, ep_id});
-        candidate_set.push({dist, ep_id});
-        visited_array[ep_id] = visited_tag;
-
-        T lower_bound = dist;
-
-        while (!candidate_set.empty())
-        {
-            auto cand = candidate_set.top();
-
-            if (cand.first > lower_bound)
-                break;
-
-            candidate_set.pop();
-            int cur_node_id = cand.second;
-
-            // 完全无锁：直接读取 level 0 邻居列表
-            int *ll_cur = get_linklist0(cur_node_id);
-            int size = get_list_count(ll_cur);
-            int *data = ll_cur + 1;
-
-#if defined(__x86_64__) || defined(_M_X64)
-            // 预取第一个邻居的 visited 标记和向量数据
-            if (size > 0)
-            {
-                _mm_prefetch((char *)(visited_array + data[0]), _MM_HINT_T0);
-                _mm_prefetch(get_data_by_id(data[0]), _MM_HINT_T0);
-            }
-#endif
-
-            for (int j = 0; j < size; j++)
-            {
-#if defined(__x86_64__) || defined(_M_X64)
-                // 预取下一个邻居
-                if (j + 1 < size)
-                {
-                    _mm_prefetch((char *)(visited_array + data[j + 1]), _MM_HINT_T0);
-                    _mm_prefetch(get_data_by_id(data[j + 1]), _MM_HINT_T0);
-                }
-#endif
-
-                int candidate_id = data[j];
-
-                if (visited_array[candidate_id] == visited_tag)
-                    continue;
-                visited_array[candidate_id] = visited_tag;
-
-                T dist_cand = dist_func_(query_data, get_data_by_id(candidate_id), dist_func_param_);
-
-                if ((int)top_candidates.size() < ef || dist_cand < lower_bound)
-                {
-                    candidate_set.push({dist_cand, candidate_id});
-                    top_candidates.push({dist_cand, candidate_id});
-
-                    if ((int)top_candidates.size() > ef)
-                        top_candidates.pop();
-
+    // add_vector
                     if (!top_candidates.empty())
                         lower_bound = top_candidates.top().first;
                 }
@@ -770,10 +687,10 @@ public:
     }
 
     // ========================================================
-    // search_layer_ef - 兼容旧接口的搜索层（用于 query 中的分布式搜索）
+    // search_layer_query - 统一搜索层（支持分布式 transfer + 预取优化）
     // 使用 Payload 进行跨节点续搜
     // ========================================================
-    void search_layer_ef(const std::vector<T> &query_vector, int level, int ef, Payload<T> &payload)
+    void search_layer_query(const std::vector<T> &query_vector, int level, int ef, Payload<T> &payload)
     {
         // query 与 add_vector 不会并发，无需加锁
         int ep_internal_id = -1;
@@ -873,15 +790,65 @@ public:
                 int size = get_list_count(ll_cur);
                 int *data = ll_cur + 1;
 
+#if defined(__x86_64__) || defined(_M_X64)
+                if (size > 0)
+                {
+                    _mm_prefetch((char *)(visited_array + data[0]), _MM_HINT_T0);
+                    _mm_prefetch(get_data_by_id(data[0]), _MM_HINT_T0);
+                }
+#endif
+
                 for (int j = 0; j < size; j++)
                 {
+#if defined(__x86_64__) || defined(_M_X64)
+                    if (j + 1 < size)
+                    {
+                        _mm_prefetch((char *)(visited_array + data[j + 1]), _MM_HINT_T0);
+                        _mm_prefetch(get_data_by_id(data[j + 1]), _MM_HINT_T0);
+                    }
+#endif
+
                     int neighbor_id = data[j];
 
                     if (visited_array[neighbor_id] == visited_tag)
                         continue;
 
-                    // 检查邻居是否需要跨节点查找（通过检查是否有高层连接来简单判断不合适，
-                    // 这里依赖于连续内存布局：如果 neighbor_id < cur_element_count_ 则在本地）
+                    // 检查邻居向量是否在本地子集中
+                    int neighbor_vid = get_external_label(neighbor_id);
+                    if (!local_vids_.empty() && local_vids_.find(neighbor_vid) == local_vids_.end())
+                    {
+                        // 该向量不在本地，需要跨节点 transfer
+                        // 先将当前搜索状态保存到 payload
+                        payload.candidates = decltype(payload.candidates)();
+                        while (!local_candidates.empty())
+                        {
+                            auto t = local_candidates.top();
+                            local_candidates.pop();
+                            payload.candidates.push({t.first, get_external_label(t.second)});
+                        }
+                        payload.results = decltype(payload.results)();
+                        while (!local_results.empty())
+                        {
+                            auto t = local_results.top();
+                            local_results.pop();
+                            payload.results.push({t.first, get_external_label(t.second)});
+                        }
+                        // 还原 cand 本身（已 pop 但未处理完）
+                        payload.candidates.push({cand.first, get_external_label(cand.second)});
+                        payload.visited_vids.clear();
+                        size_t cc = cur_element_count_.load();
+                        for (size_t vi = 0; vi < cc; vi++)
+                        {
+                            if (visited_array[vi] == visited_tag)
+                                payload.visited_vids.push_back(get_external_label((int)vi));
+                        }
+                        payload.continue_search = true;
+                        payload.require_id = neighbor_vid;
+                        payload.start_level = level;
+                        visited_pool_->release_list(vl);
+                        return;
+                    }
+
                     visited_array[neighbor_id] = visited_tag;
                     T neighbor_dist = dist_func_(query_vector.data(), get_data_by_id(neighbor_id), dist_func_param_);
                     payload.distance_cnt++;
@@ -931,6 +898,19 @@ public:
             return;
         }
 
+        // 入口点不在本地，直接触发 transfer（从别的节点 transfer 过来时 top-1 可能不在本地）
+        int ep_vid_check = get_external_label(ep_internal_id);
+        if (!local_vids_.empty() && local_vids_.find(ep_vid_check) == local_vids_.end())
+        {
+            payload.continue_search = true;
+            payload.require_id = ep_vid_check;
+            payload.start_level = level;
+            // entry_point 作为 candidate 传入，距离未知设为 max
+            payload.candidates.push({std::numeric_limits<T>::max(), ep_vid_check});
+            visited_pool_->release_list(vl);
+            return;
+        }
+
         T dist = dist_func_(query_vector.data(), get_data_by_id(ep_internal_id), dist_func_param_);
         payload.distance_cnt++;
         visited_array[ep_internal_id] = visited_tag;
@@ -969,12 +949,63 @@ public:
             int size = get_list_count(ll_cur);
             int *data = ll_cur + 1;
 
+#if defined(__x86_64__) || defined(_M_X64)
+            if (size > 0)
+            {
+                _mm_prefetch((char *)(visited_array + data[0]), _MM_HINT_T0);
+                _mm_prefetch(get_data_by_id(data[0]), _MM_HINT_T0);
+            }
+#endif
+
             for (int j = 0; j < size; j++)
             {
+#if defined(__x86_64__) || defined(_M_X64)
+                if (j + 1 < size)
+                {
+                    _mm_prefetch((char *)(visited_array + data[j + 1]), _MM_HINT_T0);
+                    _mm_prefetch(get_data_by_id(data[j + 1]), _MM_HINT_T0);
+                }
+#endif
+
                 int neighbor_id = data[j];
 
                 if (visited_array[neighbor_id] == visited_tag)
                     continue;
+
+                // 检查邻居向量是否在本地子集中
+                int neighbor_vid = get_external_label(neighbor_id);
+                if (!local_vids_.empty() && local_vids_.find(neighbor_vid) == local_vids_.end())
+                {
+                    // 该向量不在本地，需要跨节点 transfer
+                    payload.candidates = decltype(payload.candidates)();
+                    while (!local_candidates.empty())
+                    {
+                        auto t = local_candidates.top();
+                        local_candidates.pop();
+                        payload.candidates.push({t.first, get_external_label(t.second)});
+                    }
+                    payload.results = decltype(payload.results)();
+                    while (!local_results.empty())
+                    {
+                        auto t = local_results.top();
+                        local_results.pop();
+                        payload.results.push({t.first, get_external_label(t.second)});
+                    }
+                    // 还原 cand 本身（已 pop 但未处理完）
+                    payload.candidates.push({cand.first, get_external_label(cand.second)});
+                    payload.visited_vids.clear();
+                    size_t cc = cur_element_count_.load();
+                    for (size_t vi = 0; vi < cc; vi++)
+                    {
+                        if (visited_array[vi] == visited_tag)
+                            payload.visited_vids.push_back(get_external_label((int)vi));
+                    }
+                    payload.continue_search = true;
+                    payload.require_id = neighbor_vid;
+                    payload.start_level = level;
+                    visited_pool_->release_list(vl);
+                    return;
+                }
 
                 visited_array[neighbor_id] = visited_tag;
                 T neighbor_dist = dist_func_(query_vector.data(), get_data_by_id(neighbor_id), dist_func_param_);
@@ -1029,7 +1060,7 @@ public:
         // 如果是续搜，直接在当前层搜索
         if (payload.continue_search)
         {
-            search_layer_ef(query_vector, payload.start_level, std::max(ef_search, k), payload);
+            search_layer_query(query_vector, payload.start_level, std::max(ef_search, k), payload);
             if (payload.continue_search)
                 return payload.topk_ids(k);
 
@@ -1042,7 +1073,7 @@ public:
                     payload.clear();
                     payload.entry_point_id = topk[0];
                     payload.start_level = l;
-                    search_layer_ef(query_vector, l, std::max(ef_search, k), payload);
+                    search_layer_query(query_vector, l, std::max(ef_search, k), payload);
                     if (payload.continue_search)
                         return payload.topk_ids(k);
                     topk = payload.topk_ids(1);
@@ -1051,60 +1082,26 @@ public:
             return payload.topk_ids(k);
         }
 
-        // 非续搜：从最高层开始搜索
-        int ep;
-        int curlevel;
-        {
-            ep = entry_point_id;
-            curlevel = max_level;
-        }
-
-        if (ep == -1)
+        // 非续搜：从最高层开始，逐层调用 search_layer_query（统一走 transfer 机制）
+        if (entry_point_id == -1)
             return {};
 
-        // 高层贪心导航（使用 internal_id）
-        const void *query_data = query_vector.data();
-        T cur_dist = dist_func_(query_data, get_data_by_id(ep), dist_func_param_);
-        payload.distance_cnt++;
+        int ep_vid = get_external_label(entry_point_id);
+        int curlevel = max_level;
 
-        for (int level = curlevel; level > 0; level--)
+        for (int level = curlevel; level >= 0; level--)
         {
-            bool changed = true;
-            while (changed)
-            {
-                changed = false;
-                if (element_levels_[ep] < level)
-                    break;
-                int *ll = get_linklist(ep, level);
-                int size = get_list_count(ll);
-                int *data = ll + 1;
-
-                for (int i = 0; i < size; i++)
-                {
-                    int cand = data[i];
-                    T d = dist_func_(query_data, get_data_by_id(cand), dist_func_param_);
-                    payload.distance_cnt++;
-                    if (d < cur_dist)
-                    {
-                        cur_dist = d;
-                        ep = cand;
-                        changed = true;
-                    }
-                }
-            }
-        }
-
-        // level 0 搜索
-        int actual_ef = std::max(ef_search, k);
-        auto top_candidates = search_layer_query(query_data, ep, actual_ef);
-
-        // 将 internal_id 转为 vid 写入 payload.results
-        payload.results = decltype(payload.results)();
-        while (!top_candidates.empty())
-        {
-            auto top = top_candidates.top();
-            top_candidates.pop();
-            payload.results.push({top.first, get_external_label(top.second)});
+            payload.clear();
+            payload.entry_point_id = ep_vid;
+            payload.start_level = level;
+            int actual_ef = (level == 0) ? std::max(ef_search, k) : 1;
+            search_layer_query(query_vector, level, actual_ef, payload);
+            if (payload.continue_search)
+                return payload.topk_ids(k);
+            // 取当前层最近的点作为下一层入口
+            auto topk = payload.topk_ids(1);
+            if (!topk.empty())
+                ep_vid = topk[0];
         }
 
         return payload.topk_ids(k);

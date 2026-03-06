@@ -326,6 +326,147 @@ HNSWGraph<T> *deserialize_hnsw(Buffer &buf)
     return hnsw;
 }
 
+// 序列化 HNSW 子集：保留完整邻接关系，但只传子集向量数据（非本地向量数据清零）
+template <typename T>
+void serialize_hnsw_subset(Buffer &buf, const HNSWGraph<T> *hnsw, const std::unordered_set<int> &local_vids)
+{
+    size_t cur_count = hnsw->cur_element_count_.load();
+    size_t vec_bytes = hnsw->dim * sizeof(T);
+
+    // 写入参数头（与 serialize_hnsw 一致）
+    buf.write_val(hnsw->dim);
+    buf.write_val(hnsw->m);
+    buf.write_val(hnsw->ef_construction);
+    buf.write_val(hnsw->ef_search);
+    buf.write_val(hnsw->limited_level);
+    buf.write_val(hnsw->max_level);
+    buf.write_val(hnsw->entry_point_id);
+    buf.write_val(hnsw->seed);
+    buf.write_val((uint64_t)hnsw->max_elements_);
+    buf.write_val((uint64_t)cur_count);
+    buf.write_val((uint64_t)hnsw->size_per_element_);
+    buf.write_val((uint64_t)hnsw->links_level0_size_);
+    buf.write_val((uint64_t)hnsw->data_offset_);
+    buf.write_val((uint64_t)hnsw->label_offset_);
+    buf.write_val((uint64_t)hnsw->size_links_per_element_);
+    buf.write_val(hnsw->max_m_);
+    buf.write_val(hnsw->max_m0_);
+    buf.write_val(hnsw->level_mult_);
+
+    LOG_DEBUG_STREAM("Serializing HNSW subset: " << cur_count << " elements, " << local_vids.size() << " local vids.");
+
+    // 写入 level 0 骨架（links + label，跳过向量数据区）
+    for (size_t i = 0; i < cur_count; i++)
+    {
+        char *elem_ptr = hnsw->data_level0_ + i * hnsw->size_per_element_;
+        // 写入 links 区域（完整保留邻接关系）
+        buf.write(elem_ptr, hnsw->links_level0_size_);
+        // 写入 label
+        buf.write(elem_ptr + hnsw->label_offset_, sizeof(int));
+    }
+
+    // 只写入本地向量数据：(internal_id, vec_data) 对
+    buf.write_val((uint64_t)local_vids.size());
+    for (size_t i = 0; i < cur_count; i++)
+    {
+        char *elem_ptr = hnsw->data_level0_ + i * hnsw->size_per_element_;
+        int vid = *(int *)(elem_ptr + hnsw->label_offset_);
+        if (local_vids.count(vid))
+        {
+            buf.write_val((uint64_t)i);  // internal_id
+            buf.write(elem_ptr + hnsw->data_offset_, vec_bytes);  // 向量数据
+        }
+    }
+
+    // 写入高层链接数据（完整保留）
+    for (size_t i = 0; i < cur_count; i++)
+    {
+        int link_level = hnsw->element_levels_[i];
+        buf.write_val(link_level);
+        if (link_level > 0)
+        {
+            size_t link_size = hnsw->size_links_per_element_ * link_level;
+            buf.write(hnsw->link_lists_[i], link_size);
+        }
+    }
+}
+
+// 反序列化 HNSW 子集：读取骨架 + 稀疏本地向量数据
+template <typename T>
+HNSWGraph<T> *deserialize_hnsw_subset(Buffer &buf)
+{
+    int dim = buf.read_val<int>();
+    int m = buf.read_val<int>();
+    int ef_c = buf.read_val<int>();
+    int ef_s = buf.read_val<int>();
+    int lim = buf.read_val<int>();
+    int max_l = buf.read_val<int>();
+    int ep = buf.read_val<int>();
+    unsigned int seed = buf.read_val<unsigned int>();
+    uint64_t max_elements = buf.read_val<uint64_t>();
+    uint64_t cur_count = buf.read_val<uint64_t>();
+    uint64_t size_per_element = buf.read_val<uint64_t>();
+    uint64_t links_level0_size = buf.read_val<uint64_t>();
+    uint64_t data_offset = buf.read_val<uint64_t>();
+    uint64_t label_offset = buf.read_val<uint64_t>();
+    uint64_t size_links_per_element = buf.read_val<uint64_t>();
+    int max_m = buf.read_val<int>();
+    int max_m0 = buf.read_val<int>();
+    double level_mult = buf.read_val<double>();
+
+    size_t vec_bytes = dim * sizeof(T);
+
+    HNSWGraph<T> *hnsw = new HNSWGraph<T>(dim, m, ef_c, ef_s, lim, max_elements, seed);
+    hnsw->max_level = max_l;
+    hnsw->entry_point_id = ep;
+    hnsw->cur_element_count_ = (size_t)cur_count;
+
+    // 读取 level 0 骨架（links + label，向量数据区保留构造函数的零初始化）
+    for (uint64_t i = 0; i < cur_count; i++)
+    {
+        char *elem_ptr = hnsw->data_level0_ + i * hnsw->size_per_element_;
+        // 读取 links
+        buf.read(elem_ptr, hnsw->links_level0_size_);
+        // 读取 label（写入 label_offset_ 位置）
+        buf.read(elem_ptr + hnsw->label_offset_, sizeof(int));
+    }
+
+    // 读取本地向量数据：(internal_id, vec_data) 对
+    uint64_t local_count = buf.read_val<uint64_t>();
+    for (uint64_t i = 0; i < local_count; i++)
+    {
+        uint64_t internal_id = buf.read_val<uint64_t>();
+        char *vec_ptr = hnsw->data_level0_ + internal_id * hnsw->size_per_element_ + hnsw->data_offset_;
+        buf.read(vec_ptr, vec_bytes);
+        // 将对应 vid 加入 local_vids_
+        int vid = hnsw->get_external_label((int)internal_id);
+        hnsw->local_vids_.insert(vid);
+    }
+
+    // 读取高层链接数据并重建 label_lookup_
+    for (uint64_t i = 0; i < cur_count; i++)
+    {
+        int link_level = buf.read_val<int>();
+        hnsw->element_levels_[i] = link_level;
+
+        if (link_level > 0)
+        {
+            size_t link_size = hnsw->size_links_per_element_ * link_level;
+            hnsw->link_lists_[i] = (char *)malloc(link_size);
+            if (!hnsw->link_lists_[i])
+                throw std::runtime_error("deserialize_hnsw_subset: failed to allocate link_lists_");
+            buf.read(hnsw->link_lists_[i], link_size);
+        }
+
+        int vid = hnsw->get_external_label((int)i);
+        hnsw->label_lookup_[vid] = (int)i;
+    }
+
+    LOG_DEBUG_STREAM("Deserialized HNSW subset: " << cur_count << " elements, " << hnsw->local_vids_.size() << " local vids.");
+
+    return hnsw;
+}
+
 void serialize_routing(Buffer &buf, const std::vector<std::unordered_map<int, std::vector<int>>> &maps)
 {
     buf.write_val((uint64_t)maps.size());
@@ -1200,24 +1341,27 @@ public:
         for (int i = 0; i < node_num; i++)
             LOG_INFO_STREAM("[partition] node " << i << " local_vectors=" << local_vectors[i].size());
 
-        // 为每个 node 创建 local_hnsw（浅拷贝/新实例），并设置 vectors/neighbors/entrypoint/max_level
+        // 构建每个节点的 local_vids 集合（用于子集序列化和搜索时判断本地/远程向量）
+        std::vector<std::unordered_set<int>> node_local_vids(node_num);
         for (int i = 0; i < node_num; i++)
         {
-            // 释放旧的 local_hnsw（避免重复 partition 时内存泄漏）
+            for (const auto &kv : local_vectors[i])
+                node_local_vids[i].insert(kv.first);
+            // 确保 entry_point 的向量数据在每个节点都存在（query 高层导航需要）
+            if (hnsw->entry_point_id >= 0)
+                node_local_vids[i].insert(hnsw->get_external_label(hnsw->entry_point_id));
+        }
+
+        // 释放旧的 local_hnsw
+        for (int i = 0; i < node_num; i++)
+        {
             if (nodes[i].local_hnsw != nullptr && nodes[i].local_hnsw != hnsw)
             {
                 delete nodes[i].local_hnsw;
                 nodes[i].local_hnsw = nullptr;
             }
-            size_t local_max_elements = std::max(local_vectors[i].size(), (size_t)1000);
-            HNSWGraph<T> *local_hnsw = new HNSWGraph<T>(hnsw->dim, hnsw->m, hnsw->ef_construction, hnsw->ef_search, hnsw->limited_level, local_max_elements, hnsw->seed);
-            // 通过 add_vector 逐个添加（建立连续内存布局和邻居关系）
-            for (const auto &kv : local_vectors[i])
-            {
-                local_hnsw->add_vector(kv.first, kv.second);
-            }
-            nodes[i].local_hnsw = local_hnsw;
         }
+        LOG_INFO_STREAM("[partition] Distributing subset HNSW graphs (full adjacency + local vectors only)");
 
         // Distribute partitions to remote nodes
         for (int i = 0; i < node_num; i++)
@@ -1238,7 +1382,7 @@ public:
                 Buffer buf;
                 buf.write_val((int)MSG_INIT_GRAPH);
                 serialize_routing(buf, vector_node_map);
-                serialize_hnsw(buf, target_node.local_hnsw);
+                serialize_hnsw_subset(buf, hnsw, node_local_vids[i]);
 
                 uint64_t msg_size = buf.data.size();
                 LOG_INFO_STREAM("[partition] Sending MSG_INIT_GRAPH to node " << i << ", msg_size=" << msg_size << " bytes");
@@ -1274,14 +1418,13 @@ public:
             }
             else
             {
+                // 本地节点：通过序列化/反序列化深拷贝子集图
                 Buffer buf;
                 serialize_routing(buf, vector_node_map);
-                serialize_hnsw(buf, target_node.local_hnsw);
+                serialize_hnsw_subset(buf, hnsw, node_local_vids[i]);
                 deserialize_routing(buf, vector_node_map);
 
-                if (target_node.local_hnsw)
-                    delete target_node.local_hnsw;
-                target_node.local_hnsw = deserialize_hnsw<T>(buf);
+                target_node.local_hnsw = deserialize_hnsw_subset<T>(buf);
             }
         }
     }
@@ -1969,7 +2112,7 @@ void Node<T>::handle_node_client(int conn_id)
 
                 if (local_hnsw)
                     delete local_hnsw;
-                local_hnsw = deserialize_hnsw<T>(buf);
+                local_hnsw = deserialize_hnsw_subset<T>(buf);
 
                 LOG_DEBUG_STREAM("Node " << node_id << " initialized with " << local_hnsw->get_cur_element_count() << " vectors.");
 
