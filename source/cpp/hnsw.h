@@ -850,9 +850,9 @@ public:
 
     // ========================================================
     // search_layer_query - 搜索一层（支持分布式 transfer + 预取优化）
-    // 方案 C：搜索主循环内部全程使用 (dist, internal_id)
-    // 只在进入/退出边界处做 vid ↔ internal_id 的批量转换
-    // 消除热路径上的 hash lookup，大幅提升 QPS
+    // 统一使用 (dist, vid) 管理 candidates/results，不区分 remote/local
+    // 像在一张完整图上搜索：遇到远程 candidate 触发 transfer，
+    // 遇到远程邻居跳过（无法计算距离），不中断本地搜索
     // ========================================================
     void search_layer_query(const std::vector<T> &query_vector, int level, int ef, Payload<T> &payload)
     {
@@ -934,10 +934,9 @@ public:
             if (it == label_lookup_.end())
             {
                 // 远程 candidate：本地无法展开邻居，transfer 到远程节点展开
-                // 远程节点会计算该节点邻居的距离并加入 candidates/results
+                // candidate 已在 candidates 堆中，远程节点弹出堆顶自然就是它
                 if (is_compacted)
                 {
-                    // 将此 candidate 放回（远程节点需要展开它）
                     payload.candidates.push({cand_dist, cand_vid});
                     payload.continue_search = true;
                     payload.require_id = cand_vid;
