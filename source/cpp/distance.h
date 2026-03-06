@@ -440,7 +440,6 @@ static float IPSqrSIMD16ExtAVX(const void* pVect1v, const void* pVect2v, const v
 #if defined(__AVX512F__) || defined(USE_AVX512)
 
 static float L2SqrSIMD16ExtAVX512(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
-    float PORTABLE_ALIGN64 TmpRes[16];
     const float* pVect1 = (const float*)pVect1v;
     const float* pVect2 = (const float*)pVect2v;
     size_t qty = *((const size_t*)qty_ptr);
@@ -461,11 +460,7 @@ static float L2SqrSIMD16ExtAVX512(const void* pVect1v, const void* pVect2v, cons
         sum = _mm512_add_ps(sum, _mm512_mul_ps(diff, diff));
     }
 
-    _mm512_store_ps(TmpRes, sum);
-    float res = TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3] +
-                TmpRes[4] + TmpRes[5] + TmpRes[6] + TmpRes[7] +
-                TmpRes[8] + TmpRes[9] + TmpRes[10] + TmpRes[11] +
-                TmpRes[12] + TmpRes[13] + TmpRes[14] + TmpRes[15];
+    float res = _mm512_reduce_add_ps(sum);
 
     size_t remaining = qty & 15;
     for (size_t i = 0; i < remaining; i++) {
@@ -477,7 +472,6 @@ static float L2SqrSIMD16ExtAVX512(const void* pVect1v, const void* pVect2v, cons
 }
 
 static double L2SqrSIMD8ExtAVX512(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
-    double PORTABLE_ALIGN64 TmpRes[8];
     const double* pVect1 = (const double*)pVect1v;
     const double* pVect2 = (const double*)pVect2v;
     size_t qty = *((const size_t*)qty_ptr);
@@ -498,9 +492,7 @@ static double L2SqrSIMD8ExtAVX512(const void* pVect1v, const void* pVect2v, cons
         sum = _mm512_add_pd(sum, _mm512_mul_pd(diff, diff));
     }
 
-    _mm512_store_pd(TmpRes, sum);
-    double res = TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3] +
-                 TmpRes[4] + TmpRes[5] + TmpRes[6] + TmpRes[7];
+    double res = _mm512_reduce_add_pd(sum);
 
     size_t remaining = qty & 7;
     for (size_t i = 0; i < remaining; i++) {
@@ -512,7 +504,6 @@ static double L2SqrSIMD8ExtAVX512(const void* pVect1v, const void* pVect2v, cons
 }
 
 static float IPSqrSIMD16ExtAVX512(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
-    float PORTABLE_ALIGN64 TmpRes[16];
     const float* pVect1 = (const float*)pVect1v;
     const float* pVect2 = (const float*)pVect2v;
     size_t qty = *((const size_t*)qty_ptr);
@@ -532,11 +523,7 @@ static float IPSqrSIMD16ExtAVX512(const void* pVect1v, const void* pVect2v, cons
         sum = _mm512_add_ps(sum, _mm512_mul_ps(v1, v2));
     }
 
-    _mm512_store_ps(TmpRes, sum);
-    float res = TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3] +
-                TmpRes[4] + TmpRes[5] + TmpRes[6] + TmpRes[7] +
-                TmpRes[8] + TmpRes[9] + TmpRes[10] + TmpRes[11] +
-                TmpRes[12] + TmpRes[13] + TmpRes[14] + TmpRes[15];
+    float res = _mm512_reduce_add_ps(sum);
 
     size_t remaining = qty & 15;
     for (size_t i = 0; i < remaining; i++) {

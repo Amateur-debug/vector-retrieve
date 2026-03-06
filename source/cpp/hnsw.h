@@ -453,24 +453,26 @@ public:
         if ((int)top_candidates.size() <= M)
             return;  // 早退优化
 
-        // 将 min-heap 中的元素按距离从近到远提取出来
-        std::priority_queue<std::pair<T, int>> queue_closest;  // max-heap
-        std::vector<std::pair<T, int>> return_list;
-
+        // 直接 dump 到 vector 排序，省去中间 max-heap 转换开销
+        std::vector<std::pair<T, int>> sorted_candidates;
+        sorted_candidates.reserve(top_candidates.size());
         while (!top_candidates.empty())
         {
-            queue_closest.push({-top_candidates.top().first, top_candidates.top().second});
+            sorted_candidates.push_back(top_candidates.top());
             top_candidates.pop();
         }
+        // 按距离升序排序（距离最近的优先）
+        std::sort(sorted_candidates.begin(), sorted_candidates.end());
 
-        while (!queue_closest.empty())
+        std::vector<std::pair<T, int>> return_list;
+        return_list.reserve(M);
+
+        for (auto &cur : sorted_candidates)
         {
             if ((int)return_list.size() >= M)
                 break;
 
-            auto cur = queue_closest.top();
-            queue_closest.pop();
-            T dist_to_query = -cur.first;
+            T dist_to_query = cur.first;
 
             bool good = true;
             for (auto &ret : return_list)
@@ -486,7 +488,7 @@ public:
             }
             if (good)
             {
-                return_list.push_back({dist_to_query, cur.second});
+                return_list.push_back(cur);
             }
         }
 
@@ -628,7 +630,9 @@ public:
             candidate_set.pop();
             int cur_node_id = cand.second;
 
-            // 建图搜索：加节点锁读取邻居并遍历
+            // 建图搜索：先拷贝邻居 ID 到本地数组再释放锁，距离计算在锁外执行
+            int local_neighbors[256];  // 栈上分配，足够容纳 max_m0_ 个邻居（通常 <= 128）
+            int size;
             {
                 std::unique_lock<std::mutex> lock(*link_locks_[cur_node_id]);
 
@@ -638,30 +642,31 @@ public:
                 else
                     ll_cur = get_linklist(cur_node_id, level);
 
-                int size = get_list_count(ll_cur);
-                int *data = ll_cur + 1;
+                size = get_list_count(ll_cur);
+                memcpy(local_neighbors, ll_cur + 1, size * sizeof(int));
+            }  // 锁在此释放
 
-                for (int j = 0; j < size; j++)
+            // 距离计算在锁外进行，不阻塞其他线程
+            for (int j = 0; j < size; j++)
+            {
+                int candidate_id = local_neighbors[j];
+
+                if (visited_array[candidate_id] == visited_tag)
+                    continue;
+                visited_array[candidate_id] = visited_tag;
+
+                T dist_cand = dist_func_(query_data, get_data_by_id(candidate_id), dist_func_param_);
+
+                if ((int)top_candidates.size() < ef || dist_cand < lower_bound)
                 {
-                    int candidate_id = data[j];
+                    candidate_set.push({dist_cand, candidate_id});
+                    top_candidates.push({dist_cand, candidate_id});
 
-                    if (visited_array[candidate_id] == visited_tag)
-                        continue;
-                    visited_array[candidate_id] = visited_tag;
+                    if ((int)top_candidates.size() > ef)
+                        top_candidates.pop();
 
-                    T dist_cand = dist_func_(query_data, get_data_by_id(candidate_id), dist_func_param_);
-
-                    if ((int)top_candidates.size() < ef || dist_cand < lower_bound)
-                    {
-                        candidate_set.push({dist_cand, candidate_id});
-                        top_candidates.push({dist_cand, candidate_id});
-
-                        if ((int)top_candidates.size() > ef)
-                            top_candidates.pop();
-
-                        if (!top_candidates.empty())
-                            lower_bound = top_candidates.top().first;
-                    }
+                    if (!top_candidates.empty())
+                        lower_bound = top_candidates.top().first;
                 }
             }
         }
@@ -845,9 +850,9 @@ public:
 
     // ========================================================
     // search_layer_query - 搜索一层（支持分布式 transfer + 预取优化）
-    // candidates/results 全程使用 (dist, vid) 形式，就像在一张完整图上搜索
-    // 搜索一层的过程中，一旦发现不在本地就立即 transfer 返回
-    // 上层 query 循环调用本函数即可
+    // 方案 C：搜索主循环内部全程使用 (dist, internal_id)
+    // 只在进入/退出边界处做 vid ↔ internal_id 的批量转换
+    // 消除热路径上的 hash lookup，大幅提升 QPS
     // ========================================================
     void search_layer_query(const std::vector<T> &query_vector, int level, int ef, Payload<T> &payload)
     {
@@ -862,7 +867,10 @@ public:
         // 远程 vid visited 集合（compact 模式下用于快速判重）
         std::unordered_set<int> remote_visited_set;
 
-        // 恢复 visited 状态（续搜时从 payload 恢复，非续搜时为空）
+        // 预分配 visited_vids 容量，减少 push_back 动态扩容开销
+        payload.reserve_visited(ef + 16);
+
+        // ---- 进入边界：恢复 visited 状态（vid → iid，冷路径 hash lookup）----
         for (int vid : payload.visited_vids)
         {
             auto it = label_lookup_.find(vid);
@@ -872,7 +880,43 @@ public:
                 remote_visited_set.insert(vid);  // 远程 vid 无法标记到 visited_array
         }
 
-        // 处理入口点：加入 candidates/results
+        // ---- 进入边界：将 payload 中的 (dist, vid) 转为本地 (dist, iid) ----
+        // local_candidates: min-heap (dist, internal_id)
+        std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>,
+                            std::greater<std::pair<T, int>>> local_candidates;
+        // local_results: max-heap (dist, internal_id)
+        std::priority_queue<std::pair<T, int>> local_results;
+
+        // 转换 payload.candidates → local_candidates
+        {
+            auto tmp = std::move(payload.candidates);
+            payload.candidates = decltype(payload.candidates)();
+            while (!tmp.empty())
+            {
+                auto [dist, vid] = tmp.top();
+                tmp.pop();
+                auto it = label_lookup_.find(vid);
+                if (it != label_lookup_.end())
+                    local_candidates.push({dist, it->second});
+                // 不在本地的 candidate 忽略（compact 模式下可能出现）
+            }
+        }
+
+        // 转换 payload.results → local_results
+        {
+            auto tmp = std::move(payload.results);
+            payload.results = decltype(payload.results)();
+            while (!tmp.empty())
+            {
+                auto [dist, vid] = tmp.top();
+                tmp.pop();
+                auto it = label_lookup_.find(vid);
+                if (it != label_lookup_.end())
+                    local_results.push({dist, it->second});
+            }
+        }
+
+        // 处理入口点：加入 local_candidates/local_results
         if (payload.entry_point_id != -1)
         {
             int ep_vid = payload.entry_point_id;
@@ -902,29 +946,23 @@ public:
                 T dist = dist_func_(query_vector.data(), get_data_by_id(ep_iid), dist_func_param_);
                 payload.distance_cnt++;
                 visited_array[ep_iid] = visited_tag;
-                payload.visited_vids.push_back(ep_vid);
-                payload.candidates.push({dist, ep_vid});
-                payload.results.push({dist, ep_vid});
+                payload.visited_vids.push_back(get_external_label(ep_iid));
+                local_candidates.push({dist, ep_iid});
+                local_results.push({dist, ep_iid});
             }
         }
 
-        // 搜索主循环
-        T lower_bound = payload.results.empty() ? std::numeric_limits<T>::max() : payload.results.top().first;
+        // ---- 搜索主循环：全程 (dist, internal_id)，零 hash lookup ----
+        T lower_bound = local_results.empty() ? std::numeric_limits<T>::max() : local_results.top().first;
 
-        while (!payload.candidates.empty())
+        while (!local_candidates.empty())
         {
-            auto cand = payload.candidates.top();
+            auto cand = local_candidates.top();
             if (cand.first > lower_bound)
                 break;
-            payload.candidates.pop();
+            local_candidates.pop();
 
-            int cand_vid = cand.second;
-
-            // 查找 candidate 的 internal_id（compact 后只有本地向量在 label_lookup_ 中）
-            auto it = label_lookup_.find(cand_vid);
-            if (it == label_lookup_.end())
-                continue;
-            int cur_node = it->second;
+            int cur_node = cand.second;  // 直接就是 internal_id，无需 hash lookup
 
             int *ll_cur;
             if (level == 0)
@@ -960,14 +998,31 @@ public:
 
                 int neighbor_id = data[j];
 
-                // compact 后：负数编码 = 远程向量，直接 transfer
+                // compact 后：负数编码 = 远程向量，需要 transfer
                 if (neighbor_id < 0)
                 {
                     int remote_vid = -(neighbor_id + 1);
                     if (remote_visited_set.count(remote_vid))
                         continue;
 
-                    payload.candidates.push(cand);
+                    // ---- 退出边界（transfer 中断）：iid → vid 写回 payload ----
+                    // 将当前节点放回 candidates（用 vid 形式）
+                    payload.candidates.push({cand.first, get_external_label(cur_node)});
+                    // 导出剩余 local_candidates → payload.candidates
+                    while (!local_candidates.empty())
+                    {
+                        auto [d, iid] = local_candidates.top();
+                        local_candidates.pop();
+                        payload.candidates.push({d, get_external_label(iid)});
+                    }
+                    // 导出 local_results → payload.results
+                    while (!local_results.empty())
+                    {
+                        auto [d, iid] = local_results.top();
+                        local_results.pop();
+                        payload.results.push({d, get_external_label(iid)});
+                    }
+
                     payload.continue_search = true;
                     payload.require_id = remote_vid;
                     payload.start_level = level;
@@ -978,26 +1033,32 @@ public:
                 if (visited_array[neighbor_id] == visited_tag)
                     continue;
 
-                int neighbor_vid = get_external_label(neighbor_id);
-
                 visited_array[neighbor_id] = visited_tag;
-                payload.visited_vids.push_back(neighbor_vid);
+                payload.visited_vids.push_back(get_external_label(neighbor_id));
 
                 T neighbor_dist = dist_func_(query_vector.data(), get_data_by_id(neighbor_id), dist_func_param_);
                 payload.distance_cnt++;
 
-                if ((int)payload.results.size() < ef || neighbor_dist < lower_bound)
+                if ((int)local_results.size() < ef || neighbor_dist < lower_bound)
                 {
-                    payload.candidates.push({neighbor_dist, neighbor_vid});
-                    payload.results.push({neighbor_dist, neighbor_vid});
+                    local_candidates.push({neighbor_dist, neighbor_id});
+                    local_results.push({neighbor_dist, neighbor_id});
 
-                    if ((int)payload.results.size() > ef)
-                        payload.results.pop();
+                    if ((int)local_results.size() > ef)
+                        local_results.pop();
 
-                    if (!payload.results.empty())
-                        lower_bound = payload.results.top().first;
+                    if (!local_results.empty())
+                        lower_bound = local_results.top().first;
                 }
             }
+        }
+
+        // ---- 退出边界（正常结束）：iid → vid 写回 payload.results ----
+        while (!local_results.empty())
+        {
+            auto [d, iid] = local_results.top();
+            local_results.pop();
+            payload.results.push({d, get_external_label(iid)});
         }
 
         // 本层搜索正常结束，清理中间状态
@@ -1031,8 +1092,7 @@ public:
                 else
                 {
                     // 后续层：从上一层结果取最近点作为入口，清理中间状态重新搜索
-                    auto topk = payload.topk_ids(1);
-                    int ep_vid = topk.empty() ? -1 : topk[0];
+                    int ep_vid = payload.top1_id();
                     payload.clear();
                     payload.continue_search = false;
                     payload.entry_point_id = ep_vid;
@@ -1064,9 +1124,9 @@ public:
             if (payload.continue_search)
                 return payload.topk_ids(k);
             // 取当前层最近的点作为下一层入口
-            auto topk = payload.topk_ids(1);
-            if (!topk.empty())
-                ep_vid = topk[0];
+            int next_ep = payload.top1_id();
+            if (next_ep != -1)
+                ep_vid = next_ep;
         }
 
         return payload.topk_ids(k);

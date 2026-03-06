@@ -10,7 +10,7 @@
 
 #include <vector>
 #include <cstring>
-#include <mutex>
+#include <atomic>
 
 /**
  * @brief 单个 visited 列表
@@ -54,77 +54,61 @@ public:
 };
 
 /**
- * @brief VisitedList 对象池
+ * @brief VisitedList 对象池（thread_local 无锁版本）
  *
- * 线程安全的 VisitedList 池，每个搜索线程从池中获取一个 VisitedList，
- * 搜索结束后归还。避免多线程竞争和频繁内存分配。
+ * 每个线程持有自己的 VisitedList（通过 thread_local），完全消除锁竞争。
+ * 当 numelements 变化（resize）时，线程下次 get_free_list 会自动重建。
  */
 class VisitedListPool {
 public:
     /**
-     * @param initial_pool_size 初始池大小（预创建的 VisitedList 数量）
+     * @param initial_pool_size 初始池大小（thread_local 模式下忽略）
      * @param numelements 每个 VisitedList 支持的最大元素数量
      */
     VisitedListPool(int initial_pool_size, int numelements)
-        : numelements_(numelements) {
-        for (int i = 0; i < initial_pool_size; i++) {
-            pool_.push_back(new VisitedList(numelements));
-        }
-    }
+        : numelements_(numelements) {}
 
     /**
-     * @brief 从池中获取一个空闲的 VisitedList
+     * @brief 获取当前线程专属的 VisitedList（无锁）
      *
-     * 如果池为空则动态创建新的 VisitedList。
-     * 获取后自动 reset（O(1)），调用方独占使用。
+     * 每个线程通过 thread_local 持有独立的 VisitedList，
+     * 容量不匹配时自动重建。获取后自动 reset（O(1)）。
      */
     VisitedList* get_free_list() {
-        VisitedList* vl;
-        {
-            std::unique_lock<std::mutex> lock(pool_mutex_);
-            if (pool_.empty()) {
-                vl = new VisitedList(numelements_);
-            } else {
-                vl = pool_.back();
-                pool_.pop_back();
-            }
+        thread_local VisitedList* tl_vl = nullptr;
+        thread_local int tl_size = 0;
+
+        int cur_size = numelements_.load(std::memory_order_acquire);
+        if (tl_vl == nullptr || tl_size != cur_size) {
+            delete tl_vl;
+            tl_vl = new VisitedList(cur_size);
+            tl_size = cur_size;
         }
-        vl->reset();
-        return vl;
+        tl_vl->reset();
+        return tl_vl;
     }
 
     /**
-     * @brief 将 VisitedList 归还到池中
+     * @brief 归还 VisitedList（thread_local 模式下为空操作）
      */
     void release_list(VisitedList* vl) {
-        std::unique_lock<std::mutex> lock(pool_mutex_);
-        pool_.push_back(vl);
+        // thread_local 模式：无需归还，线程退出时自动销毁
     }
 
     /**
-     * @brief 调整池中所有 VisitedList 的容量
+     * @brief 调整容量
      *
-     * 当 max_elements 扩容时调用，重建所有池内的 VisitedList。
-     * 注意：调用时确保没有 VisitedList 正在被使用。
+     * 更新 numelements_，各线程下次 get_free_list 时检测到容量变化会自动重建。
+     * 调用时确保没有 VisitedList 正在被使用（与原实现约束一致）。
      */
     void resize(int new_numelements) {
-        std::unique_lock<std::mutex> lock(pool_mutex_);
-        numelements_ = new_numelements;
-        for (auto& vl : pool_) {
-            delete vl;
-            vl = new VisitedList(new_numelements);
-        }
+        numelements_.store(new_numelements, std::memory_order_release);
     }
 
     ~VisitedListPool() {
-        for (auto* vl : pool_) {
-            delete vl;
-        }
-        pool_.clear();
+        // thread_local 的 VisitedList 由各线程退出时自动销毁
     }
 
 private:
-    std::vector<VisitedList*> pool_;
-    std::mutex pool_mutex_;
-    int numelements_;
+    std::atomic<int> numelements_;
 };

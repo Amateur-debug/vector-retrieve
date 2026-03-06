@@ -38,6 +38,11 @@ struct Payload {
         send_timestamp = 0.0;
     }
 
+    // 预留 visited_vids 容量，减少动态扩容开销
+    void reserve_visited(size_t capacity) {
+        visited_vids.reserve(capacity);
+    }
+
     // 估算当前 Payload 的大小 (bits)，用于计算网络延迟
     uint64_t size_bits() const {
 
@@ -50,6 +55,32 @@ struct Payload {
         uint64_t overhead = 256;
 
         return visited_size + candidates_size + results_size + overhead;
+    }
+
+    // 快速获取 results 中距离最小的单个 vid（不拷贝堆）
+    // 用于取下一层入口点，避免 topk_ids(1) 的整堆拷贝开销
+    // 通过访问 priority_queue 底层容器实现 O(N) 无拷贝扫描
+    int top1_id() const
+    {
+        if (results.empty())
+            return -1;
+
+        // hack: 访问 priority_queue 底层 vector 容器（标准布局，c 是第一个成员）
+        // 参考: priority_queue 在各主流标准库中底层容器名为 c
+        struct PQHack : public decltype(results) {
+            static const auto& get_container(const decltype(results)& pq) {
+                return reinterpret_cast<const PQHack&>(pq).c;
+            }
+        };
+        const auto& container = PQHack::get_container(results);
+
+        auto best = container[0];
+        for (size_t i = 1; i < container.size(); i++)
+        {
+            if (container[i].first < best.first)
+                best = container[i];
+        }
+        return best.second;
     }
 
     std::vector<int> topk_ids(size_t k) const

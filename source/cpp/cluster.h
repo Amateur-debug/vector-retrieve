@@ -2036,7 +2036,7 @@ void Node<T>::tcp_server_loop()
             continue;
         }
 
-        LOG_INFO_STREAM("[Node " << node_id << "] tcp_server_loop: accepted connection, conn_id=" << conn_id);
+        LOG_DEBUG_STREAM("[Node " << node_id << "] tcp_server_loop: accepted connection, conn_id=" << conn_id);
         std::thread(&Node<T>::handle_node_client, this, conn_id).detach();
     }
 }
@@ -2071,7 +2071,7 @@ template <typename T>
 void Node<T>::handle_node_client(int conn_id)
 {
     active_handlers++;
-    LOG_INFO_STREAM("[Node " << node_id << "] handle_node_client started, conn_id=" << conn_id);
+    LOG_DEBUG_STREAM("[Node " << node_id << "] handle_node_client started, conn_id=" << conn_id);
 
     while (true)
     {
@@ -2083,7 +2083,7 @@ void Node<T>::handle_node_client(int conn_id)
             if (msg_size == 0)
                 break;
 
-            LOG_INFO_STREAM("[Node " << node_id << "] handle_node_client received msg_size=" << msg_size << ", conn_id=" << conn_id);
+            LOG_DEBUG_STREAM("[Node " << node_id << "] handle_node_client received msg_size=" << msg_size << ", conn_id=" << conn_id);
             std::vector<char> buffer(msg_size);
             cluster->transport->recv_raw(conn_id, buffer.data(), msg_size);
 
