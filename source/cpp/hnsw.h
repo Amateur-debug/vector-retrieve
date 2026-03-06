@@ -277,6 +277,156 @@ public:
     }
 
     // ========================================================
+    // 紧凑重排：只保留本地向量，远程邻居用负数编码 -(vid+1)
+    // 调用后 data_level0_ 只含本地向量，内存大幅缩小
+    // 邻居列表中 >=0 为本地 internal_id，<0 为远程 vid 编码
+    // ========================================================
+    void compact()
+    {
+        if (local_vids_.empty())
+            return;  // 持有全部向量，无需 compact
+
+        size_t old_count = cur_element_count_.load();
+        size_t local_count = local_vids_.size();
+
+        // 1. 构建 old_id -> new_id 映射（仅本地向量）
+        //    同时构建 vid -> old_id 映射（用于邻居列表中远程 vid 编码）
+        std::vector<int> old_to_new(old_count, -1);  // -1 表示非本地
+        std::unordered_map<int, int> vid_to_old;      // vid -> old_internal_id
+        vid_to_old.reserve(old_count);
+
+        int new_id = 0;
+        for (size_t i = 0; i < old_count; i++)
+        {
+            int vid = get_external_label((int)i);
+            vid_to_old[vid] = (int)i;
+            if (local_vids_.count(vid))
+            {
+                old_to_new[i] = new_id++;
+            }
+        }
+
+        // 2. 分配新的连续内存
+        size_t new_max = local_count + local_count / 4 + 16;  // 留余量给后续 add_vector
+        char *new_data = (char *)malloc(new_max * size_per_element_);
+        if (!new_data)
+            throw std::runtime_error("compact: failed to allocate new data_level0_");
+        memset(new_data, 0, new_max * size_per_element_);
+
+        char **new_links = (char **)malloc(sizeof(char *) * new_max);
+        if (!new_links)
+            throw std::runtime_error("compact: failed to allocate new link_lists_");
+        memset(new_links, 0, sizeof(char *) * new_max);
+
+        std::vector<int> new_element_levels(new_max, 0);
+
+        // 3. 拷贝本地向量数据到新位置
+        for (size_t i = 0; i < old_count; i++)
+        {
+            if (old_to_new[i] < 0)
+                continue;
+            int nid = old_to_new[i];
+            // 拷贝整个 level0 元素（links + vec + label）
+            memcpy(new_data + (size_t)nid * size_per_element_,
+                   data_level0_ + i * size_per_element_,
+                   size_per_element_);
+            // 拷贝高层链接
+            if (element_levels_[i] > 0)
+            {
+                size_t link_size = size_links_per_element_ * element_levels_[i];
+                new_links[nid] = (char *)malloc(link_size);
+                memcpy(new_links[nid], link_lists_[i], link_size);
+            }
+            new_element_levels[nid] = element_levels_[i];
+        }
+
+        // 4. 更新所有邻居列表中的 internal_id 引用
+        //    本地向量 -> new_id，远程向量 -> -(vid+1)
+        auto remap_linklist = [&](int *ll) {
+            int cnt = ll[0];
+            int *ids = ll + 1;
+            for (int j = 0; j < cnt; j++)
+            {
+                int old_id = ids[j];
+                if (old_to_new[old_id] >= 0)
+                {
+                    ids[j] = old_to_new[old_id];  // 本地：映射到新 id
+                }
+                else
+                {
+                    int vid = get_external_label(old_id);
+                    ids[j] = -(vid + 1);  // 远程：负数编码
+                }
+            }
+        };
+
+        for (int nid = 0; nid < (int)local_count; nid++)
+        {
+            // level 0
+            int *ll0 = (int *)(new_data + (size_t)nid * size_per_element_);
+            remap_linklist(ll0);
+
+            // 高层
+            for (int lv = 1; lv <= new_element_levels[nid]; lv++)
+            {
+                int *ll = (int *)(new_links[nid] + (size_t)(lv - 1) * size_links_per_element_);
+                remap_linklist(ll);
+            }
+        }
+
+        // 5. 更新 entry_point_id 和 max_level
+        //    选择层级最高的本地向量作为 entry point
+        int best_entry = 0;
+        int best_level = new_element_levels[0];
+        for (int nid = 1; nid < (int)local_count; nid++)
+        {
+            if (new_element_levels[nid] > best_level)
+            {
+                best_level = new_element_levels[nid];
+                best_entry = nid;
+            }
+        }
+        entry_point_id = best_entry;
+        max_level = best_level;
+
+        // 6. 释放旧内存，替换为新内存
+        free(data_level0_);
+        for (size_t i = 0; i < old_count; i++)
+        {
+            if (link_lists_[i])
+                free(link_lists_[i]);
+        }
+        free(link_lists_);
+
+        data_level0_ = new_data;
+        link_lists_ = new_links;
+        element_levels_ = std::move(new_element_levels);
+
+        // 7. 重建 label_lookup_（仅本地向量）
+        label_lookup_.clear();
+        for (int nid = 0; nid < (int)local_count; nid++)
+        {
+            int vid = get_external_label(nid);
+            label_lookup_[vid] = nid;
+        }
+
+        // 8. 更新容量和计数
+        cur_element_count_ = local_count;
+        max_elements_ = new_max;
+
+        // 9. 重建锁和 visited_pool
+        link_locks_.clear();
+        link_locks_.resize(new_max);
+        for (size_t i = 0; i < new_max; i++)
+            link_locks_[i] = std::make_unique<std::mutex>();
+
+        visited_pool_ = std::make_unique<VisitedListPool>(1, new_max);
+
+        // 10. compact 后 local_vids_ 不再需要：所有本地向量就是 [0, local_count)
+        //     但保留它用于外部判断（如 add_vector 后的路由）
+    }
+
+    // ========================================================
     // 随机层级生成
     // ========================================================
     int random_level()
@@ -706,12 +856,20 @@ public:
         unsigned short *visited_array = vl->visited_array;
         unsigned short visited_tag = vl->cur_tag;
 
+        // compact 后的模式判断：local_vids_ 非空说明已 compact，邻居列表中 <0 为远程编码
+        bool is_compacted = !local_vids_.empty();
+
+        // 远程 vid visited 集合（compact 模式下用于快速判重）
+        std::unordered_set<int> remote_visited_set;
+
         // 恢复 visited 状态（续搜时从 payload 恢复，非续搜时为空）
         for (int vid : payload.visited_vids)
         {
             auto it = label_lookup_.find(vid);
             if (it != label_lookup_.end())
                 visited_array[it->second] = visited_tag;
+            else if (is_compacted)
+                remote_visited_set.insert(vid);  // 远程 vid 无法标记到 visited_array
         }
 
         // 处理入口点：加入 candidates/results
@@ -723,23 +881,21 @@ public:
             auto it = label_lookup_.find(ep_vid);
             if (it == label_lookup_.end())
             {
-                // 入口点不在本地图结构中
+                // 入口点不在本地，触发 transfer
+                if (is_compacted)
+                {
+                    payload.entry_point_id = ep_vid;
+                    payload.continue_search = true;
+                    payload.require_id = ep_vid;
+                    payload.start_level = level;
+                    visited_pool_->release_list(vl);
+                    return;
+                }
                 visited_pool_->release_list(vl);
                 return;
             }
 
             int ep_iid = it->second;
-
-            // 入口点向量数据不在本地，触发 transfer
-            if (!local_vids_.empty() && local_vids_.find(ep_vid) == local_vids_.end())
-            {
-                payload.entry_point_id = ep_vid;
-                payload.continue_search = true;
-                payload.require_id = ep_vid;
-                payload.start_level = level;
-                visited_pool_->release_list(vl);
-                return;
-            }
 
             if (visited_array[ep_iid] != visited_tag)
             {
@@ -764,14 +920,11 @@ public:
 
             int cand_vid = cand.second;
 
-            // 查找 candidate 的 internal_id
+            // 查找 candidate 的 internal_id（compact 后只有本地向量在 label_lookup_ 中）
             auto it = label_lookup_.find(cand_vid);
             if (it == label_lookup_.end())
                 continue;
             int cur_node = it->second;
-
-            // 注意：展开 candidate 只需读取邻居列表（links），不需要 candidate 自身的向量数据
-            // （距离已在 cand.first 中），邻居列表在子集反序列化时完整保留，无需检查 local_vids_
 
             int *ll_cur;
             if (level == 0)
@@ -787,7 +940,8 @@ public:
             int *data = ll_cur + 1;
 
 #if defined(__x86_64__) || defined(_M_X64)
-            if (size > 0)
+            // 预取：只对本地向量（id >= 0）预取
+            if (size > 0 && data[0] >= 0)
             {
                 _mm_prefetch((char *)(visited_array + data[0]), _MM_HINT_T0);
                 _mm_prefetch(get_data_by_id(data[0]), _MM_HINT_T0);
@@ -797,7 +951,7 @@ public:
             for (int j = 0; j < size; j++)
             {
 #if defined(__x86_64__) || defined(_M_X64)
-                if (j + 1 < size)
+                if (j + 1 < size && data[j + 1] >= 0)
                 {
                     _mm_prefetch((char *)(visited_array + data[j + 1]), _MM_HINT_T0);
                     _mm_prefetch(get_data_by_id(data[j + 1]), _MM_HINT_T0);
@@ -806,21 +960,25 @@ public:
 
                 int neighbor_id = data[j];
 
-                if (visited_array[neighbor_id] == visited_tag)
-                    continue;
-
-                int neighbor_vid = get_external_label(neighbor_id);
-
-                // 邻居不在本地，立即 transfer
-                if (!local_vids_.empty() && local_vids_.find(neighbor_vid) == local_vids_.end())
+                // compact 后：负数编码 = 远程向量，直接 transfer
+                if (neighbor_id < 0)
                 {
+                    int remote_vid = -(neighbor_id + 1);
+                    if (remote_visited_set.count(remote_vid))
+                        continue;
+
                     payload.candidates.push(cand);
                     payload.continue_search = true;
-                    payload.require_id = neighbor_vid;
+                    payload.require_id = remote_vid;
                     payload.start_level = level;
                     visited_pool_->release_list(vl);
                     return;
                 }
+
+                if (visited_array[neighbor_id] == visited_tag)
+                    continue;
+
+                int neighbor_vid = get_external_label(neighbor_id);
 
                 visited_array[neighbor_id] = visited_tag;
                 payload.visited_vids.push_back(neighbor_vid);
@@ -928,6 +1086,7 @@ public:
     }
 
     // 获取邻居列表（供 Python 绑定使用）
+    // compact 后邻居列表中 <0 为远程 vid 编码 -(vid+1)，>=0 为本地 internal_id
     std::vector<int> get_neighbors(int vid, int level) const
     {
         auto it = label_lookup_.find(vid);
@@ -952,7 +1111,10 @@ public:
         result.reserve(size);
         for (int i = 0; i < size; i++)
         {
-            result.push_back(get_external_label(data[i]));
+            if (data[i] < 0)
+                result.push_back(-(data[i] + 1));  // 远程：解码 vid
+            else
+                result.push_back(get_external_label(data[i]));  // 本地：查 label
         }
         return result;
     }

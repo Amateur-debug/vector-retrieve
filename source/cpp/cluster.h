@@ -464,6 +464,10 @@ HNSWGraph<T> *deserialize_hnsw_subset(Buffer &buf)
 
     LOG_DEBUG_STREAM("Deserialized HNSW subset: " << cur_count << " elements, " << hnsw->local_vids_.size() << " local vids.");
 
+    // 紧凑重排：只保留本地向量，远程邻居用负数编码
+    hnsw->compact();
+    LOG_DEBUG_STREAM("Compacted HNSW subset: " << hnsw->get_cur_element_count() << " local elements, max_elements=" << hnsw->max_elements_);
+
     return hnsw;
 }
 
