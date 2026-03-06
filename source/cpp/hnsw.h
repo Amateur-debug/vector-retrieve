@@ -880,43 +880,10 @@ public:
                 remote_visited_set.insert(vid);  // 远程 vid 无法标记到 visited_array
         }
 
-        // ---- 进入边界：将 payload 中的 (dist, vid) 转为本地 (dist, iid) ----
-        // local_candidates: min-heap (dist, internal_id)
-        std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>,
-                            std::greater<std::pair<T, int>>> local_candidates;
-        // local_results: max-heap (dist, internal_id)
-        std::priority_queue<std::pair<T, int>> local_results;
+        // ---- 统一使用 (dist, vid) 管理 candidates/results，不区分 remote/local ----
+        // payload.candidates/results 直接作为全局堆使用
 
-        // 转换 payload.candidates → local_candidates
-        {
-            auto tmp = std::move(payload.candidates);
-            payload.candidates = decltype(payload.candidates)();
-            while (!tmp.empty())
-            {
-                auto [dist, vid] = tmp.top();
-                tmp.pop();
-                auto it = label_lookup_.find(vid);
-                if (it != label_lookup_.end())
-                    local_candidates.push({dist, it->second});
-                // 不在本地的 candidate 忽略（compact 模式下可能出现）
-            }
-        }
-
-        // 转换 payload.results → local_results
-        {
-            auto tmp = std::move(payload.results);
-            payload.results = decltype(payload.results)();
-            while (!tmp.empty())
-            {
-                auto [dist, vid] = tmp.top();
-                tmp.pop();
-                auto it = label_lookup_.find(vid);
-                if (it != label_lookup_.end())
-                    local_results.push({dist, it->second});
-            }
-        }
-
-        // 处理入口点：加入 local_candidates/local_results
+        // 处理入口点：计算距离后加入 candidates/results
         if (payload.entry_point_id != -1)
         {
             int ep_vid = payload.entry_point_id;
@@ -925,7 +892,7 @@ public:
             auto it = label_lookup_.find(ep_vid);
             if (it == label_lookup_.end())
             {
-                // 入口点不在本地，触发 transfer
+                // 入口点不在本地，触发 transfer 到远程计算距离
                 if (is_compacted)
                 {
                     payload.entry_point_id = ep_vid;
@@ -946,23 +913,42 @@ public:
                 T dist = dist_func_(query_vector.data(), get_data_by_id(ep_iid), dist_func_param_);
                 payload.distance_cnt++;
                 visited_array[ep_iid] = visited_tag;
-                payload.visited_vids.push_back(get_external_label(ep_iid));
-                local_candidates.push({dist, ep_iid});
-                local_results.push({dist, ep_iid});
+                payload.visited_vids.push_back(ep_vid);
+                payload.candidates.push({dist, ep_vid});
+                payload.results.push({dist, ep_vid});
             }
         }
 
-        // ---- 搜索主循环：全程 (dist, internal_id)，零 hash lookup ----
-        T lower_bound = local_results.empty() ? std::numeric_limits<T>::max() : local_results.top().first;
+        // ---- 搜索主循环：全程 (dist, vid)，像在一张完整图上搜索 ----
+        T lower_bound = payload.results.empty() ? std::numeric_limits<T>::max() : payload.results.top().first;
 
-        while (!local_candidates.empty())
+        while (!payload.candidates.empty())
         {
-            auto cand = local_candidates.top();
-            if (cand.first > lower_bound)
+            auto [cand_dist, cand_vid] = payload.candidates.top();
+            if (cand_dist > lower_bound)
                 break;
-            local_candidates.pop();
+            payload.candidates.pop();
 
-            int cur_node = cand.second;  // 直接就是 internal_id，无需 hash lookup
+            // 查找 candidate 是否在本地
+            auto it = label_lookup_.find(cand_vid);
+            if (it == label_lookup_.end())
+            {
+                // 远程 candidate：本地无法展开邻居，transfer 到远程节点展开
+                // 远程节点会计算该节点邻居的距离并加入 candidates/results
+                if (is_compacted)
+                {
+                    // 将此 candidate 放回（远程节点需要展开它）
+                    payload.candidates.push({cand_dist, cand_vid});
+                    payload.continue_search = true;
+                    payload.require_id = cand_vid;
+                    payload.start_level = level;
+                    visited_pool_->release_list(vl);
+                    return;
+                }
+                continue;
+            }
+
+            int cur_node = it->second;  // internal_id
 
             int *ll_cur;
             if (level == 0)
@@ -998,67 +984,40 @@ public:
 
                 int neighbor_id = data[j];
 
-                // compact 后：负数编码 = 远程向量，需要 transfer
+                // compact 后：负数编码 = 远程向量
                 if (neighbor_id < 0)
                 {
                     int remote_vid = -(neighbor_id + 1);
                     if (remote_visited_set.count(remote_vid))
                         continue;
-
-                    // ---- 退出边界（transfer 中断）：iid → vid 写回 payload ----
-                    // 将当前节点放回 candidates（用 vid 形式）
-                    payload.candidates.push({cand.first, get_external_label(cur_node)});
-                    // 导出剩余 local_candidates → payload.candidates
-                    while (!local_candidates.empty())
-                    {
-                        auto [d, iid] = local_candidates.top();
-                        local_candidates.pop();
-                        payload.candidates.push({d, get_external_label(iid)});
-                    }
-                    // 导出 local_results → payload.results
-                    while (!local_results.empty())
-                    {
-                        auto [d, iid] = local_results.top();
-                        local_results.pop();
-                        payload.results.push({d, get_external_label(iid)});
-                    }
-
-                    payload.continue_search = true;
-                    payload.require_id = remote_vid;
-                    payload.start_level = level;
-                    visited_pool_->release_list(vl);
-                    return;
+                    // 远程邻居无法在本地计算距离，跳过（不中断搜索）
+                    // 当本地候选都展开完毕后，如果远程 candidate 被弹出堆顶，会触发 transfer
+                    // 此处不加入 candidates，因为没有距离信息
+                    continue;
                 }
 
                 if (visited_array[neighbor_id] == visited_tag)
                     continue;
 
                 visited_array[neighbor_id] = visited_tag;
-                payload.visited_vids.push_back(get_external_label(neighbor_id));
+                int neighbor_vid = get_external_label(neighbor_id);
+                payload.visited_vids.push_back(neighbor_vid);
 
                 T neighbor_dist = dist_func_(query_vector.data(), get_data_by_id(neighbor_id), dist_func_param_);
                 payload.distance_cnt++;
 
-                if ((int)local_results.size() < ef || neighbor_dist < lower_bound)
+                if ((int)payload.results.size() < ef || neighbor_dist < lower_bound)
                 {
-                    local_candidates.push({neighbor_dist, neighbor_id});
-                    local_results.push({neighbor_dist, neighbor_id});
+                    payload.candidates.push({neighbor_dist, neighbor_vid});
+                    payload.results.push({neighbor_dist, neighbor_vid});
 
-                    if ((int)local_results.size() > ef)
-                        local_results.pop();
+                    if ((int)payload.results.size() > ef)
+                        payload.results.pop();
 
-                    if (!local_results.empty())
-                        lower_bound = local_results.top().first;
+                    if (!payload.results.empty())
+                        lower_bound = payload.results.top().first;
                 }
             }
-        }
-
-        // ---- 退出边界（正常结束）：iid → vid 写回 payload.results ----
-        while (!local_results.empty())
-        {
-            auto [d, iid] = local_results.top();
-            local_results.pop();
-            payload.results.push({d, get_external_label(iid)});
         }
 
         // 本层搜索正常结束，清理中间状态
