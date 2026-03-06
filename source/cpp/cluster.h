@@ -1319,8 +1319,8 @@ public:
 
                             LOG_DEBUG_STREAM("[Cluster] Received response for query " << query_id << " from remote node " << i);
 
-                            // 非持久连接：远程节点已关闭，标记为无效
-                            transport->release_connection(i, sock, false);
+                            // 持久连接：远程节点 handle_client 继续等待下一个消息，归还连接池复用
+                            transport->release_connection(i, sock, true);
 
                             Buffer resp_buf;
                             resp_buf.data = std::move(resp_data);
@@ -1826,18 +1826,18 @@ void Node<T>::handle_client(int client_fd)
     active_handlers++;
 
     // 持久连接模式：循环处理多个消息
+    // SDK 交互始终使用 TCP，直接用裸 socket recv/send
     while (true)
     {
         try
         {
+            // 先读 uint64_t 长度头，再读数据
             uint64_t msg_size = 0;
-            ssize_t r = recv(client_fd, &msg_size, sizeof(uint64_t), MSG_WAITALL);
-            if (r <= 0)
+            recv_all(client_fd, &msg_size, sizeof(uint64_t));
+            if (msg_size == 0)
             {
-                // 连接关闭或错误
                 break;
             }
-
             std::vector<char> buffer(msg_size);
             recv_all(client_fd, buffer.data(), msg_size);
 

@@ -379,7 +379,7 @@ class VectorRetrieveRunner:
                 port = 19000 + i
                 # 对于本地节点使用 127.0.0.1
                 connect_ip = "127.0.0.1" if i == self.host_id else ip
-                client = ClusterSDKClient(ip=connect_ip, port=port, timeout=2, comm_mode=self.comm_mode)
+                client = ClusterSDKClient(ip=connect_ip, port=port, comm_mode=self.comm_mode)
                 if client.connect():
                     info = client.get_information()
                     client.disconnect()

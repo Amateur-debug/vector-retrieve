@@ -249,8 +249,8 @@ PYBIND11_MODULE(vector_retrieve, m)
 
     // 绑定 ClusterSDKClient 类（float 版本）
     py::class_<ClusterSDKClient<float>>(m, "ClusterSDKClientFloat")
-        .def(py::init<const std::string &, int, int, const std::string &>(),
-             py::arg("ip") = "127.0.0.1", py::arg("port") = 19000, py::arg("timeout") = 5,
+        .def(py::init<const std::string &, int, const std::string &>(),
+             py::arg("ip") = "127.0.0.1", py::arg("port") = 19000,
              py::arg("comm_mode") = "tcp")
         .def("connect", &ClusterSDKClient<float>::connect,
              py::arg("ip") = "", py::arg("port") = -1)
@@ -290,8 +290,8 @@ PYBIND11_MODULE(vector_retrieve, m)
 
     // 绑定 ClusterSDKClient 类（double 版本）
     py::class_<ClusterSDKClient<double>>(m, "ClusterSDKClientDouble")
-        .def(py::init<const std::string &, int, int, const std::string &>(),
-             py::arg("ip") = "127.0.0.1", py::arg("port") = 19000, py::arg("timeout") = 5,
+        .def(py::init<const std::string &, int, const std::string &>(),
+             py::arg("ip") = "127.0.0.1", py::arg("port") = 19000,
              py::arg("comm_mode") = "tcp")
         .def("connect", &ClusterSDKClient<double>::connect,
              py::arg("ip") = "", py::arg("port") = -1)

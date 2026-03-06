@@ -17,7 +17,6 @@ private:
     int host_port;
     int sockfd;
     bool connected;
-    int timeout_sec;
     std::vector<QueryEndpoint> query_endpoints;
     size_t current_endpoint_idx;  // 当前连接的端点索引，-1 表示无效
 
@@ -211,8 +210,8 @@ public:
         }
     }
 
-    ClusterSDKClient(const std::string &ip = "127.0.0.1", int port = 19000, int timeout = 5, const std::string &comm_mode = "tcp")
-        : host_ip(ip), host_port(port), sockfd(-1), connected(false), timeout_sec(timeout), current_endpoint_idx((size_t)-1)
+    ClusterSDKClient(const std::string &ip = "127.0.0.1", int port = 19000, const std::string &comm_mode = "tcp")
+        : host_ip(ip), host_port(port), sockfd(-1), connected(false), current_endpoint_idx((size_t)-1)
     {
         transport_config.comm_mode = comm_mode;
         transport = TransportFactory::create(transport_config);

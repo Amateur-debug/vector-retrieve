@@ -35,7 +35,6 @@ static constexpr int RDMA_MAX_SGE = 1;            // 每个WR的最大SGE数
 static constexpr int RDMA_CQ_SIZE = 256;          // 完成队列大小
 static constexpr int RDMA_MAX_INLINE = 256;       // 最大内联数据大小
 static constexpr size_t RDMA_BUF_SIZE = 4 * 1024 * 1024;  // 4MB 收发缓冲区
-static constexpr int RDMA_POLL_TIMEOUT_MS = 5000; // CQ轮询超时（毫秒）
 
 // ==================== RDMA QP 握手信息 ====================
 struct RdmaQPInfo {
@@ -101,12 +100,6 @@ private:
     int create_tcp_connection(const std::string& ip, int port) {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) return -1;
-        
-        struct timeval timeout;
-        timeout.tv_sec = 5;
-        timeout.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         
         int flag = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
@@ -603,7 +596,6 @@ private:
         // 等待接收完成
         struct ibv_wc wc;
         int polls = 0;
-        int timeout_count = 0;
         while (polls == 0) {
             polls = ibv_poll_cq(recv_cq, 1, &wc);
             if (polls < 0) {
@@ -611,12 +603,6 @@ private:
                 return -1;
             }
             if (polls == 0) {
-                timeout_count++;
-                if (timeout_count > RDMA_POLL_TIMEOUT_MS * 1000) {
-                    LOG_DEBUG_STREAM("[RDMA] 接收超时");
-                    return -1;
-                }
-                // 短暂让出 CPU
                 std::this_thread::yield();
             }
         }
@@ -888,63 +874,36 @@ public:
     // --- 原始数据传输（不带长度头） ---
 
     void send_raw(int conn_id, const void* data, size_t size) override {
-        // 尝试查找 RDMA 活跃连接
         auto conn = get_active_conn(conn_id);
-        if (conn && conn->is_valid) {
-            // 使用 RDMA Send 发送
-            // 对于大消息需要分片发送
-            const char* ptr = (const char*)data;
-            size_t remaining = size;
-            while (remaining > 0) {
-                size_t chunk = std::min(remaining, RDMA_BUF_SIZE);
-                if (rdma_send(conn, ptr, chunk) != 0) {
-                    throw std::runtime_error("RDMA send 失败");
-                }
-                ptr += chunk;
-                remaining -= chunk;
-            }
-            return;
+        if (!conn || !conn->is_valid) {
+            throw std::runtime_error("RDMA send_raw: 找不到有效的 RDMA 连接, conn_id=" + std::to_string(conn_id));
         }
-        
-        // 回退到 TCP（用于服务端接受的 TCP 辅助通道连接）
-        const char* buf = (const char*)data;
-        size_t total = 0;
-        while (total < size) {
-            ssize_t n = ::send(conn_id, buf + total, size - total, 0);
-            if (n <= 0) {
-                throw std::runtime_error("RDMA transport: TCP send 失败");
+        const char* ptr = (const char*)data;
+        size_t remaining = size;
+        while (remaining > 0) {
+            size_t chunk = std::min(remaining, RDMA_BUF_SIZE);
+            if (rdma_send(conn, ptr, chunk) != 0) {
+                throw std::runtime_error("RDMA send 失败");
             }
-            total += n;
+            ptr += chunk;
+            remaining -= chunk;
         }
     }
     
     void recv_raw(int conn_id, void* data, size_t size) override {
-        // 尝试查找 RDMA 活跃连接
         auto conn = get_active_conn(conn_id);
-        if (conn && conn->is_valid) {
-            // 使用 RDMA Recv 接收
-            char* ptr = (char*)data;
-            size_t remaining = size;
-            while (remaining > 0) {
-                size_t actual_size = 0;
-                if (rdma_recv(conn, ptr, remaining, actual_size) != 0) {
-                    throw std::runtime_error("RDMA recv 失败");
-                }
-                ptr += actual_size;
-                remaining -= actual_size;
-            }
-            return;
+        if (!conn || !conn->is_valid) {
+            throw std::runtime_error("RDMA recv_raw: 找不到有效的 RDMA 连接, conn_id=" + std::to_string(conn_id));
         }
-        
-        // 回退到 TCP（用于服务端接受的 TCP 辅助通道连接）
-        char* buf = (char*)data;
-        size_t total = 0;
-        while (total < size) {
-            ssize_t n = ::recv(conn_id, buf + total, size - total, MSG_WAITALL);
-            if (n <= 0) {
-                throw std::runtime_error("RDMA transport: TCP recv 失败");
+        char* ptr = (char*)data;
+        size_t remaining = size;
+        while (remaining > 0) {
+            size_t actual_size = 0;
+            if (rdma_recv(conn, ptr, remaining, actual_size) != 0) {
+                throw std::runtime_error("RDMA recv 失败");
             }
-            total += n;
+            ptr += actual_size;
+            remaining -= actual_size;
         }
     }
 };
