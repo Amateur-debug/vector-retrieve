@@ -23,6 +23,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <queue>
@@ -59,7 +60,7 @@ public:
     // === 连续内存布局 ===
     char *data_level0_;                     // level 0 连续内存块
     char **link_lists_;                     // 高层邻居指针数组
-    std::vector<std::mutex> link_locks_;    // 节点级锁数组
+    std::vector<std::unique_ptr<std::mutex>> link_locks_;    // 节点级锁数组
     std::mutex global_mutex_;               // 全局锁（保护 entry_point_id, max_level）
     std::shared_mutex resize_mutex_;               // 读写锁：resize 时独占，建图线程共享
 
@@ -139,7 +140,10 @@ public:
         memset(link_lists_, 0, sizeof(char *) * max_elements_);
 
         // 预分配节点级锁
-        link_locks_ = std::vector<std::mutex>(max_elements_);
+        link_locks_.resize(max_elements_);
+        for (size_t i = 0; i < max_elements_; i++) {
+            link_locks_[i] = std::make_unique<std::mutex>();
+        }
 
         // 预分配层级记录
         element_levels_.resize(max_elements_, 0);
@@ -256,8 +260,12 @@ public:
         memset(new_links + max_elements_, 0, sizeof(char *) * (new_max_elements - max_elements_));
         link_lists_ = new_links;
 
-        // 扩容锁数组：resize 到新大小（追加新的 mutex，保留已有的）
+        // 扩容锁数组：追加新的 mutex，保留已有的
+        size_t old_size = link_locks_.size();
         link_locks_.resize(new_max_elements);
+        for (size_t i = old_size; i < new_max_elements; i++) {
+            link_locks_[i] = std::make_unique<std::mutex>();
+        }
 
         // 扩容层级记录
         element_levels_.resize(new_max_elements, 0);
@@ -380,7 +388,7 @@ public:
         // 为每个被选中的邻居建立反向连接
         for (int selected_id : selected_neighbors)
         {
-            std::unique_lock<std::mutex> lock(link_locks_[selected_id]);
+            std::unique_lock<std::mutex> lock(*link_locks_[selected_id]);
 
             int *ll_other;
             if (level == 0)
@@ -472,7 +480,7 @@ public:
 
             // 建图搜索：加节点锁读取邻居并遍历
             {
-                std::unique_lock<std::mutex> lock(link_locks_[cur_node_id]);
+                std::unique_lock<std::mutex> lock(*link_locks_[cur_node_id]);
 
                 int *ll_cur;
                 if (level == 0)
@@ -641,7 +649,7 @@ public:
                 while (changed)
                 {
                     changed = false;
-                    std::unique_lock<std::mutex> lock(link_locks_[ep]);
+                    std::unique_lock<std::mutex> lock(*link_locks_[ep]);
                     int *ll = get_linklist(ep, level);
                     int size = get_list_count(ll);
                     int *data = ll + 1;
