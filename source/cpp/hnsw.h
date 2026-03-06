@@ -166,7 +166,7 @@ public:
         }
         if (link_lists_)
         {
-            for (size_t i = 0; i < cur_element_count_.load(); i++)
+            for (size_t i = 0; i < max_elements_; i++)
             {
                 if (link_lists_[i])
                     free(link_lists_[i]);
@@ -257,8 +257,8 @@ public:
         memset(new_links + max_elements_, 0, sizeof(char *) * (new_max_elements - max_elements_));
         link_lists_ = new_links;
 
-        // 扩容锁数组（需要创建新的）
-        link_locks_ = std::vector<std::mutex>(new_max_elements);
+        // 扩容锁数组：resize 到新大小（追加新的 mutex，保留已有的）
+        link_locks_.resize(new_max_elements);
 
         // 扩容层级记录
         element_levels_.resize(new_max_elements, 0);
@@ -471,39 +471,40 @@ public:
             candidate_set.pop();
             int cur_node_id = cand.second;
 
-            // 建图搜索：加节点锁读取邻居
-            int *ll_cur;
+            // 建图搜索：加节点锁读取邻居并遍历
             {
                 std::unique_lock<std::mutex> lock(link_locks_[cur_node_id]);
+
+                int *ll_cur;
                 if (level == 0)
                     ll_cur = get_linklist0(cur_node_id);
                 else
                     ll_cur = get_linklist(cur_node_id, level);
-            }
 
-            int size = get_list_count(ll_cur);
-            int *data = ll_cur + 1;
+                int size = get_list_count(ll_cur);
+                int *data = ll_cur + 1;
 
-            for (int j = 0; j < size; j++)
-            {
-                int candidate_id = data[j];
-
-                if (visited_array[candidate_id] == visited_tag)
-                    continue;
-                visited_array[candidate_id] = visited_tag;
-
-                T dist_cand = dist_func_(query_data, get_data_by_id(candidate_id), dist_func_param_);
-
-                if ((int)top_candidates.size() < ef || dist_cand < lower_bound)
+                for (int j = 0; j < size; j++)
                 {
-                    candidate_set.push({dist_cand, candidate_id});
-                    top_candidates.push({dist_cand, candidate_id});
+                    int candidate_id = data[j];
 
-                    if ((int)top_candidates.size() > ef)
-                        top_candidates.pop();
+                    if (visited_array[candidate_id] == visited_tag)
+                        continue;
+                    visited_array[candidate_id] = visited_tag;
 
-                    if (!top_candidates.empty())
-                        lower_bound = top_candidates.top().first;
+                    T dist_cand = dist_func_(query_data, get_data_by_id(candidate_id), dist_func_param_);
+
+                    if ((int)top_candidates.size() < ef || dist_cand < lower_bound)
+                    {
+                        candidate_set.push({dist_cand, candidate_id});
+                        top_candidates.push({dist_cand, candidate_id});
+
+                        if ((int)top_candidates.size() > ef)
+                            top_candidates.pop();
+
+                        if (!top_candidates.empty())
+                            lower_bound = top_candidates.top().first;
+                    }
                 }
             }
         }
@@ -511,17 +512,15 @@ public:
         visited_pool_->release_list(vl);
 
         // 转换为 min-heap 返回
-    // ========================================================
-    // add_vector
-                    if (!top_candidates.empty())
-                        lower_bound = top_candidates.top().first;
-                }
-            }
+        std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>,
+                            std::greater<std::pair<T, int>>>
+            results;
+        while (!top_candidates.empty())
+        {
+            results.push(top_candidates.top());
+            top_candidates.pop();
         }
-
-        visited_pool_->release_list(vl);
-
-        return top_candidates;
+        return results;
     }
 
     // ========================================================
@@ -643,6 +642,7 @@ public:
                 while (changed)
                 {
                     changed = false;
+                    std::unique_lock<std::mutex> lock(link_locks_[ep]);
                     int *ll = get_linklist(ep, level);
                     int size = get_list_count(ll);
                     int *data = ll + 1;
@@ -698,7 +698,6 @@ public:
         // 将 payload.entry_point_id (vid) 转为 internal_id
         if (payload.entry_point_id != -1)
         {
-            std::unique_lock<std::mutex> lock(label_lookup_mutex_);
             auto it = label_lookup_.find(payload.entry_point_id);
             if (it != label_lookup_.end())
             {
@@ -726,7 +725,6 @@ public:
         {
             for (int vid : payload.visited_vids)
             {
-                std::unique_lock<std::mutex> lock(label_lookup_mutex_);
                 auto it = label_lookup_.find(vid);
                 if (it != label_lookup_.end())
                 {
@@ -734,18 +732,7 @@ public:
                 }
             }
 
-            // 如果续搜有入口点，加入搜索
-            if (ep_internal_id != -1 && visited_array[ep_internal_id] != visited_tag)
-            {
-                T dist = dist_func_(query_vector.data(), get_data_by_id(ep_internal_id), dist_func_param_);
-                payload.distance_cnt++;
-                visited_array[ep_internal_id] = visited_tag;
-
-                // 将 candidates 和 results 中的 vid 转为 internal_id
-                // 注意：续搜时 payload 中的 ID 是 vid
-            }
-
-            // 恢复 candidates（vid -> internal_id）
+            // 恢复 candidates（vid -> internal_id），不在本地的跳过（无法展开邻居）
             std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>,
                                 std::greater<std::pair<T, int>>>
                 local_candidates;
@@ -753,141 +740,46 @@ public:
             {
                 auto top = payload.candidates.top();
                 payload.candidates.pop();
-                std::unique_lock<std::mutex> lock(label_lookup_mutex_);
                 auto it = label_lookup_.find(top.second);
                 if (it != label_lookup_.end())
                 {
                     local_candidates.push({top.first, it->second});
                 }
+                // 不在本地的 candidate 跳过：无法展开其邻居
             }
 
-            // 恢复 results（vid -> internal_id）
+            // 恢复 results（vid -> internal_id），不在本地的保留为远程结果
             std::priority_queue<std::pair<T, int>> local_results;
+            std::vector<std::pair<T, int>> remote_results;  // 不在本地的结果（保持 vid）
             while (!payload.results.empty())
             {
                 auto top = payload.results.top();
                 payload.results.pop();
-                std::unique_lock<std::mutex> lock(label_lookup_mutex_);
                 auto it = label_lookup_.find(top.second);
                 if (it != label_lookup_.end())
                 {
                     local_results.push({top.first, it->second});
                 }
-            }
-
-            // 执行搜索主循环（使用 internal_id）
-            T lower_bound = local_results.empty() ? std::numeric_limits<T>::max() : local_results.top().first;
-
-            while (!local_candidates.empty())
-            {
-                auto cand = local_candidates.top();
-                if (cand.first > lower_bound)
-                    break;
-                local_candidates.pop();
-                int cur_node = cand.second;
-
-                int *ll_cur = (level == 0) ? get_linklist0(cur_node) : get_linklist(cur_node, level);
-                int size = get_list_count(ll_cur);
-                int *data = ll_cur + 1;
-
-#if defined(__x86_64__) || defined(_M_X64)
-                if (size > 0)
+                else
                 {
-                    _mm_prefetch((char *)(visited_array + data[0]), _MM_HINT_T0);
-                    _mm_prefetch(get_data_by_id(data[0]), _MM_HINT_T0);
-                }
-#endif
-
-                for (int j = 0; j < size; j++)
-                {
-#if defined(__x86_64__) || defined(_M_X64)
-                    if (j + 1 < size)
-                    {
-                        _mm_prefetch((char *)(visited_array + data[j + 1]), _MM_HINT_T0);
-                        _mm_prefetch(get_data_by_id(data[j + 1]), _MM_HINT_T0);
-                    }
-#endif
-
-                    int neighbor_id = data[j];
-
-                    if (visited_array[neighbor_id] == visited_tag)
-                        continue;
-
-                    // 检查邻居向量是否在本地子集中
-                    int neighbor_vid = get_external_label(neighbor_id);
-                    if (!local_vids_.empty() && local_vids_.find(neighbor_vid) == local_vids_.end())
-                    {
-                        // 该向量不在本地，需要跨节点 transfer
-                        // 先将当前搜索状态保存到 payload
-                        payload.candidates = decltype(payload.candidates)();
-                        while (!local_candidates.empty())
-                        {
-                            auto t = local_candidates.top();
-                            local_candidates.pop();
-                            payload.candidates.push({t.first, get_external_label(t.second)});
-                        }
-                        payload.results = decltype(payload.results)();
-                        while (!local_results.empty())
-                        {
-                            auto t = local_results.top();
-                            local_results.pop();
-                            payload.results.push({t.first, get_external_label(t.second)});
-                        }
-                        // 还原 cand 本身（已 pop 但未处理完）
-                        payload.candidates.push({cand.first, get_external_label(cand.second)});
-                        payload.visited_vids.clear();
-                        size_t cc = cur_element_count_.load();
-                        for (size_t vi = 0; vi < cc; vi++)
-                        {
-                            if (visited_array[vi] == visited_tag)
-                                payload.visited_vids.push_back(get_external_label((int)vi));
-                        }
-                        payload.continue_search = true;
-                        payload.require_id = neighbor_vid;
-                        payload.start_level = level;
-                        visited_pool_->release_list(vl);
-                        return;
-                    }
-
-                    visited_array[neighbor_id] = visited_tag;
-                    T neighbor_dist = dist_func_(query_vector.data(), get_data_by_id(neighbor_id), dist_func_param_);
-                    payload.distance_cnt++;
-
-                    if ((int)local_results.size() < ef || neighbor_dist < lower_bound)
-                    {
-                        local_candidates.push({neighbor_dist, neighbor_id});
-                        local_results.push({neighbor_dist, neighbor_id});
-
-                        if ((int)local_results.size() > ef)
-                            local_results.pop();
-
-                        if (!local_results.empty())
-                            lower_bound = local_results.top().first;
-                    }
+                    // 不在本地的结果保留（vid 形式），搜索完成后合并回 payload
+                    remote_results.push_back(top);
                 }
             }
 
-            // 将 internal_id 转回 vid 写入 payload
-            while (!local_results.empty())
+            // 如果续搜有入口点且在本地且未被访问过，加入候选集和结果集
+            if (ep_internal_id != -1 && visited_array[ep_internal_id] != visited_tag)
             {
-                auto top = local_results.top();
-                local_results.pop();
-                payload.results.push({top.first, get_external_label(top.second)});
+                T dist = dist_func_(query_vector.data(), get_data_by_id(ep_internal_id), dist_func_param_);
+                payload.distance_cnt++;
+                visited_array[ep_internal_id] = visited_tag;
+                local_candidates.push({dist, ep_internal_id});
+                local_results.push({dist, ep_internal_id});
             }
 
-            // 提取 visited 列表（internal_id -> vid）
-            payload.visited_vids.clear();
-            size_t cur_count = cur_element_count_.load();
-            for (size_t i = 0; i < cur_count; i++)
-            {
-                if (visited_array[i] == visited_tag)
-                {
-                    payload.visited_vids.push_back(get_external_label((int)i));
-                }
-            }
-
-            payload.continue_search = false;
-            visited_pool_->release_list(vl);
+            // 执行搜索主循环
+            search_layer_query_loop(query_vector, level, ef, payload, local_candidates, local_results,
+                                    visited_array, visited_tag, vl, remote_results);
             return;
         }
 
@@ -898,14 +790,13 @@ public:
             return;
         }
 
-        // 入口点不在本地，直接触发 transfer（从别的节点 transfer 过来时 top-1 可能不在本地）
+        // 入口点不在本地，直接触发 transfer
         int ep_vid_check = get_external_label(ep_internal_id);
         if (!local_vids_.empty() && local_vids_.find(ep_vid_check) == local_vids_.end())
         {
             payload.continue_search = true;
             payload.require_id = ep_vid_check;
             payload.start_level = level;
-            // entry_point 作为 candidate 传入，距离未知设为 max
             payload.candidates.push({std::numeric_limits<T>::max(), ep_vid_check});
             visited_pool_->release_list(vl);
             return;
@@ -915,7 +806,6 @@ public:
         payload.distance_cnt++;
         visited_array[ep_internal_id] = visited_tag;
 
-        // 使用内部 candidates 和 results（internal_id）
         std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>,
                             std::greater<std::pair<T, int>>>
             local_candidates;
@@ -924,7 +814,26 @@ public:
         local_candidates.push({dist, ep_internal_id});
         local_results.push({dist, ep_internal_id});
 
-        T lower_bound = dist;
+        // 非续搜：无远程结果
+        std::vector<std::pair<T, int>> no_remote_results;
+        // 执行搜索主循环
+        search_layer_query_loop(query_vector, level, ef, payload, local_candidates, local_results,
+                                visited_array, visited_tag, vl, no_remote_results);
+    }
+
+    // ========================================================
+    // search_layer_query_loop - 搜索主循环（续搜/非续搜公用）
+    // remote_results: 续搜恢复时不在本地的结果（vid 形式），搜索完成后合并回 payload.results
+    // ========================================================
+    void search_layer_query_loop(
+        const std::vector<T> &query_vector, int level, int ef, Payload<T> &payload,
+        std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>,
+                            std::greater<std::pair<T, int>>> &local_candidates,
+        std::priority_queue<std::pair<T, int>> &local_results,
+        unsigned short *visited_array, unsigned short visited_tag, VisitedList *vl,
+        std::vector<std::pair<T, int>> &remote_results)
+    {
+        T lower_bound = local_results.empty() ? std::numeric_limits<T>::max() : local_results.top().first;
 
         while (!local_candidates.empty())
         {
@@ -940,9 +849,7 @@ public:
             else
             {
                 if (element_levels_[cur_node] < level)
-                {
                     continue;
-                }
                 ll_cur = get_linklist(cur_node, level);
             }
 
@@ -991,6 +898,11 @@ public:
                         local_results.pop();
                         payload.results.push({t.first, get_external_label(t.second)});
                     }
+                    // 合并远程结果（不在本地的 vid，从上一次续搜带过来的）
+                    for (auto &rr : remote_results)
+                    {
+                        payload.results.push(rr);
+                    }
                     // 还原 cand 本身（已 pop 但未处理完）
                     payload.candidates.push({cand.first, get_external_label(cand.second)});
                     payload.visited_vids.clear();
@@ -1033,15 +945,19 @@ public:
             payload.results.push({top.first, get_external_label(top.second)});
         }
 
+        // 合并远程结果（不在本地的 vid，保持 vid 形式直接写入 payload.results）
+        for (auto &rr : remote_results)
+        {
+            payload.results.push(rr);
+        }
+
         // 提取 visited 列表（internal_id -> vid）
         payload.visited_vids.clear();
         size_t cur_count = cur_element_count_.load();
         for (size_t i = 0; i < cur_count; i++)
         {
             if (visited_array[i] == visited_tag)
-            {
                 payload.visited_vids.push_back(get_external_label((int)i));
-            }
         }
 
         payload.continue_search = false;
@@ -1061,24 +977,11 @@ public:
         if (payload.continue_search)
         {
             search_layer_query(query_vector, payload.start_level, std::max(ef_search, k), payload);
+            // 续搜中再次被中断，返回中间结果让调用方继续 transfer
             if (payload.continue_search)
                 return payload.topk_ids(k);
 
-            // 如果续搜后还有更低层要搜索
-            if (payload.start_level > 0)
-            {
-                auto topk = payload.topk_ids(1);
-                for (int l = payload.start_level - 1; l >= 0; l--)
-                {
-                    payload.clear();
-                    payload.entry_point_id = topk[0];
-                    payload.start_level = l;
-                    search_layer_query(query_vector, l, std::max(ef_search, k), payload);
-                    if (payload.continue_search)
-                        return payload.topk_ids(k);
-                    topk = payload.topk_ids(1);
-                }
-            }
+            // 续搜完成，当前层搜索结束即为最终结果（更低层之前已搜过）
             return payload.topk_ids(k);
         }
 
@@ -1260,6 +1163,14 @@ public:
                 }
             }
 
+            // 写入 local_vids_
+            size_t local_vids_count = local_vids_.size();
+            ofs.write((char *)&local_vids_count, sizeof(size_t));
+            for (int vid : local_vids_)
+            {
+                ofs.write((char *)&vid, sizeof(int));
+            }
+
             return true;
         }
         catch (...)
@@ -1303,6 +1214,17 @@ public:
         ifs.read((char *)&seed_val, sizeof(unsigned int));
 
         HNSWGraph<T> *g = new HNSWGraph<T>(dim_val, m_val, ef_c, ef_s, lim, max_elements, seed_val);
+
+        // 参数一致性校验
+        if (g->links_level0_size_ != links_level0_size ||
+            g->size_per_element_ != size_per_element ||
+            g->label_offset_ != label_offset ||
+            g->data_offset_ != data_offset)
+        {
+            delete g;
+            throw std::runtime_error("HNSWGraph::load: parameter mismatch between saved file and constructor");
+        }
+
         g->max_level = max_level_val;
         g->entry_point_id = entry_point_val;
         g->cur_element_count_ = cur_count;
@@ -1329,6 +1251,18 @@ public:
             // 重建 label_lookup_
             int vid = g->get_external_label((int)i);
             g->label_lookup_[vid] = (int)i;
+        }
+
+        // 读取 local_vids_（如果文件中有）
+        size_t local_vids_count = 0;
+        if (ifs.read((char *)&local_vids_count, sizeof(size_t)))
+        {
+            for (size_t i = 0; i < local_vids_count; i++)
+            {
+                int vid;
+                ifs.read((char *)&vid, sizeof(int));
+                g->local_vids_.insert(vid);
+            }
         }
 
         return g;
