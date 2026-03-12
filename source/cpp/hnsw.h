@@ -1025,8 +1025,10 @@ public:
                     if (remote_visited_set.count(remote_vid))
                         continue;
                     // 收集所有未访问的远程邻居，等本地邻居遍历完后一起 transfer
+                    // 注意：只标记 remote_visited_set 防止重复收集，不加入 visited_vids
+                    // visited_vids 在 pending_vids 处理时计算完距离后再加，
+                    // 否则恢复 visited 阶段会提前标记 visited_array 导致 pending_vids 处理时被跳过
                     remote_visited_set.insert(remote_vid);
-                    payload.visited_vids.push_back(remote_vid);
                     payload.pending_vids.push_back(remote_vid);
                     continue;
                 }
