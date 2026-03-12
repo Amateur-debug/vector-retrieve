@@ -213,7 +213,7 @@ class VectorRetrieveRunner:
                 proc.kill()
                 print(f"  [{ip}] Cleanup command timed out")
         print("Waiting for ports to be released...")
-        time.sleep(3)  # Wait for ports to be fully released
+        time.sleep(5)  # 等待端口释放（TCP TIME_WAIT）
 
         # Launch all workers (including local host machine)
         current_dir = os.getcwd()
@@ -281,9 +281,33 @@ class VectorRetrieveRunner:
                 proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 worker_processes.append(proc)
 
-        # Give workers some time to start
+        # 等待所有 worker 节点真正启动并可连接
         print(f"Waiting for {len(worker_processes)} worker nodes to start (including local node {self.host_id})...")
-        time.sleep(5)
+        max_wait = 60  # 最长等待 60 秒
+        check_interval = 2
+        waited = 0
+        all_ready = False
+        while waited < max_wait:
+            time.sleep(check_interval)
+            waited += check_interval
+            all_ready = True
+            for i in range(len(self.node_ips)):
+                port = 19000 + i
+                connect_ip = "127.0.0.1" if i == self.host_id else self.node_ips[i]
+                try:
+                    import socket
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(2)
+                    s.connect((connect_ip, port))
+                    s.close()
+                except Exception:
+                    all_ready = False
+                    break
+            if all_ready:
+                print(f"All worker nodes are ready after {waited}s.")
+                break
+        if not all_ready:
+            raise RuntimeError(f"Not all worker nodes are ready after {max_wait}s. Aborting to avoid query failures.")
 
         self.worker_processes = worker_processes
 
@@ -1105,14 +1129,54 @@ class VectorRetrieveRunner:
     def cleanup_workers(self):
         if self.args.distributed and self.worker_processes:
             print("\nCleaning up worker processes...")
+            # 1. 先 terminate 本地管理的进程句柄（本地 worker + SSH 进程）
             for proc in self.worker_processes:
-                if proc.poll() is None:  # Still running
+                if proc.poll() is None:
                     proc.terminate()
-            # Wait a bit for graceful shutdown
             time.sleep(1)
             for proc in self.worker_processes:
-                if proc.poll() is None:  # Still running after terminate
+                if proc.poll() is None:
                     proc.kill()
+
+            # 2. 清理本地 node_start.py 进程
+            try:
+                p = subprocess.run(["pgrep", "-f", "node_start.py"], capture_output=True, text=True)
+                if p.returncode == 0 and p.stdout.strip():
+                    pids = p.stdout.strip().split()
+                    print(f"  Killing local node_start.py PIDs: {pids}")
+                    subprocess.run(["kill", "-TERM"] + pids, check=False)
+                    time.sleep(1)
+                    p2 = subprocess.run(["pgrep", "-f", "node_start.py"], capture_output=True, text=True)
+                    if p2.returncode == 0 and p2.stdout.strip():
+                        subprocess.run(["kill", "-KILL"] + p2.stdout.strip().split(), check=False)
+            except Exception as e:
+                print(f"  Local cleanup error: {e}")
+
+            # 3. 清理远程节点上的 node_start.py 进程
+            cleanup_procs = []
+            for i, ip in enumerate(self.node_ips):
+                if ip == self.host_ip:
+                    continue
+                remote_cmd = (
+                    f"pids=$(pgrep -f node_start.py || true); "
+                    f"if [ -n \"$pids\" ]; then kill -TERM $pids 2>/dev/null || true; sleep 1; "
+                    f"pids2=$(pgrep -f node_start.py || true); if [ -n \"$pids2\" ]; then kill -KILL $pids2 2>/dev/null || true; fi; fi"
+                )
+                cmd = [
+                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                    f"{self.user_name}@{ip}", remote_cmd
+                ]
+                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                cleanup_procs.append((proc, ip))
+            for proc, ip in cleanup_procs:
+                try:
+                    proc.communicate(timeout=15)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+            # 等待端口完全释放，避免下一个任务启动时端口仍被占用
+            print("Waiting for ports to be released after cleanup...")
+            time.sleep(5)
             print("Worker processes cleaned up.")
 
 if __name__ == "__main__":
