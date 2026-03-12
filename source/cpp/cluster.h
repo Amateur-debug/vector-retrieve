@@ -2673,6 +2673,12 @@ void Node<T>::add_vector(int vid, const std::vector<T> &vec)
             // Wait for ACK
             char ack = 0;
             cluster->transport->recv_raw(sock, &ack, 1);
+            if (ack != 1)
+            {
+                LOG_DEBUG_STREAM("[Node " << node_id << "] add_vector failed for vid=" << vid << ", ack=" << (int)ack);
+                cluster->transport->release_connection(node_id, sock, false);
+                return;  // 添加失败，直接返回（不重试，避免无限循环）
+            }
             // 持久连接：远程节点不会关闭连接，归还到连接池复用
             cluster->transport->release_connection(node_id, sock, true);
         }

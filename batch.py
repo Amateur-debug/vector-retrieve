@@ -38,11 +38,11 @@ PARAM_GRID = {
     "limited_level":      [5],
     "k":                  [10],
     "num_query_threads":  [8, 32],
-    "reduce":             [False, True],
+    "reduce":             [False],
     "distributed":        [True],
     "layer":              [True, False],
     "comm_mode":          ["tcp"],  # 通信模式："tcp" 或 "rdma"
-    "cpus":               [8],       # CPU 核心数
+    "num_cpu":            [8],       # CPU 核心数
 }
 
 # 等待 graph 文件的最长秒数 (0 = 无限等待)
@@ -111,7 +111,10 @@ def build_command(dataset, params):
         cmd.append('--layer')
     # 通信模式参数
     if params.get('comm_mode') and params['comm_mode'] != 'tcp':
-        cmd += ['--comm_mode', params['comm_mode']]
+        cmd += ['--comm_mode', str(params['comm_mode'])]
+    # num_cpu 参数
+    if params.get('num_cpu'):
+        cmd += ['--num_cpu', str(params['num_cpu'])]
 
     return cmd
 
@@ -131,8 +134,8 @@ def get_result_path(dataset_name, params):
         filename += "-reduce"
     if params.get('layer'):
         filename += "-layer"
-    cpus = params.get('cpus', 8)
-    filename += f"-cpus{cpus}.json"
+    num_cpu = params.get('num_cpu', 8)
+    filename += f"-cpus{num_cpu}.json"
     return os.path.join(".", "results", "cpp", filename)
 
 
@@ -141,23 +144,11 @@ def run_batch():
     # 原始参数顺序
     keys = list(PARAM_GRID.keys())
 
-    # 为 reduce 模式生成参数组合（redundancy 只需一个值，因为 reduce 模式不分区）
-    # 同时排除 layer（reduce 模式下 layer 无效）
-    param_grid_reduce = {k: v for k, v in PARAM_GRID.items() if k not in ('redundancy', 'layer')}
-    param_grid_reduce['redundancy'] = [0]  # reduce 模式只需一个值
-    param_grid_reduce['reduce'] = [True]
-    param_grid_reduce['layer'] = [False]  # reduce 模式下 layer 无效
+    # 使用列表保持顺序与原始 PARAM_GRID 的 keys 一致
+    param_grid_normal_items = [(k, PARAM_GRID[k]) for k in keys]
+    param_grid_normal = dict(param_grid_normal_items)
 
-    # 为非 reduce 模式生成参数组合
-    param_grid_normal = {k: v for k, v in PARAM_GRID.items() if k != 'reduce'}
-    param_grid_normal['reduce'] = [False]
-
-    # 确保 key 顺序与原始 PARAM_GRID 一致
-    param_grid_reduce = {k: param_grid_reduce.get(k, [False]) for k in keys}
-    param_grid_normal = {k: param_grid_normal.get(k, [False]) for k in keys}
-
-    combinations_reduce = list(itertools.product(*param_grid_reduce.values()))
-    combinations_normal = list(itertools.product(*param_grid_normal.values()))
+    combinations_normal = list(itertools.product(*[v for _, v in param_grid_normal_items]))
 
     tasks = []
     built_graphs = set()  # 记录本次运行中已构建的图
@@ -168,7 +159,8 @@ def run_batch():
             print(f"Warning: Dataset file not found: {data_path}. Skipping...")
             continue
 
-        for combo in combinations_reduce + combinations_normal:
+        # 处理任务
+        for combo in combinations_normal:
             params = dict(zip(keys, combo))
 
             cmd = build_command(dataset, params)
@@ -176,10 +168,7 @@ def run_batch():
             graph_path = get_graph_path(dataset['name'], params)
             graph_key = (dataset['name'], params['m'], params['ef_construction'], params['limited_level'])
 
-            # reduce 模式每个节点独立建图，不支持加载已有图
-            if params.get('reduce'):
-                description = f"Dataset: {dataset['name']} | Build (reduce) | Params: {params}"
-            elif os.path.exists(graph_path) or graph_key in built_graphs:
+            if os.path.exists(graph_path) or graph_key in built_graphs:
                 # 图已存在或本次已构建，加载已有图
                 cmd += ["--graph_path", graph_path]
                 description = f"Dataset: {dataset['name']} | Load graph | Params: {params}"
