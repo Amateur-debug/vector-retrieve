@@ -880,6 +880,42 @@ public:
                 remote_visited_set.insert(vid);  // 远程 vid 无法标记到 visited_array
         }
 
+        // ---- 逐个 pop 处理 pending_vids ----
+        // 从头部逐个取出 vid：在本地的计算距离加入堆并移除，不在本地的停下 transfer
+        while (!payload.pending_vids.empty())
+        {
+            int rvid = payload.pending_vids.front();
+            auto it = label_lookup_.find(rvid);
+            if (it == label_lookup_.end())
+            {
+                // 不在本地，停下来 transfer 到该 vid 所在节点
+                payload.continue_search = true;
+                payload.require_id = rvid;
+                payload.start_level = level;
+                visited_pool_->release_list(vl);
+                return;
+            }
+            // 在本地，处理完毕后 pop 掉
+            payload.pending_vids.erase(payload.pending_vids.begin());
+            int riid = it->second;
+            if (visited_array[riid] == visited_tag)
+                continue;
+            visited_array[riid] = visited_tag;
+            payload.visited_vids.push_back(rvid);
+
+            T dist = dist_func_(query_vector.data(), get_data_by_id(riid), dist_func_param_);
+            payload.distance_cnt++;
+
+            if ((int)payload.results.size() < ef || dist < (payload.results.empty() ? std::numeric_limits<T>::max() : payload.results.top().first))
+            {
+                payload.candidates.push({dist, rvid});
+                payload.results.push({dist, rvid});
+
+                if ((int)payload.results.size() > ef)
+                    payload.results.pop();
+            }
+        }
+
         // ---- 统一使用 (dist, vid) 管理 candidates/results，不区分 remote/local ----
         // payload.candidates/results 直接作为全局堆使用
 
@@ -970,9 +1006,6 @@ public:
                 _mm_prefetch(get_data_by_id(data[0]), _MM_HINT_T0);
             }
 #endif
-            // 记录第一个遇到的远程邻居，等本地邻居遍历完后再 transfer
-            int first_remote_vid = -1;
-
             for (int j = 0; j < size; j++)
             {
 #if defined(__x86_64__) || defined(_M_X64)
@@ -991,9 +1024,10 @@ public:
                     int remote_vid = -(neighbor_id + 1);
                     if (remote_visited_set.count(remote_vid))
                         continue;
-                    // 记录第一个远程邻居，等本地邻居遍历完后再 transfer
-                    if (first_remote_vid == -1)
-                        first_remote_vid = remote_vid;
+                    // 收集所有未访问的远程邻居，等本地邻居遍历完后一起 transfer
+                    remote_visited_set.insert(remote_vid);
+                    payload.visited_vids.push_back(remote_vid);
+                    payload.pending_vids.push_back(remote_vid);
                     continue;
                 }
 
@@ -1019,24 +1053,22 @@ public:
                         lower_bound = payload.results.top().first;
                 }
             }
-            
-            // 当前节点的邻居遍历完毕，如果有记录的远程邻居，transfer 到它
-            // 把当前 candidate 压回堆：它的远程邻居还没遍历，到目标节点后可继续展开
-            // 已遍历的本地邻居会被 visited 去重跳过，不会重复计算
-            if (first_remote_vid != -1)
-            {
-                payload.candidates.push({cand_dist, cand_vid});
-                payload.continue_search = true;
-                payload.require_id = first_remote_vid;
-                payload.start_level = level;
-                visited_pool_->release_list(vl);
-                return;
-            }
+        }
+
+        // 有待处理的远程 vid，需要 transfer 到远程节点逐个处理
+        if (!payload.pending_vids.empty())
+        {
+            payload.continue_search = true;
+            payload.require_id = payload.pending_vids.front();  // 路由到第一个待处理 vid 所在节点
+            payload.start_level = level;
+            visited_pool_->release_list(vl);
+            return;
         }
 
         // 本层搜索正常结束，清理中间状态
         payload.candidates = decltype(payload.candidates)();
         payload.visited_vids.clear();
+        payload.pending_vids.clear();
         payload.continue_search = false;
         visited_pool_->release_list(vl);
     }

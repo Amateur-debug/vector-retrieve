@@ -166,6 +166,7 @@ void serialize_payload(Buffer &buf, Payload<T> &payload)
     buf.write_val(payload.distance_cnt);
 
     buf.write_vec(payload.visited_vids);
+    buf.write_vec(payload.pending_vids);
 
     auto cand_copy = payload.candidates;
     std::vector<pair<T, int>> cand_vec;
@@ -210,6 +211,7 @@ void deserialize_payload(Buffer &buf, Payload<T> &payload)
     payload.distance_cnt = buf.read_val<int>();
 
     payload.visited_vids = buf.read_vec<int>();
+    payload.pending_vids = buf.read_vec<int>();
 
     int cand_size = buf.read_val<int>();
     payload.candidates = decltype(payload.candidates)();
