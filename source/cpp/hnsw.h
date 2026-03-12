@@ -992,7 +992,6 @@ public:
                     if (remote_visited_set.count(remote_vid))
                         continue;
                     // 记录第一个远程邻居，等本地邻居遍历完后再 transfer
-                    // 不加入 candidates，避免在本地展开
                     if (first_remote_vid == -1)
                         first_remote_vid = remote_vid;
                     continue;
@@ -1022,8 +1021,11 @@ public:
             }
             
             // 当前节点的邻居遍历完毕，如果有记录的远程邻居，transfer 到它
+            // 把当前 candidate 压回堆：它的远程邻居还没遍历，到目标节点后可继续展开
+            // 已遍历的本地邻居会被 visited 去重跳过，不会重复计算
             if (first_remote_vid != -1)
             {
+                payload.candidates.push({cand_dist, cand_vid});
                 payload.continue_search = true;
                 payload.require_id = first_remote_vid;
                 payload.start_level = level;
