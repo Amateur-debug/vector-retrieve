@@ -5,23 +5,23 @@
 #include <cstring>
 #include <memory>
 
-// SIMD headers — 始终包含，运行时决定使用哪个
+// SIMD 指令集头文件 —— 始终包含，实际使用哪个指令集由运行时检测决定
 #if defined(__x86_64__) || defined(_M_X64)
 #ifdef __SSE__
-#include <xmmintrin.h>  // SSE
-#include <emmintrin.h>  // SSE2
+#include <xmmintrin.h>  // SSE 指令集支持
+#include <emmintrin.h>  // SSE2 指令集支持
 #endif
 #ifdef __AVX__
 #include <immintrin.h>
 #endif
 #endif
 
-// 兼容旧的编译宏：如果使用旧的 USE_AVX512/USE_AVX/USE_SSE 也能编译
+// 编译宏兼容处理：允许旧版编译选项 USE_AVX512/USE_AVX/USE_SSE 继续生效
 #if defined(USE_AVX512) && !defined(__AVX512F__)
-// 编译期没有 AVX512 支持，USE_AVX512 宏无效
+// 编译器未启用 AVX512 支持，USE_AVX512 宏定义将被忽略
 #endif
 
-// Alignment macro
+// 内存对齐宏定义（跨平台兼容，确保 SIMD 数据的正确对齐）
 #if defined(_MSC_VER)
 #define PORTABLE_ALIGN64 __declspec(align(64))
 #define PORTABLE_ALIGN32 __declspec(align(32))
@@ -31,32 +31,36 @@
 #endif
 
 //============================================================
-// DISTFUNC 函数指针类型定义（参考 hnswlib）
-// 签名：T(*)(const void* pVect1, const void* pVect2, const void* qty_ptr)
-// qty_ptr 指向 const size_t（维度 dim）
+// 距离函数指针类型定义（参考 hnswlib 的设计）
+// 统一签名：T(*)(const void* pVect1, const void* pVect2, const void* qty_ptr)
+// 其中 qty_ptr 指向 const size_t 类型的维度值（dim）
 //============================================================
 
 template<typename T>
 using DISTFUNC = T(*)(const void*, const void*, const void*);
 
 //============================================================
-// SpaceInterface 抽象基类（参考 hnswlib）
+// 距离空间抽象基类（参考 hnswlib 的设计）
+// 封装距离函数指针、函数参数和数据维度，
+// 供 HNSWGraph 通过工厂方法获取对应类型和指令集的最优实现。
 //============================================================
 
 template<typename T>
 class SpaceInterface {
 public:
     virtual ~SpaceInterface() = default;
-    // 获取距离函数指针
+    // 获取距离计算函数指针（运行时根据 CPU SIMD 能力动态选择）
     virtual DISTFUNC<T> get_dist_func() = 0;
-    // 获取距离函数参数（指向 dim 的指针）
+    // 获取距离函数的辅助参数（指向维度值 dim 的指针）
     virtual void* get_dist_func_param() = 0;
-    // 获取维度
+    // 获取向量数据的字节大小（dim * sizeof(T)）
     virtual size_t get_data_size() = 0;
 };
 
 //============================================================
-// 运行时 SIMD 能力检测（参考 hnswlib）
+// 运行时 SIMD 指令集能力检测（参考 hnswlib 的实现）
+// 通过 CPUID 指令查询当前 CPU 支持的 SIMD 指令集，
+// 返回布尔值表示是否支持 SSE/AVX/AVX-512。
 //============================================================
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -80,7 +84,7 @@ static bool AVX512Capable() {
     int nIds = cpuInfo[0];
     if (nIds >= 7) {
         cpuid(cpuInfo, 7);
-        // AVX512F 位于 EBX bit 16
+    // 检测 AVX-512F 支持：位于 CPUID 功能 7 的 EBX 寄存器第 16 位
         return (cpuInfo[1] & (1 << 16)) != 0;
     }
     return false;
@@ -92,7 +96,7 @@ static bool AVXCapable() {
     int nIds = cpuInfo[0];
     if (nIds >= 1) {
         cpuid(cpuInfo, 1);
-        // AVX 位于 ECX bit 28
+    // 检测 AVX 支持：位于 CPUID 功能 1 的 ECX 寄存器第 28 位
         return (cpuInfo[2] & (1 << 28)) != 0;
     }
     return false;
@@ -104,21 +108,23 @@ static bool SSECapable() {
     int nIds = cpuInfo[0];
     if (nIds >= 1) {
         cpuid(cpuInfo, 1);
-        // SSE 位于 EDX bit 25
+    // 检测 SSE 支持：位于 CPUID 功能 1 的 EDX 寄存器第 25 位
         return (cpuInfo[3] & (1 << 25)) != 0;
     }
     return false;
 }
 
 #else
-// 非 x86 平台，所有 SIMD 能力返回 false
+// 非 x86 平台：所有 SIMD 指令集能力检测均返回 false，回退使用标量实现
 static bool AVX512Capable() { return false; }
 static bool AVXCapable() { return false; }
 static bool SSECapable() { return false; }
 #endif
 
 //============================================================
-// Scalar fallback implementations（DISTFUNC 签名）
+// 标量回退实现（Scalar Fallback）
+// 不依赖任何 SIMD 指令集，作为 CPU 不支持 SIMD 时的回退方案。
+// 符合 DISTFUNC 统一签名，可直接赋值给函数指针。
 //============================================================
 
 static float L2SqrScalar(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
@@ -157,7 +163,9 @@ static float IPSqrScalar(const void* pVect1v, const void* pVect2v, const void* q
 }
 
 //============================================================
-// SSE implementation（DISTFUNC 签名）
+// SSE 指令集优化实现
+// 使用 128 位 SSE 寄存器，每次处理 4 个 float。
+// 提供 4 元素和 16 元素两种循环展开版本。
 //============================================================
 #if defined(__SSE__) || defined(USE_SSE)
 
@@ -249,7 +257,9 @@ static float L2SqrSIMD16ExtSSE(const void* pVect1v, const void* pVect2v, const v
 #endif // __SSE__
 
 //============================================================
-// AVX implementation（DISTFUNC 签名）
+// AVX 指令集优化实现
+// 使用 256 位 AVX 寄存器，每次处理 8 个 float 或 4 个 double。
+// 提供 L2 距离和内积距离的多种循环展开版本。
 //============================================================
 #if defined(__AVX__) || defined(USE_AVX) || defined(USE_AVX2)
 
@@ -435,7 +445,9 @@ static float IPSqrSIMD16ExtAVX(const void* pVect1v, const void* pVect2v, const v
 #endif // __AVX__
 
 //============================================================
-// AVX-512 implementation（DISTFUNC 签名）
+// AVX-512 指令集优化实现
+// 使用 512 位 AVX-512 寄存器，每次处理 16 个 float 或 8 个 double。
+// 提供 L2 距离和内积距离的实现，利用 _mm512_reduce_add 进行高效归约。
 //============================================================
 #if defined(__AVX512F__) || defined(USE_AVX512)
 
@@ -536,8 +548,9 @@ static float IPSqrSIMD16ExtAVX512(const void* pVect1v, const void* pVect2v, cons
 #endif // __AVX512F__
 
 //============================================================
-// L2Space — float 特化
-// 运行时根据 CPU SIMD 能力和 dim 对齐情况动态选择最优距离函数
+// L2 距离空间 —— float 特化
+// 运行时根据 CPU SIMD 能力和向量维度的对齐情况，动态选择性能最优的距离函数。
+// 优先级：AVX-512 > AVX > SSE > Scalar。
 //============================================================
 
 class L2SpaceFloat : public SpaceInterface<float> {
@@ -547,12 +560,12 @@ class L2SpaceFloat : public SpaceInterface<float> {
 
 public:
     L2SpaceFloat(size_t dim) : dim_(dim), data_size_(dim * sizeof(float)) {
-        // 运行时动态选择最优距离函数
-        dist_func_ = L2SqrScalar;  // 默认 scalar
+        // 运行时动态选择性能最优的距离计算函数
+        dist_func_ = L2SqrScalar;  // 默认使用标量实现作为回退方案
 
 #if defined(__AVX512F__) || defined(USE_AVX512)
         if (AVX512Capable()) {
-            // AVX512: 16 floats per iteration
+            // AVX-512：每次迭代处理 16 个 float 元素
             dist_func_ = L2SqrSIMD16ExtAVX512;
         } else
 #endif
@@ -574,7 +587,7 @@ public:
             }
         }
 #endif
-        ;  // 结束 if-else 链
+        ;  // if-else 链结尾（防止编译器对悬空 else 报警）
     }
 
     DISTFUNC<float> get_dist_func() override { return dist_func_; }
@@ -583,7 +596,8 @@ public:
 };
 
 //============================================================
-// L2Space — double 特化
+// L2 距离空间 —— double 特化
+// 与 float 版本类似，根据 CPU SIMD 能力动态选择最优的 double 距离函数。
 //============================================================
 
 class L2SpaceDouble : public SpaceInterface<double> {
@@ -614,7 +628,8 @@ public:
 };
 
 //============================================================
-// InnerProductSpace — float 特化
+// 内积距离空间 —— float 特化
+// 返回 (1.0 - 内积) 作为距离度量，适用于归一化向量的余弦相似度搜索。
 //============================================================
 
 class InnerProductSpaceFloat : public SpaceInterface<float> {
@@ -649,8 +664,8 @@ public:
 };
 
 //============================================================
-// 便捷函数：创建 SpaceInterface（保持向后兼容）
-// 在模板代码中使用，根据 T 类型自动选择对应的 Space 类
+// 便捷工厂函数：根据模板类型 T 自动创建对应的 L2 距离空间实例。
+// 在 HNSWGraph 的模板代码中使用，根据 T=float/double 自动分发。
 //============================================================
 
 template<typename T>
@@ -667,8 +682,9 @@ inline std::unique_ptr<SpaceInterface<double>> create_l2_space<double>(size_t di
 }
 
 //============================================================
-// 保留旧接口的兼容包装函数（供过渡期使用）
-// 这些函数内部通过编译期宏选择，与原有调用方式兼容
+// 旧接口兼容包装函数（供过渡期使用）
+// 封装为直接接受指针/维度参数的调用形式，
+// 内部通过 Scalar 实现计算，与原有调用方式完全兼容。
 //============================================================
 
 inline float L2Sqr(const float* pVect1, const float* pVect2, const void* qty_ptr) {

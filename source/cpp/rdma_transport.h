@@ -29,52 +29,56 @@
 #include "transport.h"
 #include "log.h"
 
-// ==================== RDMA 常量 ====================
-static constexpr int RDMA_MAX_WR = 128;          // 最大工作请求数
-static constexpr int RDMA_MAX_SGE = 1;            // 每个WR的最大SGE数
-static constexpr int RDMA_CQ_SIZE = 256;          // 完成队列大小
-static constexpr int RDMA_MAX_INLINE = 256;       // 最大内联数据大小
-static constexpr size_t RDMA_BUF_SIZE = 4 * 1024 * 1024;  // 4MB 收发缓冲区
+// ==================== RDMA 协议常量定义 ====================
+static constexpr int RDMA_MAX_WR = 128;          // 每个 QP 的最大工作请求数
+static constexpr int RDMA_MAX_SGE = 1;            // 每个工作请求允许的最大 Scatter/Gather Entry 数
+static constexpr int RDMA_CQ_SIZE = 256;          // 完成队列 (CQ) 的容量
+static constexpr int RDMA_MAX_INLINE = 256;       // 允许内联发送的最大数据大小（字节）
+static constexpr size_t RDMA_BUF_SIZE = 4 * 1024 * 1024;  // 每个连接的收发缓冲区大小（4MB）
 
-// ==================== RDMA QP 握手信息 ====================
+// ==================== RDMA QP 握手交换信息 ====================
+// 客户端与服务端通过 TCP 辅助通道交换以下信息，完成 RDMA QP 的连接建立。
 struct RdmaQPInfo {
-    uint16_t lid;       // 本地标识符
-    uint32_t qpn;       // QP编号
-    uint32_t psn;       // 包序列号
-    uint32_t rkey;      // 远程内存注册key
-    uint64_t vaddr;     // 远程虚拟地址
-    union ibv_gid gid;  // GID（RoCE需要）
+    uint16_t lid;       // 本地标识符（InfiniBand 网络层地址）
+    uint32_t qpn;       // Queue Pair 编号
+    uint32_t psn;       // 初始包序列号（用于可靠传输的序号同步）
+    uint32_t rkey;      // 远程内存区域的访问密钥
+    uint64_t vaddr;     // 远程内存区域的虚拟地址
+    union ibv_gid gid;  // 全局标识符（RoCE 模式下必须，InfiniBand 模式下可选）
 };
 
-// ==================== RDMA 连接 ====================
+// ==================== RDMA 连接封装 ====================
+// 封装单个 RDMA 连接的所有资源：QP、收发缓冲区、内存区域注册、TCP 辅助通道等。
 struct RdmaConnection {
-    struct ibv_qp *qp = nullptr;
-    
-    // 发送缓冲区
+    struct ibv_qp *qp = nullptr;      // RDMA Queue Pair
+
+    // 发送缓冲区及其 Memory Region 注册
     void *send_buf = nullptr;
     struct ibv_mr *send_mr = nullptr;
-    
-    // 接收缓冲区
+
+    // 接收缓冲区及其 Memory Region 注册
     void *recv_buf = nullptr;
     struct ibv_mr *recv_mr = nullptr;
-    
-    // 连接元数据
+
+    // 本地和远程端的 QP 元数据（握手时交换）
     RdmaQPInfo local_info;
     RdmaQPInfo remote_info;
-    
-    // TCP 辅助通道 socket（用于握手和辅助通信）
+
+    // TCP 辅助通道 socket（用于 RDMA 握手阶段的元数据交换和辅助通信）
     int aux_sock = -1;
-    
-    // 连接状态
+
+    // 连接有效性标志和关联的节点编号
     bool is_valid = false;
     int node_id = -1;
-    
+
     ~RdmaConnection() {
-        // 资源释放由 RdmaConnectionPool 管理
+        // 资源释放统一由 RdmaConnectionPool::destroy_connection() 管理
     }
 };
 
 // ==================== RDMA 连接池 ====================
+// 管理所有 RDMA 连接的创建、复用、释放和销毁。
+// 支持客户端主动连接和服务端接受连接两种模式。
 class RdmaConnectionPool {
 private:
     struct NodeConnections {
@@ -88,7 +92,7 @@ private:
     std::unordered_map<int, NodeConnections> node_pools;
     std::mutex pools_mutex;
     
-    // RDMA 设备上下文（共享）
+    // RDMA 设备上下文（所有连接共享同一个设备上下文）
     struct ibv_context *ib_ctx = nullptr;
     struct ibv_pd *pd = nullptr;
     struct ibv_cq *send_cq = nullptr;
@@ -96,7 +100,7 @@ private:
     uint8_t ib_port = 1;
     int gid_index = -1;
     
-    // 创建 TCP 辅助通道连接
+    // 创建 TCP 辅助通道连接（用于 RDMA 握手阶段的 QP 信息交换）
     int create_tcp_connection(const std::string& ip, int port) {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) return -1;
@@ -118,7 +122,7 @@ private:
         return sock;
     }
     
-    // 创建 QP
+    // 创建 RDMA Queue Pair（使用可靠连接模式 RC）
     struct ibv_qp* create_qp() {
         if (!pd || !send_cq || !recv_cq) return nullptr;
         
@@ -136,7 +140,7 @@ private:
         return ibv_create_qp(pd, &qp_init_attr);
     }
     
-    // 将 QP 转换到 INIT 状态
+    // 将 QP 状态从 RESET 转换为 INIT（设置端口、访问权限等基本属性）
     int modify_qp_to_init(struct ibv_qp *qp) {
         struct ibv_qp_attr attr;
         memset(&attr, 0, sizeof(attr));
@@ -149,7 +153,7 @@ private:
             IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
     }
     
-    // 将 QP 转换到 RTR 状态
+    // 将 QP 状态从 INIT 转换为 RTR（Ready to Receive，配置远程 QP 信息和路由属性）
     int modify_qp_to_rtr(struct ibv_qp *qp, const RdmaQPInfo &remote) {
         struct ibv_qp_attr attr;
         memset(&attr, 0, sizeof(attr));
@@ -165,7 +169,7 @@ private:
         attr.ah_attr.src_path_bits = 0;
         attr.ah_attr.port_num = ib_port;
         
-        // RoCE: 使用 GRH
+        // RoCE 模式：必须启用 GRH（Global Routing Header）并配置远程 GID
         if (gid_index >= 0) {
             attr.ah_attr.is_global = 1;
             attr.ah_attr.grh.dgid = remote.gid;
@@ -182,7 +186,7 @@ private:
         return ibv_modify_qp(qp, &attr, flags);
     }
     
-    // 将 QP 转换到 RTS 状态
+    // 将 QP 状态从 RTR 转换为 RTS（Ready to Send，配置重试参数和流控参数）
     int modify_qp_to_rts(struct ibv_qp *qp) {
         struct ibv_qp_attr attr;
         memset(&attr, 0, sizeof(attr));
@@ -198,20 +202,20 @@ private:
             IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
     }
     
-    // 通过 TCP 辅助通道交换 QP 信息
+    // 通过 TCP 辅助通道与远程端交换 QP 元数据（LID、QPN、PSN、rkey、vaddr、GID）
     bool exchange_qp_info(int sock, const RdmaQPInfo &local, RdmaQPInfo &remote) {
-        // 发送本地 QP 信息
+        // 发送本地 QP 信息到远程端
         if (send(sock, &local, sizeof(RdmaQPInfo), 0) != sizeof(RdmaQPInfo)) {
             return false;
         }
-        // 接收远程 QP 信息
+        // 接收远程端的 QP 信息
         if (recv(sock, &remote, sizeof(RdmaQPInfo), MSG_WAITALL) != sizeof(RdmaQPInfo)) {
             return false;
         }
         return true;
     }
     
-    // 获取本地 LID 和 GID
+    // 获取本地 IB 端口的 LID 和 GID 信息，填充到 RdmaQPInfo 结构体中
     bool get_local_info(RdmaQPInfo &info, struct ibv_qp *qp) {
         struct ibv_port_attr port_attr;
         if (ibv_query_port(ib_ctx, ib_port, &port_attr)) {
@@ -220,7 +224,7 @@ private:
         
         info.lid = port_attr.lid;
         info.qpn = qp->qp_num;
-        info.psn = 0;  // 使用固定 PSN
+        info.psn = 0;  // 使用固定初始 PSN，简化握手流程
         
         if (gid_index >= 0) {
             if (ibv_query_gid(ib_ctx, ib_port, gid_index, &info.gid)) {
@@ -233,19 +237,20 @@ private:
         return true;
     }
     
-    // 建立完整的 RDMA 连接
+    // 建立完整的 RDMA 连接（客户端侧）
+    // 流程：TCP连接 -> 创建QP -> 分配缓冲区 -> 注册MR -> QP状态转换 -> 交换元数据 -> 预投递接收
     std::shared_ptr<RdmaConnection> create_rdma_connection(const std::string& ip, int port, int node_id) {
         auto conn = std::make_shared<RdmaConnection>();
         conn->node_id = node_id;
-        
-        // 1. 建立 TCP 辅助通道
+
+        // 步骤 1：建立 TCP 辅助通道（用于 QP 元数据交换）
         conn->aux_sock = create_tcp_connection(ip, port);
         if (conn->aux_sock < 0) {
             LOG_DEBUG_STREAM("[RDMA] 无法建立到 " << ip << ":" << port << " 的TCP辅助通道");
             return nullptr;
         }
         
-        // 2. 创建 QP
+        // 步骤 2：创建 RDMA Queue Pair
         conn->qp = create_qp();
         if (!conn->qp) {
             LOG_DEBUG_STREAM("[RDMA] 创建QP失败");
@@ -253,7 +258,7 @@ private:
             return nullptr;
         }
         
-        // 3. 分配和注册发送/接收缓冲区
+        // 步骤 3：分配并注册发送/接收缓冲区的 Memory Region
         conn->send_buf = malloc(RDMA_BUF_SIZE);
         conn->recv_buf = malloc(RDMA_BUF_SIZE);
         if (!conn->send_buf || !conn->recv_buf) {
@@ -271,13 +276,13 @@ private:
             goto cleanup;
         }
         
-        // 4. QP 转 INIT
+        // 步骤 4：将 QP 转换到 INIT 状态
         if (modify_qp_to_init(conn->qp)) {
             LOG_DEBUG_STREAM("[RDMA] QP转INIT失败");
             goto cleanup;
         }
         
-        // 5. 获取本地信息并交换 QP 元数据
+        // 步骤 5：获取本地 QP 信息并与远程端交换元数据
         if (!get_local_info(conn->local_info, conn->qp)) {
             LOG_DEBUG_STREAM("[RDMA] 获取本地QP信息失败");
             goto cleanup;
@@ -290,19 +295,19 @@ private:
             goto cleanup;
         }
         
-        // 6. QP 转 RTR
+        // 步骤 6：将 QP 转换到 RTR（Ready to Receive）状态
         if (modify_qp_to_rtr(conn->qp, conn->remote_info)) {
             LOG_DEBUG_STREAM("[RDMA] QP转RTR失败");
             goto cleanup;
         }
         
-        // 7. QP 转 RTS
+        // 步骤 7：将 QP 转换到 RTS（Ready to Send）状态
         if (modify_qp_to_rts(conn->qp)) {
             LOG_DEBUG_STREAM("[RDMA] QP转RTS失败");
             goto cleanup;
         }
         
-        // 8. 预投递接收请求
+        // 步骤 8：预投递接收请求（确保连接建立后立即可接收数据）
         {
             struct ibv_sge sge;
             sge.addr = (uint64_t)conn->recv_buf;
@@ -335,7 +340,7 @@ private:
         return nullptr;
     }
     
-    // 销毁 RDMA 连接
+    // 销毁 RDMA 连接，按顺序释放所有资源：QP -> MR -> 缓冲区 -> TCP 辅助通道
     void destroy_connection(std::shared_ptr<RdmaConnection> conn) {
         if (!conn) return;
         
@@ -931,7 +936,7 @@ public:
         return conn_id;
     }
     
-    // --- 数据传输（带长度头） ---
+    // --- 数据传输接口（带 uint64_t 长度头，内部调用 send_raw/recv_raw 实现） ---
 
     void send_message(int conn_id, const void* data, size_t size) override {
         uint64_t msg_size = size;
@@ -965,7 +970,7 @@ public:
         return "[RdmaTransport] Active connections: " + std::to_string(active_conns.size());
     }
 
-    // --- 原始数据传输（不带长度头） ---
+    // --- 原始数据传输接口（不带长度头，支持超过单次缓冲区大小的自动分块传输） ---
 
     void send_raw(int conn_id, const void* data, size_t size) override {
         auto conn = get_active_conn(conn_id);

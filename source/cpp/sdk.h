@@ -2,7 +2,9 @@
 
 #include "cluster.h"
 
-// SDK Client: 通过通信中间层与集群交互的客户端
+// SDK Client：通过通信中间层与远程集群进行交互的客户端。
+// 提供向量添加、K 近邻查询、分区、保存加载等远程操作接口，
+// 支持 TCP 和 RDMA 两种传输模式，并具备自动路由发现和多端点负载均衡能力。
 template <typename T>
 class ClusterSDKClient
 {
@@ -18,13 +20,13 @@ private:
     int sockfd;
     bool connected;
     std::vector<QueryEndpoint> query_endpoints;
-    size_t current_endpoint_idx;  // 当前连接的端点索引，-1 表示无效
+    size_t current_endpoint_idx;  // 当前已连接的查询端点索引，(size_t)-1 表示未连接任何端点
 
-    // 通信中间层配置和实例
+    // 通信中间层的配置及实例，由 TransportFactory 根据 comm_mode 创建
     TransportConfig transport_config;
     std::unique_ptr<ITransport> transport;
 
-    // SDK 使用虚拟 node_id 来管理连接
+    // SDK 使用虚拟 node_id 来管理通信连接，避免与集群真实节点 ID 冲突
     static constexpr int SDK_HOST_NODE_ID = 99999;
     int next_virtual_node_id = SDK_HOST_NODE_ID;
 
@@ -36,7 +38,7 @@ public:
     bool init_routes()
     {
         try {
-            // 使用 transport 进行路由初始化通信
+            // 通过临时 TCP 连接获取集群路由信息，确定各节点的地址和分区配置
             int virtual_id = get_virtual_node_id();
             transport->register_node(virtual_id, host_ip, host_port);
             int info_sock = transport->acquire_connection(virtual_id);
@@ -44,7 +46,7 @@ public:
                 return false;
             }
 
-            // 使用 RAII 确保资源释放
+            // 使用 RAII 模式确保临时连接在作用域结束时自动释放
             struct SockGuard {
                 ITransport* t;
                 int node_id;
@@ -215,7 +217,7 @@ public:
     {
         transport_config.comm_mode = comm_mode;
         transport = TransportFactory::create(transport_config);
-        // 注册默认 host 节点
+        // 注册默认 host 节点，使得首次 connect() 可直接使用 transport 连接池
         transport->register_node(SDK_HOST_NODE_ID, host_ip, host_port);
     }
 
@@ -228,7 +230,7 @@ public:
         const std::string &target_ip = ip.empty() ? host_ip : ip;
         int target_port = (port >= 0) ? port : host_port;
 
-        // 通过 transport 建立连接
+        // 通过 transport 层建立到目标地址的网络连接
         int virtual_id = get_virtual_node_id();
         transport->register_node(virtual_id, target_ip, target_port);
         sockfd = transport->acquire_connection(virtual_id);
@@ -288,7 +290,7 @@ public:
             disconnect();
             throw;
         }
-        // 持久连接：不断开，下次 add_vector 复用同一连接
+        // 持久连接模式：不主动断开，后续的 add_vector / query 调用可复用同一连接
     }
 
     std::vector<int> query(int query_id, const std::vector<T> &query_vector, Payload<T> &payload, int k = 10)

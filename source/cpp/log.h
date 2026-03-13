@@ -6,13 +6,13 @@
 #include <string>
 #include <utility>
 
-// 日志级别控制
-// VR_LOG_LEVEL_DEBUG=0: debug级别，默认不打印
-// VR_LOG_LEVEL_INFO=1: info级别，默认打印
-// 可以通过编译选项 -DVR_LOG_LEVEL=1 启用debug日志
+// 日志级别控制机制：
+//   VR_LOG_LEVEL = 0（DEBUG 级别）：仅输出 INFO 日志，DEBUG 日志被静默忽略（默认行为）
+//   VR_LOG_LEVEL >= 1（INFO 级别）：同时输出 DEBUG 和 INFO 日志
+// 可通过编译选项 -DVR_LOG_LEVEL=1 启用 DEBUG 级别日志输出。
 
 #ifndef VR_LOG_LEVEL
-#define VR_LOG_LEVEL 0  // 默认: debug级别，不打印debug日志
+#define VR_LOG_LEVEL 0  // 默认级别：不输出 DEBUG 日志
 #endif
 
 namespace vrlog
@@ -55,7 +55,7 @@ inline void set_log_level(int level)
 
 #include <iostream>
 
-// INFO级别日志 - 默认打印
+// INFO 级别日志宏 —— 始终输出，不受 VR_LOG_LEVEL 控制
 #define LOG_INFOF(fmt, ...) ::vrlog::log_printf((fmt), ##__VA_ARGS__)
 #define LOG_INFO_STREAM(expr)                          \
     do                                                 \
@@ -64,7 +64,7 @@ inline void set_log_level(int level)
         std::cerr << expr << std::endl;                \
     } while (0)
 
-// DEBUG级别日志 - 根据VR_LOG_LEVEL决定是否打印
+// DEBUG 级别日志宏 —— 仅在 VR_LOG_LEVEL >= 1 时启用，否则编译期优化为空操作
 #if VR_LOG_LEVEL >= 1
 #define LOG_DEBUGF(fmt, ...) ::vrlog::log_printf((fmt), ##__VA_ARGS__)
 #define LOG_DEBUG_STREAM(expr)                         \

@@ -19,8 +19,9 @@
 
 #include "log.h"
 
-// ==================== TCP 连接池 ====================
-// 与 cluster.h 中的 TcpConnectionPool 相同实现，迁移到此处统一管理
+// ==================== TCP 连接池实现 ====================
+// 基于每节点独立管理的 TCP 连接池，支持连接复用、有效性检测和自动创建新连接。
+// 与 cluster.h 中的 TcpConnectionPool 为同一实现，迁移至此处统一管理。
 class TcpConnectionPool {
 private:
     struct NodeConnections {
@@ -215,13 +216,15 @@ public:
 };
 
 
-// ==================== TcpTransport 实现 ====================
+// ==================== TCP 传输层实现 ====================
+// ITransport 接口的 TCP 实现，基于标准 BSD Socket API。
+// 内部使用 TcpConnectionPool 进行连接复用和生命周期管理。
 class TcpTransport : public ITransport {
 private:
     TcpConnectionPool pool_;
     int server_fd_ = -1;
 
-    // 底层发送/接收辅助函数
+    // 底层发送辅助函数：确保将指定大小的数据完整发送，处理部分发送的情况。
     static void send_all_impl(int sock, const void* data, size_t size) {
         const char* ptr = static_cast<const char*>(data);
         size_t total_sent = 0;
@@ -234,6 +237,7 @@ private:
         }
     }
 
+    // 底层接收辅助函数：确保接收指定大小的完整数据，处理部分接收的情况。
     static void recv_all_impl(int sock, void* data, size_t size) {
         char* ptr = static_cast<char*>(data);
         size_t total_read = 0;
@@ -254,7 +258,7 @@ public:
         pool_.clear();
     }
 
-    // --- 服务端生命周期 ---
+    // --- 服务端生命周期管理 ---
 
     int start_server(int port) override {
         server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
@@ -305,7 +309,7 @@ public:
         return client_fd;
     }
 
-    // --- 节点注册与连接管理 ---
+    // --- 节点注册与连接池管理 ---
 
     void register_node(int node_id, const std::string& ip, int port) override {
         pool_.register_node(node_id, ip, port);
@@ -321,7 +325,8 @@ public:
 
     void close_connection(int conn_id) override {
         if (conn_id < 0) return;
-        // 硬关闭：设置 SO_LINGER 为 0，发送 RST
+        // 硬关闭连接：设置 SO_LINGER 为 0 强制发送 RST，立即释放套接字资源。
+        // 避免 TIME_WAIT 状态占用端口，适用于已知连接失效的场景。
         struct linger so_linger;
         so_linger.l_onoff = 1;
         so_linger.l_linger = 0;
@@ -329,7 +334,7 @@ public:
         close(conn_id);
     }
 
-    // --- 数据传输 ---
+    // --- 数据传输接口 ---
 
     void send_message(int conn_id, const void* data, size_t size) override {
         uint64_t msg_size = size;
@@ -353,7 +358,7 @@ public:
         recv_all_impl(conn_id, data, size);
     }
 
-    // --- 资源管理 ---
+    // --- 资源管理接口 ---
 
     void close_node(int node_id) override {
         pool_.close_node(node_id);
@@ -367,17 +372,17 @@ public:
         return pool_.get_stats();
     }
 
-    // --- 获取服务端 fd（供兼容层使用）---
+    // --- 获取服务端 socket fd（供兼容层使用，如关联事件循环） ---
     int get_server_fd() const { return server_fd_; }
 };
 
 
-// ==================== 条件引入 RDMA Transport ====================
+// ==================== 条件引入 RDMA 传输层实现 ====================
 #ifdef HAVE_RDMA
 #include "rdma_transport.h"
 #endif
 
-// ==================== TransportFactory 实现 ====================
+// ==================== 传输层工厂方法实现 ====================
 inline std::unique_ptr<ITransport> TransportFactory::create(const TransportConfig& config) {
     if (config.comm_mode == "tcp") {
         return std::make_unique<TcpTransport>();

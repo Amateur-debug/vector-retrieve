@@ -48,52 +48,52 @@ class HNSWGraph
 {
 public:
     // === 基本参数 ===
-    int dim;
-    int m;                  // 高层最大邻居数
-    int ef_construction;
-    int ef_search;
-    int limited_level;
-    int max_level;
-    int entry_point_id;     // internal_id of entry point (-1 if empty)
-    unsigned int seed;
+    int dim;                        // 向量维度
+    int m;                          // 每层最大邻居数（高层上限 = m，第 0 层上限 = 2*m）
+    int ef_construction;            // 建图时搜索的候选集大小
+    int ef_search;                  // 查询时搜索的候选集大小
+    int limited_level;              // 最大层级限制（-1 表示不限制）
+    int max_level;                  // 当前图中的最高层级
+    int entry_point_id;             // 入口点的 internal_id（-1 表示图为空）
+    unsigned int seed;              // 随机数种子（用于层级生成）
 
-    // === 连续内存布局 ===
-    char *data_level0_;                     // level 0 连续内存块
-    char **link_lists_;                     // 高层邻居指针数组
-    std::vector<std::unique_ptr<std::mutex>> link_locks_;    // 节点级锁数组
-    std::mutex global_mutex_;               // 全局锁（保护 entry_point_id, max_level）
-    std::shared_mutex resize_mutex_;               // 读写锁：resize 时独占，建图线程共享
+    // === 连续内存布局（参考 hnswlib 的设计） ===
+    char *data_level0_;                     // 第 0 层连续内存块（存储邻居链表 + 向量数据 + label）
+    char **link_lists_;                     // 高层邻居链表指针数组（每个元素指向该节点各高层的链表内存）
+    std::vector<std::unique_ptr<std::mutex>> link_locks_;    // 节点级别的互斥锁（细粒度保护各节点的邻居列表）
+    std::mutex global_mutex_;               // 全局互斥锁（保护 entry_point_id、max_level 等全局状态）
+    std::shared_mutex resize_mutex_;        // 读写锁：resize 扩容时获取独占锁，建图线程获取共享锁
 
-    // === 内存布局参数 ===
-    size_t max_elements_;           // 最大元素容量
-    std::atomic<size_t> cur_element_count_;  // 当前元素数量
-    size_t size_per_element_;       // 每个元素占用字节数
-    size_t links_level0_size_;      // level 0 链接区域大小
-    size_t data_offset_;            // 向量数据在元素内的偏移
-    size_t label_offset_;           // label 在元素内的偏移
-    size_t size_links_per_element_; // 高层每层链接占用字节数
-    int max_m_;                     // 高层最大邻居数 (= m)
-    int max_m0_;                    // level 0 最大邻居数 (= 2*m)
-    double level_mult_;             // 层级生成乘数
+    // === 内存布局计算参数 ===
+    size_t max_elements_;           // 当前已分配的最大元素容量（超过时触发动态扩容）
+    std::atomic<size_t> cur_element_count_;  // 当前实际元素数量（原子变量，线程安全）
+    size_t size_per_element_;       // 每个元素在 data_level0_ 中占用的字节数
+    size_t links_level0_size_;      // 第 0 层邻居链表区域的字节大小（(2*m+1) * sizeof(int)）
+    size_t data_offset_;            // 向量数据在元素内存块中的字节偏移量
+    size_t label_offset_;           // 外部 label (vid) 在元素内存块中的字节偏移量
+    size_t size_links_per_element_; // 高层每层邻居链表占用的字节数（(m+1) * sizeof(int)）
+    int max_m_;                     // 高层最大邻居数（= m）
+    int max_m0_;                    // 第 0 层最大邻居数（= 2*m，因为第 0 层接收更多反向连接）
+    double level_mult_;             // 层级生成乘数（= 1/ln(m)，控制节点层级的指数分布）
 
-    // === ID 映射 ===
-    std::unordered_map<int, int> label_lookup_;  // vid -> internal_id
+    // === 外部 ID 与内部 ID 的映射关系 ===
+    std::unordered_map<int, int> label_lookup_;  // vid → internal_id 的哈希映射
 
-    // === 距离函数 ===
-    DISTFUNC<T> dist_func_;
-    void *dist_func_param_;
-    std::unique_ptr<SpaceInterface<T>> space_;
+    // === 距离计算函数（运行时动态选择最优 SIMD 实现） ===
+    DISTFUNC<T> dist_func_;                      // 距离计算函数指针
+    void *dist_func_param_;                      // 距离函数辅助参数（指向维度值 dim 的指针）
+    std::unique_ptr<SpaceInterface<T>> space_;   // 距离空间对象（持有函数指针和参数的生命周期）
 
-    // === VisitedListPool ===
+    // === 访问标记列表对象池 ===
     std::unique_ptr<VisitedListPool> visited_pool_;
 
-    // === 层级记录 ===
-    std::vector<int> element_levels_;  // 记录每个 internal_id 的层级
+    // === 节点层级记录 ===
+    std::vector<int> element_levels_;  // 记录每个 internal_id 对应的最高层级
 
-    // === 本地向量子集标记 ===
-    std::unordered_set<int> local_vids_;  // 本地持有向量数据的 vid 集合（空表示持有全部）
+    // === 本地向量子集标记（分布式模式下使用） ===
+    std::unordered_set<int> local_vids_;  // 本地持有向量数据的 vid 集合（空集合表示持有全部向量）
 
-    // === 随机数生成器 ===
+    // === 随机数生成器（用于节点层级生成） ===
     std::mt19937 rng;
     std::uniform_real_distribution<double> uniform_;
 
@@ -120,40 +120,40 @@ public:
           rng(seed),
           uniform_(0.0, 1.0)
     {
-        // 计算内存布局参数
-        links_level0_size_ = (max_m0_ + 1) * sizeof(int);  // count + max_m0_ 个邻居 ID
-        data_offset_ = links_level0_size_;
-        label_offset_ = links_level0_size_ + dim * sizeof(T);
-        size_per_element_ = links_level0_size_ + dim * sizeof(T) + sizeof(int);
-        size_links_per_element_ = (max_m_ + 1) * sizeof(int);  // count + max_m_ 个邻居 ID
+        // 计算各内存区域的字节大小和偏移量
+        links_level0_size_ = (max_m0_ + 1) * sizeof(int);  // 存储格式：[count | id_0 | id_1 | ... | id_{2m-1}]
+        data_offset_ = links_level0_size_;                  // 向量数据紧跟邻居链表后
+        label_offset_ = links_level0_size_ + dim * sizeof(T); // label 在向量数据后
+        size_per_element_ = links_level0_size_ + dim * sizeof(T) + sizeof(int); // 单个元素总字节数
+        size_links_per_element_ = (max_m_ + 1) * sizeof(int);  // 高层每层链表：[count | id_0 | ... | id_{m-1}]
 
-        // 分配 level 0 连续内存
+        // 分配第 0 层连续内存块（存储所有节点的邻居链表 + 向量 + label）
         data_level0_ = (char *)malloc(max_elements_ * size_per_element_);
         if (!data_level0_)
             throw std::runtime_error("HNSWGraph: failed to allocate data_level0_");
         memset(data_level0_, 0, max_elements_ * size_per_element_);
 
-        // 分配高层指针数组
+        // 分配高层邻居链表指针数组（每个元素初始化为 nullptr，待实际分配高层时再填充）
         link_lists_ = (char **)malloc(sizeof(char *) * max_elements_);
         if (!link_lists_)
             throw std::runtime_error("HNSWGraph: failed to allocate link_lists_");
         memset(link_lists_, 0, sizeof(char *) * max_elements_);
 
-        // 预分配节点级锁
+        // 预分配节点级互斥锁数组（每个节点一把锁，保护其邻居列表的并发访问）
         link_locks_.resize(max_elements_);
         for (size_t i = 0; i < max_elements_; i++) {
             link_locks_[i] = std::make_unique<std::mutex>();
         }
 
-        // 预分配层级记录
+        // 预分配节点层级记录数组（默认层级为 0）
         element_levels_.resize(max_elements_, 0);
 
-        // 初始化距离函数
+        // 初始化距离计算函数（根据模板类型 T 和 CPU SIMD 能力自动选择最优实现）
         space_ = create_l2_space<T>(dim);
         dist_func_ = space_->get_dist_func();
         dist_func_param_ = space_->get_dist_func_param();
 
-        // 初始化 VisitedListPool
+        // 初始化访问标记列表对象池（基于 thread_local 的无锁实现）
         visited_pool_ = std::make_unique<VisitedListPool>(1, max_elements_);
     }
 
@@ -179,7 +179,7 @@ public:
         }
     }
 
-    // 禁止拷贝
+    // 禁止拷贝构造和拷贝赋值（包含大量原始指针和互斥锁，拷贝语义不明确）
     HNSWGraph(const HNSWGraph &) = delete;
     HNSWGraph &operator=(const HNSWGraph &) = delete;
 
@@ -187,99 +187,99 @@ public:
     // 内存访问辅助函数
     // ========================================================
 
-    // 获取 internal_id 对应的向量数据指针
+    // 获取指定 internal_id 对应的向量数据起始指针（指向 data_level0_ 中的对应位置）
     inline char *get_data_by_id(int internal_id) const
     {
         return data_level0_ + (size_t)internal_id * size_per_element_ + data_offset_;
     }
 
-    // 获取 internal_id 对应的外部 label (vid)
+    // 获取指定 internal_id 对应的外部标签 (vid)，从 data_level0_ 的 label 区域读取
     inline int get_external_label(int internal_id) const
     {
         return *(int *)(data_level0_ + (size_t)internal_id * size_per_element_ + label_offset_);
     }
 
-    // 设置 internal_id 对应的外部 label (vid)
+    // 设置指定 internal_id 的外部标签 (vid)，写入 data_level0_ 的 label 区域
     inline void set_external_label(int internal_id, int label)
     {
         *(int *)(data_level0_ + (size_t)internal_id * size_per_element_ + label_offset_) = label;
     }
 
-    // 获取 level 0 的邻居列表指针（包含 count 和 neighbor ids）
+    // 获取指定节点第 0 层的邻居列表指针（格式：[count | id_0 | id_1 | ...]）
     inline int *get_linklist0(int internal_id) const
     {
         return (int *)(data_level0_ + (size_t)internal_id * size_per_element_);
     }
 
-    // 获取高层的邻居列表指针
+    // 获取指定节点指定高层（level >= 1）的邻居列表指针
     inline int *get_linklist(int internal_id, int level) const
     {
         return (int *)(link_lists_[internal_id] + (size_t)(level - 1) * size_links_per_element_);
     }
 
-    // 获取邻居列表的邻居数量
+    // 读取邻居列表中的实际邻居数量（存储在数组第一个位置）
     inline int get_list_count(const int *data) const
     {
         return data[0];
     }
 
-    // 设置邻居列表的邻居数量
+    // 设置邻居列表中的实际邻居数量
     inline void set_list_count(int *data, int count)
     {
         data[0] = count;
     }
 
     // ========================================================
-    // 动态扩容
+    // 动态扩容：当元素数量达到容量上限时，自动将各数据结构扩容至新容量
     // ========================================================
     void resize_index(size_t new_max_elements)
     {
         if (new_max_elements <= max_elements_)
             return;
 
-        // 获取独占锁，暂停所有并发读操作（建图搜索、查询等）
+        // 获取独占写锁，阻塞所有并发读操作（包括建图搜索和查询）直到扩容完成
         std::unique_lock<std::shared_mutex> resize_lock(resize_mutex_);
 
-        // 双重检查：获取锁后再次确认是否需要扩容（可能其他线程已经扩容过了）
+        // 双重检查：获取锁后再次确认是否仍需扩容（可能其他线程已完成扩容）
         if (new_max_elements <= max_elements_)
             return;
 
-        // 扩容 data_level0_
+        // 扩容 data_level0_ 连续内存块（使用 realloc 原地扩展，避免复制）
         char *new_data = (char *)realloc(data_level0_, new_max_elements * size_per_element_);
         if (!new_data)
             throw std::runtime_error("HNSWGraph: failed to realloc data_level0_");
-        // 新区域清零
+        // 新增区域清零（确保新节点的邻居列表初始为空）
         memset(new_data + max_elements_ * size_per_element_, 0,
                (new_max_elements - max_elements_) * size_per_element_);
         data_level0_ = new_data;
 
-        // 扩容 link_lists_
+        // 扩容高层邻居链表指针数组
         char **new_links = (char **)realloc(link_lists_, sizeof(char *) * new_max_elements);
         if (!new_links)
             throw std::runtime_error("HNSWGraph: failed to realloc link_lists_");
         memset(new_links + max_elements_, 0, sizeof(char *) * (new_max_elements - max_elements_));
         link_lists_ = new_links;
 
-        // 扩容锁数组：追加新的 mutex，保留已有的
+        // 扩容节点级互斥锁数组：追加新的 mutex 实例，保留已有的不变
         size_t old_size = link_locks_.size();
         link_locks_.resize(new_max_elements);
         for (size_t i = old_size; i < new_max_elements; i++) {
             link_locks_[i] = std::make_unique<std::mutex>();
         }
 
-        // 扩容层级记录
+        // 扩容节点层级记录数组（新元素默认层级为 0）
         element_levels_.resize(new_max_elements, 0);
 
-        // 扩容 visited pool
+        // 同步更新访问标记列表池的容量（各线程下次使用时自动重建）
         visited_pool_->resize(new_max_elements);
 
         max_elements_ = new_max_elements;
     }
 
     // ========================================================
-    // 紧凑重排：只保留本地向量，远程邻居用负数编码 -(vid+1)
-    // 调用后 data_level0_ 只含本地向量，内存大幅缩小
-    // 邻居列表中 >=0 为本地 internal_id，<0 为远程 vid 编码
+    // 紧凑重排：仅保留本地向量，远程邻居以负数编码 -(vid+1) 表示。
+    // 执行后 data_level0_ 仅包含本地向量，内存占用大幅缩小。
+    // 邻居列表中：>= 0 为本地 internal_id，< 0 为远程 vid 的编码。
     // ========================================================
     void compact()
     {
@@ -428,6 +428,8 @@ public:
 
     // ========================================================
     // 随机层级生成
+    // 使用指数分布生成节点层级，公式：level = -ln(rand) * (1/ln(m))。
+    // 若设置了 limited_level >= 0，则层级不会超过该限制。
     // ========================================================
     int random_level()
     {
@@ -445,6 +447,8 @@ public:
 
     // ========================================================
     // 启发式邻居选择（对齐 hnswlib getNeighborsByHeuristic2）
+    // 从候选集中选择最多 M 个邻居，优先选择与已选邻居之间
+    // 距离较远的候选者，以保证邻居集的多样性和覆盖范围。
     // ========================================================
     void select_neighbors_heuristic(
         std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>, std::greater<std::pair<T, int>>> &top_candidates,
@@ -500,8 +504,11 @@ public:
     }
 
     // ========================================================
-    // connect_new_element - 建立双向连接
-    // 参考 hnswlib mutuallyConnectNewElement
+    // 双向连接建立（参考 hnswlib mutuallyConnectNewElement）
+    // 为新插入的节点建立双向邻居关系：
+    //   1. 新节点选取最多 M 个邻居（通过启发式选择）；
+    //   2. 为每个被选中的老节点建立反向连接，若老节点邻居数超过
+    //      Mcurmax（第 0 层为 2*M，其他层为 M），则通过启发式策略裁剪。
     // ========================================================
     void connect_new_element(
         int cur_c,  // 新节点的 internal_id
@@ -510,7 +517,9 @@ public:
     {
         int Mcurmax = (level == 0) ? max_m0_ : max_m_;
 
-        select_neighbors_heuristic(top_candidates, Mcurmax);
+        // 新插入节点统一选取 max_m_(即 M) 个邻居，与 hnswlib 保持一致。
+        // Mcurmax 仅用于限制已有节点因反向连接导致的邻居数膨胀（第 0 层上限为 2*M）。
+        select_neighbors_heuristic(top_candidates, max_m_);
 
         // 提取选中的邻居
         std::vector<int> selected_neighbors;
@@ -595,8 +604,10 @@ public:
     }
 
     // ========================================================
-    // search_layer_build - 建图搜索（加节点锁）
-    // 参考 hnswlib searchBaseLayer
+    // 建图搜索（参考 hnswlib searchBaseLayer）
+    // 以入口点为起点，在指定层级进行贪心搜索，返回最多 ef 个近邻候选。
+    // 建图期间使用节点级锁保护邻居列表的并发读写。
+    // 调用方（add_vector）已持有 resize_mutex_ 的共享锁，此处无需再获取。
     // ========================================================
     std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>, std::greater<std::pair<T, int>>>
     search_layer_build(const void *query_data, int ep_id, int ef, int level)
@@ -606,9 +617,9 @@ public:
         unsigned short *visited_array = vl->visited_array;
         unsigned short visited_tag = vl->cur_tag;
 
-        // 结果集 max-heap（距离最大的在堆顶，方便弹出最远的）
+        // 结果集（最大堆）：堆顶为距离最远的结果，方便弹出最远者保持堆大小 <= ef
         std::priority_queue<std::pair<T, int>> top_candidates;
-        // 候选集 min-heap（距离最小的在堆顶）
+        // 候选集（最小堆）：堆顶为距离最近的候选，优先展开最近的节点
         std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>,
                             std::greater<std::pair<T, int>>>
             candidate_set;
@@ -624,14 +635,17 @@ public:
         {
             auto cand = candidate_set.top();
 
-            if (cand.first > lower_bound)
+            // 终止条件：候选距离超过当前最远结果，且结果集已达到 ef_construction 容量。
+            // 仅在结果集填满后才允许终止，防止建图阶段因图稀疏而过早停止搜索。
+            if (cand.first > lower_bound && (int)top_candidates.size() == ef)
                 break;
 
             candidate_set.pop();
             int cur_node_id = cand.second;
 
-            // 建图搜索：先拷贝邻居 ID 到本地数组再释放锁，距离计算在锁外执行
-            int local_neighbors[256];  // 栈上分配，足够容纳 max_m0_ 个邻居（通常 <= 128）
+            // 建图搜索优化：先在节点锁内拷贝邻居 ID 到栈上数组，释放锁后再计算距离。
+            // 避免在持锁期间执行耗时的距离计算，减少锁竞争。
+            int local_neighbors[256];  // 栈上分配的本地缓冲区，足够容纳 max_m0_ 个邻居（通常 <= 128）
             int size;
             {
                 std::unique_lock<std::mutex> lock(*link_locks_[cur_node_id]);
@@ -646,7 +660,7 @@ public:
                 memcpy(local_neighbors, ll_cur + 1, size * sizeof(int));
             }  // 锁在此释放
 
-            // 距离计算在锁外进行，不阻塞其他线程
+            // 距离计算在锁外进行，不会阻塞其他线程对同一节点的访问
             for (int j = 0; j < size; j++)
             {
                 int candidate_id = local_neighbors[j];
@@ -686,7 +700,9 @@ public:
     }
 
     // ========================================================
-    // add_vector - 添加向量（参考 hnswlib addPoint）
+    // 添加向量（参考 hnswlib addPoint）
+    // 将一个新向量插入 HNSW 图中：生成随机层级，从最高层贪心导航到目标层，
+    // 然后在每层搜索近邻并建立双向连接。支持并发插入和自动扩容。
     // ========================================================
     void add_vector(int vid, const std::vector<T> &vec)
     {
@@ -849,28 +865,28 @@ public:
     }
 
     // ========================================================
-    // search_layer_query - 搜索一层（支持分布式 transfer + 预取优化）
-    // 统一使用 (dist, vid) 管理 candidates/results，不区分 remote/local
+    // 查询搜索——单层搜索（支持分布式 transfer 和 CPU 预取优化）
+    // 统一使用 (dist, vid) 管理 candidates 和 results，
     // 像在一张完整图上搜索：遇到远程 candidate 触发 transfer，
-    // 遇到远程邻居跳过（无法计算距离），不中断本地搜索
+    // 遇到远程邻居则跳过（无法计算距离），不中断本地搜索流程。
     // ========================================================
     void search_layer_query(const std::vector<T> &query_vector, int level, int ef, Payload<T> &payload)
     {
-        // query 与 add_vector 不会并发，无需加锁
+        // query 与 add_vector 不会并发执行（架构约束），无需加锁保护内存访问
         VisitedList *vl = visited_pool_->get_free_list();
         unsigned short *visited_array = vl->visited_array;
         unsigned short visited_tag = vl->cur_tag;
 
-        // compact 后的模式判断：local_vids_ 非空说明已 compact，邻居列表中 <0 为远程编码
+        // 判断 compact 状态：若 local_vids_ 非空，说明已执行 compact，邻居列表中 < 0 为远程编码
         bool is_compacted = !local_vids_.empty();
 
-        // 远程 vid visited 集合（compact 模式下用于快速判重）
+        // 远程 vid 的访问判重集合（compact 模式下使用，因为远程 vid 无法标记到 visited_array 中）
         std::unordered_set<int> remote_visited_set;
 
-        // 预分配 visited_vids 容量，减少 push_back 动态扩容开销
+        // 预分配 visited_vids 容量，减少搜索过程中 push_back 触发的动态扩容开销
         payload.reserve_visited(ef + 16);
 
-        // ---- 进入边界：恢复 visited 状态（vid → iid，冷路径 hash lookup）----
+        // ---- 进入边界处理：恢复跨节点传输的 visited 状态（vid → internal_id，冷路径 hash 查找） ----
         for (int vid : payload.visited_vids)
         {
             auto it = label_lookup_.find(vid);
@@ -880,7 +896,7 @@ public:
                 remote_visited_set.insert(vid);  // 远程 vid 无法标记到 visited_array
         }
 
-        // ---- 逐个 pop 处理 pending_vids ----
+        // ---- 逐个处理待处理的远程 vid 列表 ----
         // 从头部逐个取出 vid：在本地的计算距离加入堆并移除，不在本地的停下 transfer
         while (!payload.pending_vids.empty())
         {
@@ -916,8 +932,8 @@ public:
             }
         }
 
-        // ---- 统一使用 (dist, vid) 管理 candidates/results，不区分 remote/local ----
-        // payload.candidates/results 直接作为全局堆使用
+        // ---- 统一使用 (dist, vid) 管理全局搜索状态 ----
+        // payload.candidates 和 payload.results 直接作为全局候选集和结果集使用
 
         // 处理入口点：计算距离后加入 candidates/results
         if (payload.entry_point_id != -1)
@@ -955,7 +971,7 @@ public:
             }
         }
 
-        // ---- 搜索主循环：全程 (dist, vid)，像在一张完整图上搜索 ----
+        // ---- 搜索主循环：全程以 (dist, vid) 为单位，像在一张完整图上搜索 ----
         T lower_bound = payload.results.empty() ? std::numeric_limits<T>::max() : payload.results.top().first;
 
         while (!payload.candidates.empty())
@@ -1076,8 +1092,8 @@ public:
     }
 
     // ========================================================
-    // query - K近邻搜索
-    // 参考 hnswlib searchKnn
+    // K 近邻查询入口（参考 hnswlib searchKnn）
+    // 从最高层开始逐层搜索，支持分布式续搜和跨节点 transfer 机制。
     // ========================================================
     std::vector<int> query(const std::vector<T> &query_vector, Payload<T> &payload, int k)
     {
@@ -1140,7 +1156,7 @@ public:
     }
 
     // ========================================================
-    // 辅助方法：获取向量（供 Python 绑定使用）
+    // 获取单个向量（供 Python 绑定和调试使用）
     // ========================================================
     std::vector<T> get_vector(int vid) const
     {
@@ -1152,8 +1168,9 @@ public:
         return std::vector<T>(data, data + dim);
     }
 
-    // 获取邻居列表（供 Python 绑定使用）
-    // compact 后邻居列表中 <0 为远程 vid 编码 -(vid+1)，>=0 为本地 internal_id
+    // 获取指定节点在指定层级的邻居列表（供 Python 绑定和调试使用）。
+    // compact 后邻居列表中 < 0 为远程 vid 编码 -(vid+1)，>= 0 为本地 internal_id。
+    // 返回结果统一转换为外部 vid。
     std::vector<int> get_neighbors(int vid, int level) const
     {
         auto it = label_lookup_.find(vid);
@@ -1186,15 +1203,15 @@ public:
         return result;
     }
 
-    // 获取当前元素数量
+    // 获取当前图中的实际元素数量
     size_t get_cur_element_count() const
     {
         return cur_element_count_.load();
     }
 
     // ========================================================
-    // 兼容方法：获取所有向量（供 Cluster::partition 使用）
-    // 返回 vid -> vector<T> 的映射
+    // 获取所有向量数据（供 Cluster::partition 等上层调用）
+    // 返回 vid → vector<T> 的映射
     // ========================================================
     std::unordered_map<int, std::vector<T>> get_all_vectors() const
     {
@@ -1210,8 +1227,8 @@ public:
         return result;
     }
 
-    // 兼容方法：获取所有邻居关系（供 Cluster::partition 使用）
-    // 返回 level -> vid -> set(neighbor_vids)
+    // 获取所有节点的全层邻居关系（供 Cluster::partition 等上层调用）
+    // 返回 level → vid → set(neighbor_vids) 的三层嵌套映射
     std::unordered_map<int, std::unordered_map<int, std::unordered_set<int>>> get_all_neighbors() const
     {
         std::unordered_map<int, std::unordered_map<int, std::unordered_set<int>>> result;
@@ -1250,7 +1267,8 @@ public:
     }
 
     // ========================================================
-    // save - 二进制保存
+    // 二进制序列化保存
+    // 将 HNSW 图的所有参数、向量数据、邻居关系和分布式状态写入二进制文件。
     // ========================================================
     bool save(const std::string &filepath)
     {
@@ -1313,7 +1331,8 @@ public:
     }
 
     // ========================================================
-    // load - 二进制加载（静态方法）
+    // 二进制反序列化加载（静态方法）
+    // 从二进制文件中恢复完整的 HNSW 图结构，包括重建 label_lookup_ 映射。
     // ========================================================
     static HNSWGraph *load(const std::string &filepath)
     {

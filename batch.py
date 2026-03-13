@@ -33,7 +33,7 @@ PARAM_GRID = {
     "node_num":           [1],
     "partition_mode":     ["k-means"],
     "redundancy":         [2, 1, 0],
-    "m":                  [16, 24],
+    "m":                  [16, 24, 32],
     "ef_construction":    [200],
     "ef_search":          [16, 24, 32, 64],
     "limited_level":      [5],

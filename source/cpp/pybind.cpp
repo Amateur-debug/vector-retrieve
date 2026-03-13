@@ -1,6 +1,6 @@
-#include <pybind11/numpy.h> // 支持 numpy 数组
+#include <pybind11/numpy.h> // 提供 NumPy ndarray 与 C++ 数组的互转支持
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h> // 支持 STL 类型绑定
+#include <pybind11/stl.h> // 提供 STL 容器（vector、map 等）与 Python 类型的自动转换支持
 
 #include "cluster.h"
 #include "hnsw.h"
@@ -14,7 +14,7 @@ PYBIND11_MODULE(vector_retrieve, m)
 {
     m.doc() = "Pybind11 bindings for Cluster and related classes";
 
-    // 绑定 TransportConfig 配置类
+    // 绑定通信配置类，用于配置集群节点间的传输模式（TCP/RDMA）
     py::class_<TransportConfig>(m, "TransportConfig")
         .def(py::init<>())
         .def_readwrite("comm_mode", &TransportConfig::comm_mode)
@@ -35,7 +35,7 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("results", &Payload<float>::results)
         .def("topk_ids", &Payload<float>::topk_ids, py::arg("k"));
 
-    // 绑定 Payload 类（double 版本）
+    // 绑定 Payload 类（double 版本），用于在 Python 侧管理搜索中间状态
     py::class_<Payload<double>>(m, "PayloadDouble")
         .def(py::init<>())
         .def_property_readonly("size_bits", &Payload<double>::size_bits)
@@ -49,7 +49,7 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("results", &Payload<double>::results)
         .def("topk_ids", &Payload<double>::topk_ids, py::arg("k"));
 
-    // 绑定 HNSWGraph 类（float 版本）
+    // 绑定 HNSWGraph 类（float 版本），提供建图、查询、序列化等核心操作的 Python 接口
     py::class_<HNSWGraph<float>>(m, "HNSWGraphFloat")
         .def(py::init<int, int, int, int, int, size_t, unsigned int>(),
              py::arg("dim"), py::arg("m"), py::arg("ef_construction"), py::arg("ef_search"), py::arg("limited_level"), py::arg("max_elements") = 100000, py::arg("seed") = 123)
@@ -67,12 +67,12 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def("get_all_neighbors", &HNSWGraph<float>::get_all_neighbors)
         .def("get_cur_element_count", &HNSWGraph<float>::get_cur_element_count)
         .def("add_vector", &HNSWGraph<float>::add_vector, py::arg("vid"), py::arg("vec"),
-             py::call_guard<py::gil_scoped_release>())  // 释放GIL，允许真正的多线程并行
+             py::call_guard<py::gil_scoped_release>())  // 释放 Python GIL 锁，允许 C++ 层真正的多线程并行执行
         .def("query", &HNSWGraph<float>::query, py::call_guard<py::gil_scoped_release>())
         .def("save", &HNSWGraph<float>::save, py::arg("filepath"))
         .def_static("load", &HNSWGraph<float>::load, py::arg("filepath"), py::return_value_policy::take_ownership);
 
-    // 绑定 HNSWGraph 类（double 版本）
+    // 绑定 HNSWGraph 类（double 版本），接口与 float 版本完全一致
     py::class_<HNSWGraph<double>>(m, "HNSWGraphDouble")
         .def(py::init<int, int, int, int, int, size_t, unsigned int>(),
              py::arg("dim"), py::arg("m"), py::arg("ef_construction"), py::arg("ef_search"), py::arg("limited_level"), py::arg("max_elements") = 100000, py::arg("seed") = 123)
@@ -90,12 +90,12 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def("get_all_neighbors", &HNSWGraph<double>::get_all_neighbors)
         .def("get_cur_element_count", &HNSWGraph<double>::get_cur_element_count)
         .def("add_vector", &HNSWGraph<double>::add_vector, py::arg("vid"), py::arg("vec"),
-             py::call_guard<py::gil_scoped_release>())  // 释放GIL，允许真正的多线程并行
+             py::call_guard<py::gil_scoped_release>())  // 释放 Python GIL 锁，允许 C++ 层真正的多线程并行执行
         .def("query", &HNSWGraph<double>::query, py::call_guard<py::gil_scoped_release>())
         .def("save", &HNSWGraph<double>::save, py::arg("filepath"))
         .def_static("load", &HNSWGraph<double>::load, py::arg("filepath"), py::return_value_policy::take_ownership);
 
-    // 绑定 Node 类（float 版本）
+    // 绑定 Node 类（float 版本），布式集群中的单个节点，支持启动服务器、查询和添加向量
     py::class_<Node<float>>(m, "NodeFloat")
         .def(py::init<int, Cluster<float> *, HNSWGraph<float> *, bool>(),
              py::arg("node_id"), py::arg("cluster"), py::arg("local_hnsw"), py::arg("is_remote_node") = false)
@@ -114,7 +114,7 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("vid"), py::arg("vec"),
              py::call_guard<py::gil_scoped_release>());
 
-    // 绑定 Node 类（double 版本）
+    // 绑定 Node 类（double 版本），接口与 float 版本完全一致
     py::class_<Node<double>>(m, "NodeDouble")
         .def(py::init<int, Cluster<double> *, HNSWGraph<double> *, bool>(),
              py::arg("node_id"), py::arg("cluster"), py::arg("local_hnsw"), py::arg("is_remote_node") = false)
@@ -133,7 +133,7 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("vid"), py::arg("vec"),
              py::call_guard<py::gil_scoped_release>());
 
-    // 绑定 Cluster 类（float 版本）
+    // 绑定 Cluster 类（float 版本），提供集群级别的建图、查询、分区、序列化等操作
     py::class_<Cluster<float>, std::unique_ptr<Cluster<float>>>(m, "ClusterFloat")
         .def(py::init([](HNSWGraph<float> *hnsw, int node_num, const std::string &comm_mode,
                          const std::string &ib_dev, int ib_port, int gid_index) {
@@ -190,7 +190,7 @@ PYBIND11_MODULE(vector_retrieve, m)
             return std::unique_ptr<Cluster<float>>(Cluster<float>::load(filepath));
         }, py::arg("filepath"));
 
-    // 绑定 Cluster 类（double 版本）
+    // 绑定 Cluster 类（double 版本），接口与 float 版本完全一致
     py::class_<Cluster<double>, std::unique_ptr<Cluster<double>>>(m, "ClusterDouble")
         .def(py::init([](HNSWGraph<double> *hnsw, int node_num, const std::string &comm_mode,
                          const std::string &ib_dev, int ib_port, int gid_index) {
@@ -247,7 +247,7 @@ PYBIND11_MODULE(vector_retrieve, m)
             return std::unique_ptr<Cluster<double>>(Cluster<double>::load(filepath));
         }, py::arg("filepath"));
 
-    // 绑定 ClusterSDKClient 类（float 版本）
+    // 绑定 ClusterSDKClient 类（float 版本），提供远程集群的客户端操作接口
     py::class_<ClusterSDKClient<float>>(m, "ClusterSDKClientFloat")
         .def(py::init<const std::string &, int, const std::string &>(),
              py::arg("ip") = "127.0.0.1", py::arg("port") = 19000,
@@ -288,7 +288,7 @@ PYBIND11_MODULE(vector_retrieve, m)
             return json.attr("loads")(client.get_information());
         });
 
-    // 绑定 ClusterSDKClient 类（double 版本）
+    // 绑定 ClusterSDKClient 类（double 版本），接口与 float 版本完全一致
     py::class_<ClusterSDKClient<double>>(m, "ClusterSDKClientDouble")
         .def(py::init<const std::string &, int, const std::string &>(),
              py::arg("ip") = "127.0.0.1", py::arg("port") = 19000,

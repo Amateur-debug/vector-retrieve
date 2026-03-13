@@ -46,11 +46,11 @@ using json = nlohmann::json;
 
 using namespace std;
 
-// 注意: TcpConnectionPool 已迁移到 tcp_transport.h
-// g_connection_pool 已被 Cluster::transport 成员替代
+// 注意：TcpConnectionPool 已迁移到 tcp_transport.h 中统一管理
+// g_connection_pool 全局变量已被 Cluster::transport 成员变量替代
 
 template <typename T>
-class Cluster; // Forward declaration
+class Cluster; // 前向声明
 
 enum MessageType
 {
@@ -69,7 +69,7 @@ enum MessageType
     MSG_ADD_VECTOR_LOCAL = 12  // Reduce模式下直接添加到本地（避免递归路由）
 };
 
-// Buffer helper for serialization
+// 序列化/反序列化辅助缓冲区（用于 HNSW 图的网络传输、分布式同步和持久化存储）
 class Buffer
 {
 public:
@@ -150,7 +150,7 @@ public:
     }
 };
 
-// --- Serialization Helpers ---
+    // --- 序列化/反序列化辅助工具函数 ---
 
 template <typename T>
 void serialize_payload(Buffer &buf, Payload<T> &payload)
@@ -237,7 +237,7 @@ void serialize_hnsw(Buffer &buf, const HNSWGraph<T> *hnsw)
 {
     size_t cur_count = hnsw->cur_element_count_.load();
 
-    // 写入参数头
+    // 写入 HNSW 图的基本参数头（dim、m、ef_construction 等）
     buf.write_val(hnsw->dim);
     buf.write_val(hnsw->m);
     buf.write_val(hnsw->ef_construction);
@@ -259,10 +259,10 @@ void serialize_hnsw(Buffer &buf, const HNSWGraph<T> *hnsw)
 
     LOG_DEBUG_STREAM("Serializing HNSW: " << cur_count << " elements.");
 
-    // 写入 level 0 数据块
+    // 写入第 0 层连续内存块（邻居链表 + 向量数据 + label）
     buf.write(hnsw->data_level0_, cur_count * hnsw->size_per_element_);
 
-    // 写入高层链接数据
+    // 写入各节点的高层邻居链表数据
     for (size_t i = 0; i < cur_count; i++)
     {
         int link_level = hnsw->element_levels_[i];
@@ -302,7 +302,7 @@ HNSWGraph<T> *deserialize_hnsw(Buffer &buf)
     hnsw->entry_point_id = ep;
     hnsw->cur_element_count_ = (size_t)cur_count;
 
-    // 读取 level 0 数据块
+    // 读取第 0 层连续内存块（与写入格式对称）
     buf.read(hnsw->data_level0_, cur_count * hnsw->size_per_element_);
 
     // 读取高层链接数据并重建 label_lookup_
@@ -328,14 +328,15 @@ HNSWGraph<T> *deserialize_hnsw(Buffer &buf)
     return hnsw;
 }
 
-// 序列化 HNSW 子集：保留完整邻接关系，但只传子集向量数据（非本地向量数据清零）
+// 序列化 HNSW 子集：保留完整的邻接结构（图骨架），但只传输指定子集的向量数据
+// 非本地向量的数据区清零以节省带宽，接收方通过 local_vids_ 区分本地/远程节点
 template <typename T>
 void serialize_hnsw_subset(Buffer &buf, const HNSWGraph<T> *hnsw, const std::unordered_set<int> &local_vids)
 {
     size_t cur_count = hnsw->cur_element_count_.load();
     size_t vec_bytes = hnsw->dim * sizeof(T);
 
-    // 写入参数头（与 serialize_hnsw 一致）
+    // 写入参数头（格式与 serialize_hnsw 完全一致，确保反序列化时通用）
     buf.write_val(hnsw->dim);
     buf.write_val(hnsw->m);
     buf.write_val(hnsw->ef_construction);
@@ -357,17 +358,17 @@ void serialize_hnsw_subset(Buffer &buf, const HNSWGraph<T> *hnsw, const std::uno
 
     LOG_DEBUG_STREAM("Serializing HNSW subset: " << cur_count << " elements, " << local_vids.size() << " local vids.");
 
-    // 写入 level 0 骨架（links + label，跳过向量数据区）
+    // 写入第 0 层骨架数据（邻居链表 + label，跳过向量数据区以节省带宽）
     for (size_t i = 0; i < cur_count; i++)
     {
         char *elem_ptr = hnsw->data_level0_ + i * hnsw->size_per_element_;
-        // 写入 links 区域（完整保留邻接关系）
+        // 写入邻居链表区域（完整保留图的邻接结构）
         buf.write(elem_ptr, hnsw->links_level0_size_);
-        // 写入 label
+        // 写入节点的外部标签（vid）
         buf.write(elem_ptr + hnsw->label_offset_, sizeof(int));
     }
 
-    // 只写入本地向量数据：(internal_id, vec_data) 对
+    // 仅写入本地持有的向量数据：以 (internal_id, vec_data) 对的形式传输
     buf.write_val((uint64_t)local_vids.size());
     for (size_t i = 0; i < cur_count; i++)
     {
@@ -380,7 +381,7 @@ void serialize_hnsw_subset(Buffer &buf, const HNSWGraph<T> *hnsw, const std::uno
         }
     }
 
-    // 写入高层链接数据（完整保留）
+    // 写入各节点的高层邻居链表数据（完整保留图结构）
     for (size_t i = 0; i < cur_count; i++)
     {
         int link_level = hnsw->element_levels_[i];
@@ -393,7 +394,7 @@ void serialize_hnsw_subset(Buffer &buf, const HNSWGraph<T> *hnsw, const std::uno
     }
 }
 
-// 反序列化 HNSW 子集：读取骨架 + 稀疏本地向量数据
+// 反序列化 HNSW 子集：读取图结构骨架和稀疏分布的本地向量数据
 template <typename T>
 HNSWGraph<T> *deserialize_hnsw_subset(Buffer &buf)
 {
@@ -423,29 +424,29 @@ HNSWGraph<T> *deserialize_hnsw_subset(Buffer &buf)
     hnsw->entry_point_id = ep;
     hnsw->cur_element_count_ = (size_t)cur_count;
 
-    // 读取 level 0 骨架（links + label，向量数据区保留构造函数的零初始化）
+    // 读取第 0 层骨架（邻居链表 + label，向量数据区保持构造函数的零初始化状态）
     for (uint64_t i = 0; i < cur_count; i++)
     {
         char *elem_ptr = hnsw->data_level0_ + i * hnsw->size_per_element_;
-        // 读取 links
+        // 读取邻居链表数据
         buf.read(elem_ptr, hnsw->links_level0_size_);
-        // 读取 label（写入 label_offset_ 位置）
+        // 读取节点标签（写入 label_offset_ 对应位置）
         buf.read(elem_ptr + hnsw->label_offset_, sizeof(int));
     }
 
-    // 读取本地向量数据：(internal_id, vec_data) 对
+    // 读取本地向量数据：以 (internal_id, vec_data) 对的形式恢复
     uint64_t local_count = buf.read_val<uint64_t>();
     for (uint64_t i = 0; i < local_count; i++)
     {
         uint64_t internal_id = buf.read_val<uint64_t>();
         char *vec_ptr = hnsw->data_level0_ + internal_id * hnsw->size_per_element_ + hnsw->data_offset_;
         buf.read(vec_ptr, vec_bytes);
-        // 将对应 vid 加入 local_vids_
+        // 将该向量对应的 vid 加入 local_vids_ 集合，标记为本地持有
         int vid = hnsw->get_external_label((int)internal_id);
         hnsw->local_vids_.insert(vid);
     }
 
-    // 读取高层链接数据并重建 label_lookup_
+    // 读取高层邻居链表并重建 label_lookup_ 映射表
     for (uint64_t i = 0; i < cur_count; i++)
     {
         int link_level = buf.read_val<int>();
@@ -466,7 +467,7 @@ HNSWGraph<T> *deserialize_hnsw_subset(Buffer &buf)
 
     LOG_DEBUG_STREAM("Deserialized HNSW subset: " << cur_count << " elements, " << hnsw->local_vids_.size() << " local vids.");
 
-    // 紧凑重排：只保留本地向量，远程邻居用负数编码
+    // 紧凑重排：仅保留本地持有的向量，远程邻居以负数编码 -(vid+1) 表示
     hnsw->compact();
     LOG_DEBUG_STREAM("Compacted HNSW subset: " << hnsw->get_cur_element_count() << " local elements, max_elements=" << hnsw->max_elements_);
 
@@ -548,7 +549,7 @@ void deserialize_layer_replicate_flags(Buffer &buf, std::vector<bool> &flags)
     }
 }
 
-// Helper for sending all data
+    // 底层发送辅助函数：确保将指定大小的数据完整发送，处理部分发送的情况
 void send_all(int sock, const void *data, size_t size)
 {
     const char *ptr = static_cast<const char *>(data);
@@ -564,7 +565,7 @@ void send_all(int sock, const void *data, size_t size)
     }
 }
 
-// Helper for receiving all data
+    // 底层接收辅助函数：确保接收指定大小的完整数据，处理部分接收的情况
 void recv_all(int sock, void *data, size_t size)
 {
     char *ptr = static_cast<char *>(data);
@@ -580,7 +581,7 @@ void recv_all(int sock, void *data, size_t size)
     }
 }
 
-// --- End Serialization Helpers ---
+    // --- 序列化/反序列化辅助工具函数结束 ---
 
 template <typename T>
 class Node
@@ -606,10 +607,10 @@ public:
 
     std::atomic<int> active_handlers{0};
     
-    // 保护 local_hnsw 初始化的互斥锁
+    // 保护 local_hnsw 初始化过程的互斥锁（防止多线程同时初始化同一节点）
     std::mutex local_hnsw_mutex;
 
-    // 异步查询结果等待
+    // 异步查询结果的条件变量等待机制（配合互斥锁使用）
     struct PendingQuery {
         std::vector<int> results;
         Payload<T> payload;
@@ -619,7 +620,7 @@ public:
     std::condition_variable pending_queries_cv;
     std::unordered_map<int, PendingQuery> pending_queries;  // query_id -> PendingQuery
 
-    // 异步查询辅助方法
+    // 异步查询辅助方法：收集各节点返回的部分结果并执行合并操作
     void send_result_to_origin(int query_id, const std::vector<int>& results, Payload<T>& payload);
     void wait_for_async_result(int query_id, std::vector<int>& results, Payload<T>& payload);
 
@@ -629,11 +630,11 @@ public:
         port = 9500 + node_id;
     }
 
-    // 禁止拷贝
+    // 禁止拷贝构造和拷贝赋值（包含线程、socket 等不可拷贝资源）
     Node(const Node &) = delete;
     Node &operator=(const Node &) = delete;
 
-    // 移动构造函数
+    // 移动构造函数（支持在 STL 容器中存储 Node 对象）
     Node(Node &&other) noexcept
         : node_id(other.node_id), cluster(other.cluster), local_hnsw(other.local_hnsw),
           num_queries(other.num_queries), is_remote_node(other.is_remote_node),
@@ -677,16 +678,16 @@ public:
 
     int node_num = 4;
 
-    // 节点集合
+    // 集群中所有节点的状态集合（索引为节点编号）
     std::vector<Node<T>> nodes;
 
-    // 向量 -> 路由节点集合（按层）
+    // 向量到路由节点的映射关系（按层级组织，用于分布式查询时确定目标节点）
     std::vector<std::unordered_map<int, std::vector<int>>> vector_node_map;
 
-    // 模拟网络带宽 Mb/s
+    // 模拟网络带宽限制（单位：Mb/s，用于分布式场景下的性能评估和延迟模拟）
     double bandwidth = 1000.0;
 
-    // 分区模式
+    // 分区模式标识（控制向量在节点间的分配策略，如 round_robin、kmeans 等）
     std::string partition_mode;
     std::unordered_map<int, std::vector<int>> layer_config;
     std::vector<bool> layer_replicate_flags;
@@ -701,7 +702,7 @@ public:
 
     std::atomic<int> add_round_robin_counter{0};
 
-    // 通信中间层配置和实例
+    // 通信中间层的配置参数和传输层实例（支持 TCP 和 RDMA 两种传输模式）
     TransportConfig transport_config;
     std::shared_ptr<ITransport> transport;
 
@@ -718,17 +719,17 @@ public:
 
     ~Cluster()
     {
-        // 停止所有服务器并清理资源
+        // 停止所有节点的服务器线程并释放关联资源
         for (int i = 0; i < node_num; i++)
         {
             nodes[i].stop_server.store(true);
         }
-        // 通过通信中间层停止服务端
+        // 通过通信中间层向服务端发送停止信号
         if (transport)
         {
             transport->stop_server();
         }
-        // 关闭 SDK server socket
+        // 关闭 SDK 服务端的监听 socket，使 accept 循环优雅退出
         for (int i = 0; i < node_num; i++)
         {
             nodes[i].sockfd = -1;
@@ -738,7 +739,7 @@ public:
                 nodes[i].sdk_sockfd = -1;
             }
         }
-        // 等待所有服务器线程退出
+        // 阻塞等待所有服务器线程优雅退出
         for (int i = 0; i < node_num; i++)
         {
             if (nodes[i].server_thread.joinable())
@@ -750,7 +751,7 @@ public:
                 nodes[i].sdk_server_thread.join();
             }
         }
-        // 清理 local_hnsw（由 partition 创建）
+        // 释放各节点的 local_hnsw 资源（由 partition 方法动态创建，在析构时统一释放）
         for (int i = 0; i < node_num; i++)
         {
             if (nodes[i].local_hnsw != nullptr && nodes[i].local_hnsw != hnsw)
@@ -765,7 +766,7 @@ public:
     {
         if (is_reduce)
         {
-            // 轮询分配到各个节点
+            // 采用轮询策略将向量均匀分配到各个节点
             int target_node = add_round_robin_counter % node_num;
             add_round_robin_counter++;
 
@@ -792,7 +793,7 @@ public:
         }
     }
 
-    // 配置节点网络信息
+    // 配置指定节点的网络通信地址信息（IP、端口及远程标志）
     void set_node_info(int node_id, const std::string &ip, int port, bool is_remote)
     {
         if (node_id >= 0 && node_id < node_num)
@@ -800,12 +801,12 @@ public:
             nodes[node_id].ip_addr = ip;
             nodes[node_id].port = port;
             nodes[node_id].is_remote_node = is_remote;
-            // 节点间通信使用 port + NODE_PORT_OFFSET
+            // 节点间内部通信使用 port + NODE_PORT_OFFSET 作为端口（与客户端服务端口区分）
             transport->register_node(node_id, ip, port + Node<T>::NODE_PORT_OFFSET);
         }
     }
 
-    // 新增：启动指定节点的服务
+    // 启动指定节点的全部服务（包括节点间通信服务和客户端 SDK 服务）
     void start_node_server(int node_id)
     {
         if (node_id >= 0 && node_id < node_num)
@@ -814,7 +815,7 @@ public:
         }
     }
 
-    // 新增：阻塞等待指定节点的服务（用于 Worker 节点保持运行）
+    // 阻塞等待指定节点的服务线程退出（供 Worker 节点保持运行直到收到停止信号）
     void join_node_server(int node_id)
     {
         if (node_id >= 0 && node_id < node_num)
@@ -826,8 +827,8 @@ public:
         }
     }
 
-    // 简单 KMeans 实现（欧氏距离）
-    // 返回值：与 data 迭代顺序一致的 label 数组（labels[i] 对应 data 第 i 个元素）
+    // 简单 K-Means 聚类实现（基于欧氏距离，支持指定随机种子确保可复现性）
+    // 返回值：与 data 迭代顺序一致的聚类标签数组（labels[i] 对应 data 中第 i 个向量的簇编号）
     static std::vector<int> kmeans(const std::unordered_map<int, vector<T>> &data,
                                    int k, int max_iters = 100, int seed = 123)
     {
@@ -884,7 +885,8 @@ public:
             if (!changed)
                 break;
 
-            // recompute centers
+// recompute centers
+            // 重新计算各簇的质心向量
             std::vector<std::vector<T>> sums(k, std::vector<T>(dim, 0.0f));
             std::vector<int> counts(k, 0);
             for (int i = 0; i < n; i++)
@@ -922,7 +924,7 @@ public:
         auto all_vectors = hnsw->get_all_vectors();
 
         // 1. 找出所有有跨节点邻居的候选 boundary vectors（及其跨节点邻居数）
-        unordered_map<int, vector<pair<int, int>>> boundary_candidates; // node -> [(vid, cross_cnt)]
+    unordered_map<int, vector<pair<int, int>>> boundary_candidates; // 节点 -> [(vid, 跨节点连接数)]
         for (int node_id = 0; node_id < node_num; node_id++)
         {
             for (const auto &kv : local_vectors[node_id])
@@ -993,7 +995,7 @@ public:
         // 4. 重新分配local_vectors
         for (int vid : removed)
         {
-            unordered_map<int, int> counts; // node -> count
+    unordered_map<int, int> counts; // 节点 -> 分配的向量数量
             auto level_it = all_neighbors.find(0);
             std::unordered_set<int> neighbor_set;
             if (level_it != all_neighbors.end())
@@ -1061,7 +1063,7 @@ public:
         auto vectors = hnsw->get_all_vectors();
         auto neighbors = hnsw->get_all_neighbors();
 
-        // local_vectors: node_id -> map<vid, vector<T>>
+    // local_vectors: 节点编号 -> 该节点持有的向量数据映射 (vid -> vector<T>)
         vector<unordered_map<int, vector<T>>> local_vectors(node_num);
 
         vector_node_map.clear();
@@ -1149,7 +1151,7 @@ public:
                                               ? this->layer_replicate_flags[level]
                                               : false;
 
-                // split 模式才需要计算层内分区策略 (如 KMeans)
+    // split 模式才需要计算层内分区策略（如 KMeans 聚类）
                 std::unordered_map<int, int> vid_partition_map;
                 if (!is_replicate_level && layer_partition_mode == "k-means" && target_nodes.size() > 1)
                 {
@@ -1168,7 +1170,7 @@ public:
                         // 执行 KMeans (k 为目标节点数)
                         int k = std::min((int)target_nodes.size(), sub_cnt);
                         auto labels = kmeans(subset_vectors, k, 100, hnsw->seed);
-                        // kmeans() 内部用 for(const auto &kv : data) 迭代，
+    // kmeans() 内部通过 for(const auto &kv : data) 迭代，
                         // 此处用相同顺序遍历 subset_vectors 来对齐 labels
                         int i = 0;
                         for (const auto &kv : subset_vectors)
@@ -1200,7 +1202,7 @@ public:
                         }
                         if (!route_nodes.empty())
                         {
-                            // replicate层: 除第1份外的副本都算冗余
+    // replicate 层：除第 1 份外的副本均计入冗余数量
                             if (route_nodes.size() > 1)
                                 redundancy_num += (route_nodes.size() - 1);
                             vector_node_map[level][vid] = std::move(route_nodes);
@@ -1265,7 +1267,7 @@ public:
             }
         }
 
-        // redundancy: 将邻居复制到本地
+    // 冗余机制：将远程邻居的向量数据复制到本地节点
         if (redundancy > 0)
         {
             for (int r = 0; r < redundancy; r++)
@@ -1372,7 +1374,7 @@ public:
         }
         LOG_INFO_STREAM("[partition] Distributing subset HNSW graphs (full adjacency + local vectors only)");
 
-        // Distribute partitions to remote nodes
+    // 将分区数据分发到各远程工作节点
         for (int i = 0; i < node_num; i++)
         {
             Node<T> &target_node = nodes[i];
@@ -1400,7 +1402,7 @@ public:
                 transport->send_raw(sock, buf.data.data(), msg_size);
                 LOG_INFO_STREAM("[partition] Sent payload to node " << i << ", waiting for ACK...");
 
-                // Wait for ACK from worker node
+    // 等待工作节点返回确认响应
                 char ack = 0;
                 try
                 {
@@ -1422,7 +1424,7 @@ public:
                 {
                     LOG_DEBUG_STREAM("Warning: No ACK from node " << i);
                 }
-                // MSG_INIT_GRAPH 后服务器会关闭连接，不复用
+    // MSG_INIT_GRAPH 响应后服务器会关闭连接，此处不复用
                 transport->close_connection(sock);
             }
             else
@@ -1444,7 +1446,7 @@ public:
         {
             std::vector<pair<T, int>> all_results;
 
-            // Reduce模式查询：并行向所有节点发送查询并合并结果
+    // Reduce 模式查询：并行向所有节点发送查询请求并合并结果
             struct NodeQueryOutput
             {
                 std::vector<pair<T, int>> results;
@@ -1916,7 +1918,7 @@ public:
     }
 };
 
-// Implement Node methods
+// 以下为 Node 成员方法的实现
 template <typename T>
 Node<T>::~Node()
 {
@@ -2046,7 +2048,7 @@ void Node<T>::tcp_server_loop()
     }
 }
 
-// SDK 通信 accept 循环（纯 TCP 端口）
+// SDK 通信 accept 循环（纯 TCP 端口，不走传输层抽象）
 template <typename T>
 void Node<T>::sdk_server_loop()
 {
@@ -2520,7 +2522,7 @@ void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& result
         return;
     }
     
-    // origin_node 是远程节点，通过网络发送结果
+    // origin_node 在远程节点上，通过网络发送查询结果
     LOG_DEBUG_STREAM("[Node " << node_id << "] Sending result to remote origin node " << payload.origin_node_id);
     
     // 使用通信中间层获取连接
@@ -2675,7 +2677,7 @@ void Node<T>::add_vector(int vid, const std::vector<T> &vec)
             cluster->transport->send_raw(sock, &msg_size, sizeof(uint64_t));
             cluster->transport->send_raw(sock, buf.data.data(), msg_size);
 
-            // Wait for ACK
+    // 等待远程节点的确认响应
             char ack = 0;
             cluster->transport->recv_raw(sock, &ack, 1);
             // 持久连接：远程节点不会关闭连接，归还到连接池复用
