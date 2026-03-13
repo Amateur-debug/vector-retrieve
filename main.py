@@ -442,7 +442,8 @@ class VectorRetrieveRunner:
                 'port': 19000 + self.host_id
             }
 
-            if self.graph_path is not None and os.path.exists(self.graph_path):
+            if self.graph_path is not None and os.path.exists(self.graph_path) and not self.args.reduce:
+                # reduce 模式需要每个节点独立建图，不能复用统一的 HNSW 图
                 print(f"Loading HNSW graph via SDK from {self.graph_path}...")
                 sdk_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
                 if not sdk_client.connect():
