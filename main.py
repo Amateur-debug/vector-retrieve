@@ -497,7 +497,8 @@ class VectorRetrieveRunner:
             print("Loading cluster from disk...")
             self.cluster = Cluster.load(self.cluster_path)
             self.cluster.reset()
-        elif self.graph_path is not None and os.path.exists(self.graph_path):
+        elif self.graph_path is not None and os.path.exists(self.graph_path) and not self.args.reduce:
+            # reduce 模式需要每个节点独立建图，不能复用统一的 HNSW 图
             print("Loading HNSW graph from disk...")
             self.hnsw = HNSWGraph.load(self.graph_path)
             self.hnsw.ef_search = self.ef_search
