@@ -1200,6 +1200,9 @@ public:
                         }
                         if (!route_nodes.empty())
                         {
+                            // replicate层: 除第1份外的副本都算冗余
+                            if (route_nodes.size() > 1)
+                                redundancy_num += (route_nodes.size() - 1);
                             vector_node_map[level][vid] = std::move(route_nodes);
                         }
                     }

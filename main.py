@@ -12,6 +12,10 @@ from collections import defaultdict
 import sys
 sys.setrecursionlimit(5000) 
 
+class QueryStallError(Exception):
+    """查询进度停滞异常：当进度条超过指定时间没有变化时抛出"""
+    pass
+
 select_parser = argparse.ArgumentParser(add_help=False)
 select_parser.add_argument("--use_cpp", type=bool, default=True,  
                            help="whether to use the C++ implementation")
@@ -830,6 +834,11 @@ class VectorRetrieveRunner:
                 last_value = 0
                 last_update_time = time.time()
                 
+                # 用于检测进度停滞的变量
+                stall_last_value = 0
+                stall_check_time = time.time()
+                STALL_TIMEOUT = 10  # 进度停滞超时阈值（秒）
+
                 while any(t.is_alive() for t in threads):
                     current = progress_counter[0]
                     now = time.time()
@@ -841,6 +850,15 @@ class VectorRetrieveRunner:
                         pbar.set_postfix_str(f"{current_qps:.1f}")
                         last_value = current
                         last_update_time = now
+
+                    # 检测进度停滞：如果进度有变化则重置计时器
+                    if current != stall_last_value:
+                        stall_last_value = current
+                        stall_check_time = now
+                    elif now - stall_check_time >= STALL_TIMEOUT:
+                        print(f"\n[WARNING] Query progress stalled for {STALL_TIMEOUT}s (stuck at {current}/{total_queries}). Restarting main.py...")
+                        raise QueryStallError(f"Query progress stalled for {STALL_TIMEOUT}s")
+
                     time.sleep(0.1)
                 
                 # 等待所有线程完成
@@ -862,6 +880,32 @@ class VectorRetrieveRunner:
             
             # 包装query函数以显示进度
             stats_list = [None]
+
+            # 单线程模式的看门狗线程：检测进度停滞
+            stall_detected = [False]
+            def _single_thread_watchdog(counter, stall_flag):
+                STALL_TIMEOUT = 10
+                last_val = counter[0]
+                last_change_time = time.time()
+                while not stall_flag[0]:
+                    time.sleep(1)
+                    cur = counter[0]
+                    if cur != last_val:
+                        last_val = cur
+                        last_change_time = time.time()
+                    elif time.time() - last_change_time >= STALL_TIMEOUT:
+                        print(f"\n[WARNING] Single-thread query progress stalled for {STALL_TIMEOUT}s (stuck at {cur}/{total_queries}). Restarting main.py...")
+                        stall_flag[0] = True
+                        # 中断主线程
+                        import ctypes
+                        ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                            ctypes.c_ulong(threading.main_thread().ident),
+                            ctypes.py_object(QueryStallError)
+                        )
+                        return
+
+            watchdog_thread = threading.Thread(target=_single_thread_watchdog, args=(progress_counter, stall_detected), daemon=True)
+            watchdog_thread.start()
             
             with tqdm(total=total_queries, desc="Querying", unit="qry",
                       bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] QPS: {postfix}') as pbar:
@@ -920,6 +964,7 @@ class VectorRetrieveRunner:
 
                         # 更新进度条
                         pbar.update(1)
+                        progress_counter[0] = pbar.n  # 同步给看门狗线程
                         now = time.time()
                         if now - last_update_time >= 0.5:
                             elapsed = now - total_query_start_time
@@ -937,6 +982,8 @@ class VectorRetrieveRunner:
                     "distance_cnt": local_distance_cnt,
                 }
             
+            # 查询正常完成，停止看门狗线程
+            stall_detected[0] = True
             thread_stats = stats_list
 
         # 注意：每个进程自己的连接已经在 query() 函数结束时断开
@@ -1105,10 +1152,16 @@ class VectorRetrieveRunner:
         reduce_suffix = "-reduce" if self.args.reduce else ""
         layer_suffix = "-layer" if self.use_layer else ""
 
-        results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
-                        f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
-                        f"node{self.node_num}-{self.partition_mode}-red{self.redundancy}-"
-                        f"threads{self.num_query_threads}{distributed_suffix}{cpu_suffix}{reduce_suffix}{layer_suffix}.json")
+        if self.args.reduce:
+            results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
+                            f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
+                            f"node{self.node_num}-"
+                            f"threads{self.num_query_threads}{distributed_suffix}{cpu_suffix}{reduce_suffix}.json")
+        else:
+            results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
+                            f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
+                            f"node{self.node_num}-{self.partition_mode}-red{self.redundancy}-"
+                            f"threads{self.num_query_threads}{distributed_suffix}{cpu_suffix}{layer_suffix}.json")
 
         with open(results_path, 'w') as f:
             json.dump(stats, f, indent=4)
@@ -1220,5 +1273,11 @@ if __name__ == "__main__":
         runner.save_graph()  # 建图完成后立即保存
         thread_stats, total_query_time, qps = runner.run_queries()
         runner.save_results(thread_stats, total_query_time, qps)
+    except QueryStallError:
+        print("[RESTART] Cleaning up and restarting main.py...")
+        runner.cleanup_workers()
+        # 使用 os.execv 重新启动整个进程，保留原始命令行参数
+        python = sys.executable
+        os.execv(python, [python] + sys.argv)
     finally:
         runner.cleanup_workers()
