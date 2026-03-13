@@ -3,6 +3,8 @@ import numpy as np
 import time
 import weaviate
 import subprocess
+import json
+import os
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances, Reconfigure
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing  # [新增] 引入 multiprocessing
@@ -399,7 +401,7 @@ class WeaviateIndexer:
     def __init__(self, collection_name: str):
         self.collection_name = collection_name
 
-    def build(self, node_ip: str, data_path: str, m: int):
+    def build(self, node_ip: str, data_path: str, m: int, ef_construction: int = 200):
         print(f"\n=== 开始构建索引 (数据加载) ===")
         print(f"目标节点: {node_ip}, 数据: {data_path}")
         
@@ -416,14 +418,14 @@ class WeaviateIndexer:
                 print(f"删除旧集合: {self.collection_name}")
                 client.collections.delete(self.collection_name)
                 
-            print(f"创建新集合: {self.collection_name} (HNSW: m={m}, efConstruction=200, RF=1, Sharding=5)")
+            print(f"创建新集合: {self.collection_name} (HNSW: m={m}, efConstruction={ef_construction}, RF=1, Sharding=5)")
             client.collections.create(
                 name=self.collection_name,
                 vector_config=Configure.Vectors.self_provided(
                     vector_index_config=Configure.VectorIndex.hnsw(
                         distance_metric=VectorDistances.L2_SQUARED,
                         max_connections=m,
-                        ef_construction=200,
+                        ef_construction=ef_construction,
                     ),
                 ),
                 properties=[
@@ -622,6 +624,42 @@ class QueryBenchmark:
         print(f"客户端 QPS: {client_qps:.2f}")
         print(f"服务器 QPS: {global_qps:.2f}")
 
+        # 保存结果到 JSON 文件
+        results_dir = "./results"
+        os.makedirs(results_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        cpu_suffix = f"-cpus{self.args.num_cpu}" if self.args.num_cpu != 0 else ""
+
+        stats = {
+            "hnsw_params": {
+                "data_name": self.args.data_name,
+                "m": self.args.m,
+                "ef_construction": self.args.ef_construction,
+                "ef_search": self.args.ef_search,
+            },
+            "cluster_params": {
+                "node_num": len(self.active_nodes),
+            },
+            "num_queries": len(self.query_vectors),
+            "k": self.args.k,
+            "qps": round(client_qps, 2),
+            f"avg_recall@{self.args.k}": round(avg_recall, 4),
+            "recall": [round(r, 4) for r in recalls],
+        }
+
+        results_path = (
+            f"{results_dir}/results-{self.args.data_name}-m{self.args.m}-"
+            f"efc{self.args.ef_construction}-efs{self.args.ef_search}-node{len(self.active_nodes)}-"
+            f"threads{self.args.num_query_threads}{cpu_suffix}-{timestamp}.json"
+        )
+
+        with open(results_path, 'w') as f:
+            json.dump(stats, f, indent=4)
+
+        print(f"\n{'=' * 50}")
+        print(f"Results saved: {os.path.abspath(results_path)}")
+        print(f"{'=' * 50}\n")
+
 
 def main(args):
     active_nodes = ALL_NODES[:args.node_num]
@@ -650,7 +688,7 @@ def main(args):
         # 2. 如果指定了建图标志，执行数据加载
         if args.build:
             indexer = WeaviateIndexer(args.data_name)
-            indexer.build(active_ips[0], args.data_path, args.m)
+            indexer.build(active_ips[0], args.data_path, args.m, args.ef_construction)
 
         # 3. 加载查询数据
         print(f"正在加载查询向量: {args.query_path}")
@@ -690,6 +728,7 @@ if __name__ == "__main__":
 
     # HNSW 参数 (用于建图)
     parser.add_argument("--m", type=int, default=16, help="HNSW max connections")
+    parser.add_argument("--ef_construction", type=int, default=200, help="Size of the dynamic candidate list for construction")
 
     # HNSW 参数 (用于查询)
     parser.add_argument("--ef_search", type=int, default=16, help="HNSW ef_search parameter. -1 to use default.")
