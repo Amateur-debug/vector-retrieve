@@ -1274,9 +1274,13 @@ if __name__ == "__main__":
         thread_stats, total_query_time, qps = runner.run_queries()
         runner.save_results(thread_stats, total_query_time, qps)
     except QueryStallError:
-        print("[RESTART] Cleaning up and restarting main.py...")
+        print("[RESTART] Query stalled. Cleaning up and restarting main.py...")
         runner.cleanup_workers()
-        # 使用 os.execv 重新启动整个进程，保留原始命令行参数
+        python = sys.executable
+        os.execv(python, [python] + sys.argv)
+    except RuntimeError as e:
+        print(f"[RESTART] RuntimeError: {e}. Cleaning up and restarting main.py...")
+        runner.cleanup_workers()
         python = sys.executable
         os.execv(python, [python] + sys.argv)
     finally:
