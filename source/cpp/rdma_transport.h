@@ -52,6 +52,10 @@ struct RdmaQPInfo {
 struct RdmaConnection {
     struct ibv_qp *qp = nullptr;      // RDMA Queue Pair
 
+    // 每连接独立的完成队列（避免多连接并发时 poll 到其他连接的 completion）
+    struct ibv_cq *send_cq = nullptr;
+    struct ibv_cq *recv_cq = nullptr;
+
     // 发送缓冲区及其 Memory Region 注册
     void *send_buf = nullptr;
     struct ibv_mr *send_mr = nullptr;
@@ -95,8 +99,6 @@ private:
     // RDMA 设备上下文（所有连接共享同一个设备上下文）
     struct ibv_context *ib_ctx = nullptr;
     struct ibv_pd *pd = nullptr;
-    struct ibv_cq *send_cq = nullptr;
-    struct ibv_cq *recv_cq = nullptr;
     uint8_t ib_port = 1;
     int gid_index = -1;
     
@@ -122,14 +124,23 @@ private:
         return sock;
     }
     
-    // 创建 RDMA Queue Pair（使用可靠连接模式 RC）
-    struct ibv_qp* create_qp() {
-        if (!pd || !send_cq || !recv_cq) return nullptr;
+    // 创建每连接独立的 CQ 对和 RDMA Queue Pair（使用可靠连接模式 RC）
+    bool create_qp_with_cq(std::shared_ptr<RdmaConnection> conn) {
+        if (!pd || !ib_ctx) return false;
+        
+        // 为每个连接创建独立的 send/recv CQ，避免多线程并发 poll 时拿到其他连接的 completion
+        conn->send_cq = ibv_create_cq(ib_ctx, RDMA_CQ_SIZE, nullptr, nullptr, 0);
+        conn->recv_cq = ibv_create_cq(ib_ctx, RDMA_CQ_SIZE, nullptr, nullptr, 0);
+        if (!conn->send_cq || !conn->recv_cq) {
+            if (conn->send_cq) { ibv_destroy_cq(conn->send_cq); conn->send_cq = nullptr; }
+            if (conn->recv_cq) { ibv_destroy_cq(conn->recv_cq); conn->recv_cq = nullptr; }
+            return false;
+        }
         
         struct ibv_qp_init_attr qp_init_attr;
         memset(&qp_init_attr, 0, sizeof(qp_init_attr));
-        qp_init_attr.send_cq = send_cq;
-        qp_init_attr.recv_cq = recv_cq;
+        qp_init_attr.send_cq = conn->send_cq;
+        qp_init_attr.recv_cq = conn->recv_cq;
         qp_init_attr.qp_type = IBV_QPT_RC;
         qp_init_attr.cap.max_send_wr = RDMA_MAX_WR;
         qp_init_attr.cap.max_recv_wr = RDMA_MAX_WR;
@@ -137,7 +148,13 @@ private:
         qp_init_attr.cap.max_recv_sge = RDMA_MAX_SGE;
         qp_init_attr.cap.max_inline_data = RDMA_MAX_INLINE;
         
-        return ibv_create_qp(pd, &qp_init_attr);
+        conn->qp = ibv_create_qp(pd, &qp_init_attr);
+        if (!conn->qp) {
+            ibv_destroy_cq(conn->send_cq); conn->send_cq = nullptr;
+            ibv_destroy_cq(conn->recv_cq); conn->recv_cq = nullptr;
+            return false;
+        }
+        return true;
     }
     
     // 将 QP 状态从 RESET 转换为 INIT（设置端口、访问权限等基本属性）
@@ -250,10 +267,9 @@ private:
             return nullptr;
         }
         
-        // 步骤 2：创建 RDMA Queue Pair
-        conn->qp = create_qp();
-        if (!conn->qp) {
-            LOG_DEBUG_STREAM("[RDMA] 创建QP失败");
+        // 步骤 2：创建独立 CQ 和 RDMA Queue Pair
+        if (!create_qp_with_cq(conn)) {
+            LOG_DEBUG_STREAM("[RDMA] 创建QP/CQ失败");
             close(conn->aux_sock);
             return nullptr;
         }
@@ -334,19 +350,29 @@ private:
         if (conn->send_mr) ibv_dereg_mr(conn->send_mr);
         if (conn->recv_mr) ibv_dereg_mr(conn->recv_mr);
         if (conn->qp) ibv_destroy_qp(conn->qp);
+        if (conn->send_cq) ibv_destroy_cq(conn->send_cq);
+        if (conn->recv_cq) ibv_destroy_cq(conn->recv_cq);
         if (conn->send_buf) free(conn->send_buf);
         if (conn->recv_buf) free(conn->recv_buf);
         if (conn->aux_sock >= 0) close(conn->aux_sock);
         return nullptr;
     }
     
-    // 销毁 RDMA 连接，按顺序释放所有资源：QP -> MR -> 缓冲区 -> TCP 辅助通道
+    // 销毁 RDMA 连接，按顺序释放所有资源：QP -> CQ -> MR -> 缓冲区 -> TCP 辅助通道
     void destroy_connection(std::shared_ptr<RdmaConnection> conn) {
         if (!conn) return;
         
         if (conn->qp) {
             ibv_destroy_qp(conn->qp);
             conn->qp = nullptr;
+        }
+        if (conn->send_cq) {
+            ibv_destroy_cq(conn->send_cq);
+            conn->send_cq = nullptr;
+        }
+        if (conn->recv_cq) {
+            ibv_destroy_cq(conn->recv_cq);
+            conn->recv_cq = nullptr;
         }
         if (conn->send_mr) {
             ibv_dereg_mr(conn->send_mr);
@@ -376,12 +402,9 @@ public:
     
     // 初始化 RDMA 设备
     bool init(struct ibv_context *ctx, struct ibv_pd *protection_domain,
-              struct ibv_cq *scq, struct ibv_cq *rcq,
               uint8_t port, int gid_idx) {
         ib_ctx = ctx;
         pd = protection_domain;
-        send_cq = scq;
-        recv_cq = rcq;
         ib_port = port;
         gid_index = gid_idx;
         return true;
@@ -491,9 +514,8 @@ public:
         conn->node_id = -1;
         conn->aux_sock = client_fd;
         
-        conn->qp = create_qp();
-        if (!conn->qp) {
-            LOG_DEBUG_STREAM("[RDMA Server] 创建QP失败");
+        if (!create_qp_with_cq(conn)) {
+            LOG_DEBUG_STREAM("[RDMA Server] 创建QP/CQ失败");
             return nullptr;
         }
         
@@ -567,6 +589,8 @@ public:
         if (conn->send_mr) ibv_dereg_mr(conn->send_mr);
         if (conn->recv_mr) ibv_dereg_mr(conn->recv_mr);
         if (conn->qp) ibv_destroy_qp(conn->qp);
+        if (conn->send_cq) ibv_destroy_cq(conn->send_cq);
+        if (conn->recv_cq) ibv_destroy_cq(conn->recv_cq);
         if (conn->send_buf) free(conn->send_buf);
         if (conn->recv_buf) free(conn->recv_buf);
         return nullptr;
@@ -586,8 +610,6 @@ private:
     // RDMA 设备资源
     struct ibv_context *ib_ctx = nullptr;
     struct ibv_pd *pd = nullptr;
-    struct ibv_cq *send_cq = nullptr;
-    struct ibv_cq *recv_cq = nullptr;
     uint8_t ib_port = 1;
     int gid_index = -1;
     
@@ -667,11 +689,11 @@ private:
             return -1;
         }
         
-        // 等待发送完成
+        // 等待发送完成（使用连接独立的 send_cq）
         struct ibv_wc wc;
         int polls = 0;
         while (polls == 0) {
-            polls = ibv_poll_cq(send_cq, 1, &wc);
+            polls = ibv_poll_cq(conn->send_cq, 1, &wc);
             if (polls < 0) {
                 LOG_DEBUG_STREAM("[RDMA] ibv_poll_cq(send) 失败");
                 return -1;
@@ -690,11 +712,11 @@ private:
     int rdma_recv(std::shared_ptr<RdmaConnection> conn, void* data, size_t max_size, size_t &actual_size) {
         if (!conn || !conn->is_valid || !conn->recv_mr) return -1;
         
-        // 等待接收完成
+        // 等待接收完成（使用连接独立的 recv_cq）
         struct ibv_wc wc;
         int polls = 0;
         while (polls == 0) {
-            polls = ibv_poll_cq(recv_cq, 1, &wc);
+            polls = ibv_poll_cq(conn->recv_cq, 1, &wc);
             if (polls < 0) {
                 LOG_DEBUG_STREAM("[RDMA] ibv_poll_cq(recv) 失败");
                 return -1;
@@ -794,16 +816,8 @@ private:
             return false;
         }
         
-        // 创建完成队列
-        send_cq = ibv_create_cq(ib_ctx, RDMA_CQ_SIZE, nullptr, nullptr, 0);
-        recv_cq = ibv_create_cq(ib_ctx, RDMA_CQ_SIZE, nullptr, nullptr, 0);
-        if (!send_cq || !recv_cq) {
-            LOG_DEBUG_STREAM("[RDMA] 创建完成队列失败");
-            return false;
-        }
-        
-        // 初始化连接池
-        conn_pool.init(ib_ctx, pd, send_cq, recv_cq, ib_port, gid_index);
+        // 初始化连接池（CQ 由每个连接独立创建，不再使用全局共享 CQ）
+        conn_pool.init(ib_ctx, pd, ib_port, gid_index);
         
         LOG_DEBUG_STREAM("[RDMA] 设备初始化成功, port=" << (int)ib_port << ", gid_index=" << gid_index);
         return true;
@@ -828,9 +842,7 @@ public:
             active_conns.clear();
         }
         
-        // 释放 RDMA 资源
-        if (send_cq) { ibv_destroy_cq(send_cq); send_cq = nullptr; }
-        if (recv_cq) { ibv_destroy_cq(recv_cq); recv_cq = nullptr; }
+        // 释放 RDMA 资源（CQ 已随各连接独立释放，无需在此处理）
         if (pd) { ibv_dealloc_pd(pd); pd = nullptr; }
         if (ib_ctx) { ibv_close_device(ib_ctx); ib_ctx = nullptr; }
     }
