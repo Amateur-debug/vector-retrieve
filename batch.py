@@ -127,18 +127,6 @@ def get_graph_path(data_name, params):
 
 
 def get_result_path(dataset_name, params):
-<<<<<<< HEAD
-    """生成结果文件路径"""
-    filename = f"results-{dataset_name}-m{params['m']}-efc{params['ef_construction']}-efs{params['ef_search']}-ll{params['limited_level']}-node{params['node_num']}-{params['partition_mode']}-red{params['redundancy']}-threads{params['num_query_threads']}"
-    if params.get('distributed'):
-        filename += "-distributed"
-    if params.get('reduce'):
-        filename += "-reduce"
-    if params.get('layer'):
-        filename += "-layer"
-    num_cpu = params.get('num_cpu', 8)
-    filename += f"-cpus{num_cpu}.json"
-=======
     """生成结果文件路径（与 main.py 的 save_results 对齐）"""
     distributed_suffix = "-distributed" if params.get('distributed') else ""
     cpus = params.get('cpus', 8)
@@ -158,7 +146,6 @@ def get_result_path(dataset_name, params):
                     f"node{params['node_num']}-{params['partition_mode']}-red{params['redundancy']}-"
                     f"threads{params['num_query_threads']}{distributed_suffix}{cpu_suffix}{layer_suffix}.json")
 
->>>>>>> 5d4725834c167443e8e6746b14d61589a3713f51
     return os.path.join(".", "results", "cpp", filename)
 
 
