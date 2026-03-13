@@ -2,6 +2,7 @@ import subprocess
 import os
 import itertools
 import time
+import argparse
 import concurrent.futures
 
 SCRIPT_PATH = "main.py"
@@ -123,16 +124,25 @@ def get_graph_path(data_name, params):
 
 
 def get_result_path(dataset_name, params):
-    """生成结果文件路径"""
-    filename = f"results-{dataset_name}-m{params['m']}-efc{params['ef_construction']}-efs{params['ef_search']}-ll{params['limited_level']}-node{params['node_num']}-{params['partition_mode']}-red{params['redundancy']}-threads{params['num_query_threads']}"
-    if params.get('distributed'):
-        filename += "-distributed"
-    if params.get('reduce'):
-        filename += "-reduce"
-    if params.get('layer'):
-        filename += "-layer"
+    """生成结果文件路径（与 main.py 的 save_results 对齐）"""
+    distributed_suffix = "-distributed" if params.get('distributed') else ""
     cpus = params.get('cpus', 8)
-    filename += f"-cpus{cpus}.json"
+    cpu_suffix = f"-cpus{cpus}" if params.get('distributed') and cpus != 0 else ""
+
+    if params.get('reduce'):
+        # reduce 模式：无 partition_mode、redundancy、layer
+        filename = (f"results-{dataset_name}-m{params['m']}-efc{params['ef_construction']}-"
+                    f"efs{params['ef_search']}-ll{params['limited_level']}-"
+                    f"node{params['node_num']}-"
+                    f"threads{params['num_query_threads']}{distributed_suffix}{cpu_suffix}-reduce.json")
+    else:
+        # 非 reduce 模式：包含 partition_mode、redundancy，可选 layer
+        layer_suffix = "-layer" if params.get('layer') else ""
+        filename = (f"results-{dataset_name}-m{params['m']}-efc{params['ef_construction']}-"
+                    f"efs{params['ef_search']}-ll{params['limited_level']}-"
+                    f"node{params['node_num']}-{params['partition_mode']}-red{params['redundancy']}-"
+                    f"threads{params['num_query_threads']}{distributed_suffix}{cpu_suffix}{layer_suffix}.json")
+
     return os.path.join(".", "results", "cpp", filename)
 
 
@@ -159,8 +169,14 @@ def run_batch():
     combinations_reduce = list(itertools.product(*param_grid_reduce.values()))
     combinations_normal = list(itertools.product(*param_grid_normal.values()))
 
+    # 解析命令行参数
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--skip', action='store_true', help='跳过已有结果文件的任务')
+    batch_args = parser.parse_args()
+
     tasks = []
     built_graphs = set()  # 记录本次运行中已构建的图
+    skipped = 0
 
     for dataset in DATASETS:
         data_path = os.path.join(DATASET_ROOT, dataset['base'])
@@ -189,11 +205,26 @@ def run_batch():
                 cmd.append("--save")
                 description = f"Dataset: {dataset['name']} | Build graph | Params: {params}"
 
+            # --skip 模式：跳过已有结果的任务
+            if batch_args.skip:
+                result_path = get_result_path(dataset['name'], params)
+                if os.path.exists(result_path):
+                    try:
+                        with open(result_path, 'r') as f:
+                            content = f.read().strip()
+                            if content and content != '{}':
+                                skipped += 1
+                                continue
+                    except Exception:
+                        pass
+
             tasks.append((cmd, description, dataset, params))
 
     total_experiments = len(tasks)
     print("=" * 60)
-    print(f"Total experiments: {total_experiments}")
+    if batch_args.skip:
+        print(f"Skipped experiments (results exist): {skipped}")
+    print(f"Total experiments to run: {total_experiments}")
     print(f"Parallel workers: {MAX_WORKERS}")
     print("=" * 60)
 
