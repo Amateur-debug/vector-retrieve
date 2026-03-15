@@ -1,1 +1,16 @@
-/volumes
+# === 白名单模式 ===
+*
+
+# === 白名单文件夹 ===
+
+
+# === 白名单文件 ===
+!/*.md
+!/*.yaml
+!/*.yml
+!/*.py
+!/*.sh
+
+!**/.gitignore
+!**/.gitmodules
+!**/.gitattributes

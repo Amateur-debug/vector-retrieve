@@ -1,16 +1,23 @@
 
-**/.vscode
+# === 白名单模式 ===
+*
 
-**/__pycache__
+# === 白名单文件夹 ===
+!/source/
+!/dataset/
+!/weaviate/
+!/CoTra/
 
-/dataset/*
-!/dataset/siftsmall.tar.gz
+# === 白名单文件 ===
+!/*.md
+!/*.yaml
+!/*.yml
+!/*.py
+!/CMakeLists.txt
 
-/results
-/save
-/build
-/plot
+!**/.gitignore
+!**/.gitmodules
+!**/.gitattributes
 
-**/*.log
-
-/vector-retrieve.code-workspace
+# === 黑名单文件夹 ===
+**/__pycache__/
