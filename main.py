@@ -450,6 +450,8 @@ class VectorRetrieveRunner:
                     raise RuntimeError("Failed to connect SDK to local node for load_hnsw")
                 try:
                     sdk_client.load_hnsw(self.graph_path)
+                    # 图加载后通过专用接口覆盖运行时查询参数，避免依赖 load 时的历史参数。
+                    sdk_client.set_hnsw_params(ef_search=self.ef_search)
                 finally:
                     sdk_client.disconnect()
             else:

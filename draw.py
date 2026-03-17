@@ -4,292 +4,747 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 import json
 import re
+import numpy as np
+
+
+# ============================================================
+# 工具函数
+# ============================================================
+
+def load_json(path):
+    with open(path, 'r') as f:
+        return json.load(f)
+
+
+def get_param_value(data, key):
+    """在 JSON 结构中查找参数"""
+    if key in data:
+        return data[key]
+    if 'hnsw_params' in data and key in data['hnsw_params']:
+        return data['hnsw_params'][key]
+    if 'cluster_params' in data and key in data['cluster_params']:
+        return data['cluster_params'][key]
+    return None
+
+
+def parse_filename_params(filename):
+    """从结果文件名中解析参数，返回参数字典"""
+    params = {}
+
+    match = re.search(r'results-([a-z]+?)-m', filename)
+    if match:
+        params['data_name'] = match.group(1)
+
+    match = re.search(r'-m(\d+)-', filename)
+    if match:
+        params['m'] = int(match.group(1))
+
+    match = re.search(r'-efc(\d+)-', filename)
+    if match:
+        params['ef_construction'] = int(match.group(1))
+
+    match = re.search(r'-efs(\d+)-', filename)
+    if match:
+        params['ef_search'] = int(match.group(1))
+
+    match = re.search(r'-ll(\d+)-', filename)
+    if match:
+        params['limited_level'] = int(match.group(1))
+
+    match = re.search(r'-node(\d+)-', filename)
+    if match:
+        params['node_num'] = int(match.group(1))
+
+    match = re.search(r'-node\d+-([a-z_-]+)-red', filename)
+    if match:
+        params['partition_mode'] = match.group(1)
+
+    match = re.search(r'-red(\d+)', filename)
+    if match:
+        params['redundancy'] = int(match.group(1))
+
+    match = re.search(r'-threads(\d+)', filename)
+    if match:
+        params['threads'] = int(match.group(1))
+
+    params['reduce'] = 'reduce' in filename
+    params['distributed'] = 'distributed' in filename
+    params['layer'] = filename.rstrip('.json').endswith('-layer')
+
+    return params
+
+
+def find_matching_file(directory, target_params):
+    """从目录中找到匹配参数的第一个 JSON 文件"""
+    if not os.path.isdir(directory):
+        return None
+
+    for filename in sorted(os.listdir(directory)):
+        if not filename.endswith('.json'):
+            continue
+
+        file_params = parse_filename_params(filename)
+
+        match = True
+        for key, value in target_params.items():
+            if value is None:
+                continue
+            if file_params.get(key) != value:
+                match = False
+                break
+
+        if match:
+            return os.path.join(directory, filename)
+
+    return None
+
+
+def classify_mode(filepath, data=None):
+    """根据文件名判断实验模式，并生成包含分区方式的标签。
+
+    返回 (mode_key, label):
+      - reduce:   ('reduce', 'Reduce')
+      - no-layer: ('no-layer', 'No-Layer (k-means)')
+      - layer:    ('layer', 'Layer (k-means)')
+    """
+    basename = os.path.basename(filepath)
+    if 'reduce' in basename:
+        return 'reduce', 'Reduce'
+
+    if data:
+        cp = data.get('cluster_params', {})
+    else:
+        cp = {}
+
+    if basename.rstrip('.json').endswith('-layer'):
+        layer_pm = cp.get('layer_partition_mode', 'unknown')
+        return 'layer', f'Layer ({layer_pm})'
+    else:
+        pm = cp.get('partition_mode', 'unknown')
+        return 'no-layer', f'No-Layer ({pm})'
+
+
+def get_y_value(data, y_key, data_name):
+    """根据 y_key 从 data 中提取 y 值（支持自定义派生指标）"""
+    if y_key == "red_per_node":
+        redundancy_num = get_param_value(data, "redundancy_num")
+        node_num = get_param_value(data, "node_num")
+        return redundancy_num / node_num if node_num else 0
+    elif y_key == "data_per_node":
+        total_data = {'siftsmall': 10000, 'sift': 1000000, 'gist': 1000000, 'deep': 1000000}.get(data_name, 0)
+        total_data_redundant = total_data + (get_param_value(data, "redundancy_num") or 0)
+        node_num = get_param_value(data, "node_num")
+        return total_data_redundant / node_num if node_num else 0
+    else:
+        return get_param_value(data, y_key)
+
+
+def make_output_filename(prefix, args, extra_keys=None):
+    """生成输出文件名"""
+    parts = [
+        prefix,
+        f"{args.x}-{args.y}-{args.data_name}",
+        f"m{args.m}-efc{args.ef_construction}-ll{args.limited_level}",
+    ]
+    if args.node_num is not None:
+        parts.append(f"node{args.node_num}")
+    if args.redundancy is not None:
+        parts.append(f"red{args.redundancy}")
+    if args.threads is not None:
+        parts.append(f"threads{args.threads}")
+    if getattr(args, 'recall', None) is not None:
+        parts.append(f"recall{args.recall}")
+    if extra_keys:
+        parts.extend(extra_keys)
+    return "-".join(parts) + ".pdf"
+
+
+def setup_legend(ax, n_labels):
+    """图例统一放在图上方，水平排列"""
+    ax.legend(fontsize=10, loc='lower center', bbox_to_anchor=(0.5, 1.02),
+              ncol=n_labels, frameon=True, fancybox=True)
+
+
+RECALL_BUCKET_SIZE = 0.05
+
+
+def is_recall_x(x_key):
+    """判断 x 轴是否为 recall 类指标"""
+    return 'recall' in x_key.lower()
+
+
+def snap_to_recall_bucket(val):
+    """将 recall 值对齐到最近的 0.05 档位"""
+    return round(round(val / RECALL_BUCKET_SIZE) * RECALL_BUCKET_SIZE, 2)
+
+
+def bucket_recall_points(points_dict):
+    """将 {raw_recall: y_val} 按 0.05 档位聚合。
+
+    同一档位有多个点时，保留 recall 最接近档位中心的那个。
+    返回 {bucketed_recall: y_val}。
+    """
+    # 先按 bucket 分组：bucket -> [(raw_x, y), ...]
+    buckets = defaultdict(list)
+    for raw_x, y in points_dict.items():
+        bucket = snap_to_recall_bucket(raw_x)
+        buckets[bucket].append((raw_x, y))
+
+    # 每个 bucket 保留最接近中心的点
+    result = {}
+    for bucket, candidates in buckets.items():
+        best = min(candidates, key=lambda c: abs(c[0] - bucket))
+        result[bucket] = best[1]
+
+    return result
+
+
+# ============================================================
+# 数据收集函数（按 mode 分类）
+# ============================================================
+
+def collect_compare(args):
+    """compare 模式：收集三路对比数据 (reduce / no-layer / layer)。
+
+    返回 (mode_points, mode_labels, mode_debug):
+      mode_points: {mode_key: {x_val: y_val}}
+      mode_labels: {mode_key: display_label}
+      mode_debug:  {mode_key: {x_val: (recall, filename)}} or None
+    """
+    directory = args.json_path
+    if not os.path.isdir(directory):
+        print(f"Error: {directory} is not a directory.")
+        return None, None
+
+    files = [os.path.join(directory, f) for f in os.listdir(directory) if f.endswith('.json')]
+
+    mode_points = defaultdict(dict)
+    mode_labels = {}
+    # --recall 模式：收集所有候选，稍后按 recall 筛选
+    # candidates: {mode_key: {x_val: [(recall, y_val, filename), ...]}}
+    mode_candidates = defaultdict(lambda: defaultdict(list))
+    target_recall = getattr(args, 'recall', None)
+
+    for f in files:
+        try:
+            data = load_json(f)
+            file_params = parse_filename_params(os.path.basename(f))
+
+            skip = False
+            for param_name, arg_val in [
+                ('data_name', args.data_name),
+                ('m', args.m),
+                ('ef_construction', args.ef_construction),
+                ('limited_level', args.limited_level),
+                ('node_num', args.node_num),
+                ('threads', args.threads),
+            ]:
+                if arg_val is not None and file_params.get(param_name) != arg_val:
+                    skip = True
+                    break
+            if skip:
+                continue
+
+            if not file_params.get('reduce') and args.redundancy is not None:
+                if file_params.get('redundancy') != args.redundancy:
+                    continue
+
+            mode_key, label = classify_mode(f, data)
+            mode_labels[mode_key] = label
+
+            x_val = get_param_value(data, args.x)
+            if x_val is None:
+                x_val = file_params.get(args.x)
+            y_val = get_y_value(data, args.y, args.data_name)
+
+            if x_val is None or y_val is None:
+                continue
+
+            if target_recall is not None:
+                # 收集候选，稍后按 recall 距离筛选
+                recall_val = get_param_value(data, 'avg_recall@10')
+                if recall_val is not None:
+                    mode_candidates[mode_key][x_val].append(
+                        (recall_val, y_val, os.path.basename(f)))
+            else:
+                mode_points[mode_key][x_val] = y_val
+                print(f"[{label}] {os.path.basename(f)} | {args.x}={x_val} | {args.y}={y_val}")
+
+        except Exception as e:
+            print(f"Skipping {f}: {e}")
+
+    # --recall 模式：对每个 (mode, x_val) 选 recall 最接近目标的
+    mode_debug = None
+    if target_recall is not None:
+        mode_debug = defaultdict(dict)
+        for mode_key, x_candidates in mode_candidates.items():
+            for x_val, candidates in x_candidates.items():
+                # 先按 recall 距离分组，取最近的一批，再从中选 y 最大的
+                min_dist = min(abs(c[0] - target_recall) for c in candidates)
+                nearest = [c for c in candidates if abs(c[0] - target_recall) - min_dist < 0.025]
+                best = max(nearest, key=lambda c: c[1])
+                mode_points[mode_key][x_val] = best[1]
+                mode_debug[mode_key][x_val] = (best[0], best[2])  # (recall, filename)
+                label = mode_labels.get(mode_key, mode_key)
+                print(f"[{label}] {best[2]} | {args.x}={x_val} | {args.y}={best[1]} "
+                      f"| recall={best[0]:.4f} (target={target_recall})")
+
+    if not any(mode_points.values()):
+        print("No valid data points found.")
+        return None, None, None
+
+    # recall x 轴时，按 0.05 档位聚合
+    if is_recall_x(args.x):
+        for mode_key in list(mode_points.keys()):
+            mode_points[mode_key] = bucket_recall_points(mode_points[mode_key])
+
+    return mode_points, mode_labels, mode_debug
+
+
+def collect_detail(args):
+    """detail 模式：收集单次实验的逐查询详细数据。
+
+    返回 {series_label: [(x, y), ...]}，只有一个 series。
+    """
+    json_file = args.json_path
+
+    if os.path.isdir(args.json_path):
+        target_params = {
+            'data_name': args.data_name,
+            'm': args.m,
+            'ef_construction': args.ef_construction,
+            'ef_search': args.ef_search,
+            'limited_level': args.limited_level,
+            'node_num': args.node_num,
+            'partition_mode': args.partition_mode,
+            'redundancy': args.redundancy,
+            'threads': args.threads,
+            'reduce': args.reduce,
+            'distributed': args.distributed,
+        }
+
+        json_file = find_matching_file(args.json_path, target_params)
+
+        if json_file is None:
+            print("Error: No matching JSON file found with the specified parameters.")
+            print(f"Target parameters: {target_params}")
+            return None, None
+
+        print(f"Found matching file: {json_file}")
+
+    data = load_json(json_file)
+    raw_y_data = data.get(args.y)
+
+    if not raw_y_data or not isinstance(raw_y_data, dict):
+        print(f"Error: Key '{args.y}' not found or is not a dictionary in the JSON file.")
+        print(f"Available keys: {list(data.keys())}")
+        return None, None
+
+    sorted_items = sorted(
+        [(int(k), v) for k, v in raw_y_data.items() if k.isdigit()],
+        key=lambda x: x[0]
+    )
+
+    if not sorted_items:
+        print(f"Error: No valid numeric keys found in {args.y}")
+        return None, None
+
+    label = args.y
+    return {label: sorted_items}, json_file
+
+
+def collect_merge(args):
+    """merge 模式：从多个文件中提取单条汇总曲线。
+
+    返回 {series_label: [(x, y), ...]}，只有一个 series。
+    """
+    directory = args.json_path
+    files = []
+    if os.path.isdir(directory):
+        files = [os.path.join(directory, f) for f in os.listdir(directory) if f.endswith('.json')]
+    else:
+        files = [directory]
+
+    points = {}
+    candidates = defaultdict(list)  # x_val -> [(recall, y_val, filename), ...]
+    target_recall = getattr(args, 'recall', None)
+
+    for f in files:
+        try:
+            data = load_json(f)
+            if (
+                args.data_name is not None and get_param_value(data, "data_name") != args.data_name or
+                args.m is not None and get_param_value(data, "m") != args.m or
+                args.ef_construction is not None and get_param_value(data, "ef_construction") != args.ef_construction or
+                args.ef_search is not None and get_param_value(data, "ef_search") != args.ef_search or
+                args.limited_level is not None and get_param_value(data, "limited_level") != args.limited_level or
+                args.node_num is not None and get_param_value(data, "node_num") != args.node_num or
+                args.partition_mode is not None and get_param_value(data, "partition_mode") != args.partition_mode or
+                args.redundancy is not None and get_param_value(data, "redundancy_level") != args.redundancy
+            ):
+                continue
+
+            x_val = get_param_value(data, args.x)
+            y_val = get_y_value(data, args.y, args.data_name)
+
+            if x_val is None or y_val is None:
+                continue
+
+            if target_recall is not None:
+                recall_val = get_param_value(data, 'avg_recall@10')
+                if recall_val is not None:
+                    candidates[x_val].append((recall_val, y_val, os.path.basename(f)))
+            else:
+                print(f"File: {f} | {args.x}: {x_val} | {args.y}: {y_val}")
+                points[x_val] = y_val
+
+        except Exception as e:
+            print(f"Skipping {f}: {e}")
+
+    if target_recall is not None:
+        for x_val, cands in candidates.items():
+            min_dist = min(abs(c[0] - target_recall) for c in cands)
+            nearest = [c for c in cands if abs(c[0] - target_recall) - min_dist < 0.025]
+            best = max(nearest, key=lambda c: c[1])
+            points[x_val] = best[1]
+            print(f"{best[2]} | {args.x}={x_val} | {args.y}={best[1]} "
+                  f"| recall={best[0]:.4f} (target={target_recall})")
+
+    if not points:
+        print("No valid data points found.")
+        return None
+
+    # recall x 轴时，按 0.05 档位聚合
+    if is_recall_x(args.x):
+        points = bucket_recall_points(points)
+
+    sorted_pts = sorted(points.items(), key=lambda p: p[0])
+    label = args.y
+    return {label: sorted_pts}
+
+
+# ============================================================
+# 绘图函数（按 chart 类型分类）
+# ============================================================
+
+MODE_ORDER = ['reduce', 'no-layer', 'layer']
+MODE_STYLES = {
+    'reduce':   {'marker': 'o', 'linestyle': '-',  'color': '#1f77b4'},
+    'no-layer': {'marker': 's', 'linestyle': '--', 'color': '#ff7f0e'},
+    'layer':    {'marker': '^', 'linestyle': '-.', 'color': '#2ca02c'},
+}
+
+
+def draw_line_compare(mode_points, mode_labels, args, mode_debug=None):
+    """折线图 × compare 模式"""
+    debug = getattr(args, 'debug', False) and mode_debug is not None
+    n_x = max(len(pts) for pts in mode_points.values())
+    fig_width = max(8, n_x * 1.5 + 3)
+    fig_height = 7.5 if debug else 6
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    for mode_key in MODE_ORDER:
+        points = mode_points.get(mode_key, {})
+        if not points:
+            continue
+        sorted_pts = sorted(points.items(), key=lambda p: p[0])
+        xs, ys = zip(*sorted_pts)
+        style = MODE_STYLES[mode_key]
+        ax.plot(xs, ys, marker=style['marker'], linestyle=style['linestyle'],
+                color=style['color'], label=mode_labels[mode_key], linewidth=2, markersize=8)
+        for x, y in sorted_pts:
+            if debug and mode_debug.get(mode_key, {}).get(x):
+                recall, fname = mode_debug[mode_key][x]
+                ax.annotate(f"{y:.2f}\nrecall={recall:.4f}\n{fname}",
+                            (x, y), fontsize=6, va='bottom', ha='left',
+                            xytext=(5, 5), textcoords='offset points')
+            else:
+                ax.text(x, y, f" {y:.2f}", fontsize=8, va='bottom')
+
+    ax.set_xlabel(args.x, fontsize=12)
+    ax.set_ylabel(args.y, fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.7)
+    n_labels = sum(1 for m in MODE_ORDER if m in mode_points)
+    setup_legend(ax, n_labels)
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.88)
+
+    output_path = os.path.join(args.output_dir, make_output_filename("line-compare", args))
+    fig.savefig(output_path, bbox_inches='tight')
+    print(f"Plot saved to {output_path}")
+    plt.close(fig)
+
+
+def draw_bar_compare(mode_points, mode_labels, args, mode_debug=None):
+    """柱状图 × compare 模式"""
+    debug = getattr(args, 'debug', False) and mode_debug is not None
+    all_x_vals = sorted(set().union(*[pts.keys() for pts in mode_points.values()]))
+    x_labels = [str(v) for v in all_x_vals]
+
+    active_modes = [m for m in MODE_ORDER if mode_points.get(m)]
+
+    n_groups = len(all_x_vals)
+    n_bars = len(active_modes)
+    bar_width = 0.8 / max(n_bars, 1)
+    x_indices = np.arange(n_groups)
+
+    fig_width = max(8, n_groups * n_bars * 0.6 + 3)
+    fig_height = 7.5 if debug else 6
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    for i, mode_key in enumerate(active_modes):
+        y_vals = [mode_points[mode_key].get(x, 0) for x in all_x_vals]
+        offset = (i - (n_bars - 1) / 2) * bar_width
+        bars = ax.bar(x_indices + offset, y_vals, bar_width,
+                      label=mode_labels[mode_key], color=MODE_STYLES[mode_key]['color'], alpha=0.85)
+        for j, (bar, val) in enumerate(zip(bars, y_vals)):
+            if val != 0:
+                x_key = all_x_vals[j]
+                if debug and mode_debug.get(mode_key, {}).get(x_key):
+                    recall, fname = mode_debug[mode_key][x_key]
+                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                            f'{val:.2f}\nr={recall:.4f}\n{fname}',
+                            ha='center', va='bottom', fontsize=5.5)
+                else:
+                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                            f'{val:.2f}', ha='center', va='bottom', fontsize=8)
+
+    ax.set_xticks(x_indices)
+    ax.set_xticklabels(x_labels, fontsize=11)
+    ax.set_xlabel(args.x, fontsize=12)
+    ax.set_ylabel(args.y, fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.5, axis='y')
+    setup_legend(ax, n_bars)
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.88)
+
+    output_path = os.path.join(args.output_dir, make_output_filename("bar-compare", args))
+    fig.savefig(output_path, bbox_inches='tight')
+    print(f"Plot saved to {output_path}")
+    plt.close(fig)
+
+
+def draw_scatter_compare(mode_points, mode_labels, args, mode_debug=None):
+    """散点图 × compare 模式"""
+    debug = getattr(args, 'debug', False) and mode_debug is not None
+    n_x = max(len(pts) for pts in mode_points.values())
+    fig_width = max(8, n_x * 1.5 + 3)
+    fig_height = 7.5 if debug else 6
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    for mode_key in MODE_ORDER:
+        points = mode_points.get(mode_key, {})
+        if not points:
+            continue
+        sorted_pts = sorted(points.items(), key=lambda p: p[0])
+        xs, ys = zip(*sorted_pts)
+        ax.scatter(xs, ys, color=MODE_STYLES[mode_key]['color'],
+                   label=mode_labels[mode_key], s=80, alpha=0.8,
+                   marker=MODE_STYLES[mode_key]['marker'])
+        for x, y in sorted_pts:
+            if debug and mode_debug.get(mode_key, {}).get(x):
+                recall, fname = mode_debug[mode_key][x]
+                ax.annotate(f"{y:.2f}\nrecall={recall:.4f}\n{fname}",
+                            (x, y), fontsize=6, va='bottom', ha='left',
+                            xytext=(5, 5), textcoords='offset points')
+            else:
+                ax.text(x, y, f" {y:.2f}", fontsize=8, va='bottom')
+
+    ax.set_xlabel(args.x, fontsize=12)
+    ax.set_ylabel(args.y, fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.7)
+    n_labels = sum(1 for m in MODE_ORDER if m in mode_points)
+    setup_legend(ax, n_labels)
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.88)
+
+    output_path = os.path.join(args.output_dir, make_output_filename("scatter-compare", args))
+    fig.savefig(output_path, bbox_inches='tight')
+    print(f"Plot saved to {output_path}")
+    plt.close(fig)
+
+
+def draw_line_single(series_data, args, prefix="line"):
+    """折线图 × 单系列模式（detail / merge）"""
+    n_points = max(len(pts) for pts in series_data.values())
+    fig, ax = plt.subplots(figsize=(16, 6))
+
+    all_xs = []
+    for label, pts in series_data.items():
+        xs, ys = zip(*pts)
+        all_xs.extend(xs)
+        ax.plot(xs, ys, linestyle='-', linewidth=0.5, label=label)
+
+    if all_xs:
+        ax.set_xlim(min(all_xs), max(all_xs))
+
+    x_label = "Query Index" if args.mode == "detail" else args.x
+    ax.set_xlabel(x_label, fontsize=12)
+    ax.set_ylabel(args.y, fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.7)
+    setup_legend(ax, len(series_data))
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.88)
+
+    output_path = os.path.join(args.output_dir, make_output_filename(f"{prefix}-{args.mode}", args))
+    fig.savefig(output_path, bbox_inches='tight')
+    print(f"Plot saved to {output_path}")
+    plt.close(fig)
+
+
+def draw_scatter_single(series_data, args, prefix="scatter"):
+    """散点图 × 单系列模式（detail / merge）"""
+    n_points = max(len(pts) for pts in series_data.values())
+    fig, ax = plt.subplots(figsize=(16, 6))
+
+    all_xs = []
+    for label, pts in series_data.items():
+        xs, ys = zip(*pts)
+        all_xs.extend(xs)
+        s = 1 if n_points > 500 else 20
+        alpha = 0.3 if n_points > 500 else 0.6
+        ax.scatter(xs, ys, alpha=alpha, s=s, label=label)
+
+    if all_xs:
+        ax.set_xlim(min(all_xs), max(all_xs))
+
+    x_label = "Query Index" if args.mode == "detail" else args.x
+    ax.set_xlabel(x_label, fontsize=12)
+    ax.set_ylabel(args.y, fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.7)
+    setup_legend(ax, len(series_data))
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.88)
+
+    output_path = os.path.join(args.output_dir, make_output_filename(f"{prefix}-{args.mode}", args))
+    fig.savefig(output_path, bbox_inches='tight')
+    print(f"Plot saved to {output_path}")
+    plt.close(fig)
+
+
+def draw_bar_single(series_data, args, prefix="bar"):
+    """柱状图 × 单系列模式（detail / merge）"""
+    n_points = max(len(pts) for pts in series_data.values())
+    fig_width = max(6, min(20, n_points * 1.2 + 2))
+    fig, ax = plt.subplots(figsize=(fig_width, 6))
+
+    for label, pts in series_data.items():
+        xs, ys = zip(*pts)
+        x_labels = [str(x) for x in xs]
+        x_indices = np.arange(len(xs))
+        bar_width = min(0.6, max(0.2, 6.0 / max(len(xs), 1)))
+        bars = ax.bar(x_indices, ys, width=bar_width, color='#1f77b4', alpha=0.85, label=label)
+        for bar, val in zip(bars, ys):
+            if val != 0:
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                        f'{val:.2f}', ha='center', va='bottom', fontsize=7)
+        ax.set_xticks(x_indices)
+        ax.set_xticklabels(x_labels, fontsize=9, rotation=45 if len(xs) > 20 else 0)
+
+    x_label = "Query Index" if args.mode == "detail" else args.x
+    ax.set_xlabel(x_label, fontsize=12)
+    ax.set_ylabel(args.y, fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.5, axis='y')
+    setup_legend(ax, len(series_data))
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.88)
+
+    output_path = os.path.join(args.output_dir, make_output_filename(f"{prefix}-{args.mode}", args))
+    fig.savefig(output_path, bbox_inches='tight')
+    print(f"Plot saved to {output_path}")
+    plt.close(fig)
+
+
+# ============================================================
+# 主入口
+# ============================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize Vector Retrieval Results")
-    parser.add_argument("--json_path", type=str, default="./results/cpp", help="Path to the results JSON file or directory containing multiple JSON files")
-    parser.add_argument("--merge", action='store_true', help="Whether to merge multiple JSON files")
-    parser.add_argument("--output_dir", type=str, default="./plot", help="Directory to save plot")
-    parser.add_argument("--x", type=str, default="node_num", help="X-axis parameter for plotting (Merge mode)")
-    parser.add_argument("--y", type=str, default="avg_remote_transfer_cnt", help="Y-axis parameter for plotting")
-    parser.add_argument("--data_name", type=str, default="siftsmall", help="Name of the dataset")
-    parser.add_argument("--m", type=int, default=16, help="Max number of connections per element")
-    parser.add_argument("--ef_construction", type=int, default=64, help="Size of the dynamic candidate list for construction")
-    parser.add_argument("--ef_search", type=int, default=64, help="Size of the dynamic candidate list for search")
+    parser.add_argument("--json_path", type=str, default="./results/cpp",
+                        help="Path to JSON file or directory")
+    parser.add_argument("--output_dir", type=str, default="./plot",
+                        help="Directory to save plot")
+
+    # 两个独立维度
+    parser.add_argument("--chart", type=str, default="line", choices=["line", "bar", "scatter"],
+                        help="图表类型: line (折线图), bar (柱状图), scatter (散点图)")
+    parser.add_argument("--mode", type=str, default="compare", choices=["compare", "detail", "merge"],
+                        help="数据模式: compare (三路对比), detail (单实验逐查询), merge (单曲线汇总)")
+
+    # 通用参数
+    parser.add_argument("--x", type=str, default="ef_search", help="X-axis parameter")
+    parser.add_argument("--y", type=str, default="qps", help="Y-axis metric")
+
+    # 筛选参数
+    parser.add_argument("--data_name", type=str, default="sift", help="Dataset name")
+    parser.add_argument("--m", type=int, default=10, help="Max connections per element")
+    parser.add_argument("--ef_construction", type=int, default=200, help="ef_construction")
+    parser.add_argument("--ef_search", type=int, default=None, help="ef_search (for detail/merge filtering)")
     parser.add_argument("--limited_level", type=int, default=5, help="Level limit for HNSW")
-    parser.add_argument("--node_num", type=int, default=None, help="Number of cluster nodes")
-    parser.add_argument("--partition_mode", type=str, default="k-means", help="Data partition mode across nodes")
-    parser.add_argument("--redundancy", type=int, default=0, help="Redundancy level for data replication across nodes")
-    parser.add_argument("--threads", type=int, default=1, help="Number of query threads")
-    parser.add_argument("--reduce", action='store_true', help="Enable ghreduce mode (independent graphs per node)")
-    parser.add_argument("--distributed", action='store_true', help="Enable distributed mode")
-    parser.add_argument("--plot_type", type=str, default="line", help="Type of plot for query results (line or scatter)")
+    parser.add_argument("--node_num", type=int, default=5, help="Number of cluster nodes")
+    parser.add_argument("--partition_mode", type=str, default="k-means", help="Partition mode (for detail/merge)")
+    parser.add_argument("--redundancy", type=int, default=2, help="Redundancy level")
+    parser.add_argument("--threads", type=int, default=None, help="Number of query threads")
+    parser.add_argument("--reduce", action='store_true', help="Enable reduce mode (for detail/merge)")
+    parser.add_argument("--distributed", action='store_true', help="Enable distributed mode (for detail/merge)")
+
+    # recall 约束：指定目标 recall，对每个 x 值找 recall 最接近的实验结果
+    parser.add_argument("--recall", type=float, default=None,
+                        help="Target recall (e.g. 0.9), pick experiments closest to this recall per x value")
+    parser.add_argument("--debug", action='store_true',
+                        help="Debug mode: annotate recall and filename on chart (used with --recall)")
+
+    # 兼容旧参数
+    parser.add_argument("--merge", action='store_true', help="(deprecated) Use --mode merge instead")
+    parser.add_argument("--plot_type", type=str, default=None,
+                        help="(deprecated) Use --chart instead")
 
     args = parser.parse_args()
 
     if not os.path.exists(args.json_path):
-        print(f"Error: File {args.json_path} not found.")
+        print(f"Error: {args.json_path} not found.")
         exit(1)
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    def load_json(path):
-        with open(path, 'r') as f:
-            return json.load(f)
-
-    # 辅助函数：在 JSON 结构中查找参数
-    def get_param_value(data, key):
-        # 尝试直接在根节点找
-        if key in data: return data[key]
-        # 尝试在 hnsw_params 中找
-        if 'hnsw_params' in data and key in data['hnsw_params']:
-            return data['hnsw_params'][key]
-        # 尝试在 cluster_params 中找
-        if 'cluster_params' in data and key in data['cluster_params']:
-            return data['cluster_params'][key] 
-        return None
-
-    # 新增函数：从文件名中解析参数
-    def parse_filename_params(filename):
-        """从结果文件名中解析参数，返回参数字典"""
-        # 文件名格式: results-{data_name}-m{m}-efc{ef_construction}-efs{ef_search}-ll{limited_level}-node{node_num}-{partition_mode}-red{redundancy}-threads{threads}-...
-        params = {}
-        
-        # 提取数据名称
-        match = re.search(r'results-([a-z]+?)-m', filename)
-        if match:
-            params['data_name'] = match.group(1)
-        
-        # 提取 m
-        match = re.search(r'-m(\d+)-', filename)
-        if match:
-            params['m'] = int(match.group(1))
-        
-        # 提取 efc (ef_construction)
-        match = re.search(r'-efc(\d+)-', filename)
-        if match:
-            params['ef_construction'] = int(match.group(1))
-        
-        # 提取 efs (ef_search)
-        match = re.search(r'-efs(\d+)-', filename)
-        if match:
-            params['ef_search'] = int(match.group(1))
-        
-        # 提取 ll (limited_level)
-        match = re.search(r'-ll(\d+)-', filename)
-        if match:
-            params['limited_level'] = int(match.group(1))
-        
-        # 提取 node_num
-        match = re.search(r'-node(\d+)-', filename)
-        if match:
-            params['node_num'] = int(match.group(1))
-        
-        # 提取 partition_mode
-        match = re.search(r'-node\d+-([a-z_-]+)-red', filename)
-        if match:
-            params['partition_mode'] = match.group(1)
-        
-        # 提取 redundancy_level
-        match = re.search(r'-red(\d+)', filename)
-        if match:
-            params['redundancy'] = int(match.group(1))
-        
-        # 提取 threads
-        match = re.search(r'-threads(\d+)', filename)
-        if match:
-            params['threads'] = int(match.group(1))
-        
-        # 检查 reduce 模式 (文件名中含有 "reduce")
-        params['reduce'] = 'reduce' in filename
-        
-        # 检查 distributed 模式 (文件名中含有 "distributed")
-        params['distributed'] = 'distributed' in filename
-        
-        return params
-
-    # 新增函数：根据参数筛选文件
-    def find_matching_file(directory, target_params):
-        """从目录中找到匹配参数的第一个 JSON 文件"""
-        if not os.path.isdir(directory):
-            return None
-        
-        for filename in sorted(os.listdir(directory)):
-            if not filename.endswith('.json'):
-                continue
-            
-            file_params = parse_filename_params(filename)
-            
-            # 检查所有指定的参数是否匹配
-            match = True
-            for key, value in target_params.items():
-                # 只有当用户指定了参数（value 不为 None）才进行匹配
-                if value is None:
-                    continue
-                
-                # 精确匹配
-                file_value = file_params.get(key)
-                if file_value != value:
-                    match = False
-                    break
-            
-            if match:
-                return os.path.join(directory, filename)
-        
-        return None
-
-    plt.figure(figsize=(20, 6))
-    
-    # --- 1. Merge 模式: 比较不同参数下的汇总指标 ---
+    # 兼容旧参数
     if args.merge:
-        files = []
-        if os.path.isdir(args.json_path):
-            files = [os.path.join(args.json_path, f) for f in os.listdir(args.json_path) if f.endswith('.json')]
-        else:
-            files = [args.json_path]
+        args.mode = "merge"
+    if args.plot_type == "scatter":
+        args.chart = "scatter"
 
-        points = {}
-        for f in files:
-            try:
-                data = load_json(f)
-                # 参数筛选
-                if (
-                    args.data_name is not None and get_param_value(data, "data_name") != args.data_name or
-                    args.m is not None and get_param_value(data, "m") != args.m or
-                    args.ef_construction is not None and get_param_value(data, "ef_construction") != args.ef_construction or
-                    args.ef_search is not None and get_param_value(data, "ef_search") != args.ef_search or
-                    args.limited_level is not None and get_param_value(data, "limited_level") != args.limited_level or
-                    args.node_num is not None and get_param_value(data, "node_num") != args.node_num or
-                    args.partition_mode is not None and get_param_value(data, "partition_mode") != args.partition_mode or
-                    args.redundancy is not None and get_param_value(data, "redundancy_level") != args.redundancy
-                ):
-                    continue
+    # 根据 mode 收集数据，根据 chart 绘图
+    if args.mode == "compare":
+        mode_points, mode_labels, mode_debug = collect_compare(args)
+        if mode_points is None:
+            exit(1)
+        if args.chart == "line":
+            draw_line_compare(mode_points, mode_labels, args, mode_debug)
+        elif args.chart == "bar":
+            draw_bar_compare(mode_points, mode_labels, args, mode_debug)
+        elif args.chart == "scatter":
+            draw_scatter_compare(mode_points, mode_labels, args, mode_debug)
 
-                # 获取 X 轴 (参数)
-                x_val = get_param_value(data, args.x)
-                # 获取 Y 轴 (汇总指标)
-                if args.y == "red_per_node":
-                    redundancy_num = get_param_value(data, "redundancy_num")
-                    node_num = get_param_value(data, "node_num")
-                    y_val = redundancy_num / node_num if node_num else 0
-                elif args.y == "data_per_node":
-                    if args.data_name == "siftsmall":
-                        total_data = 10000
-                    elif args.data_name == "sift":
-                        total_data = 1000000
-                    
-                    total_data_redundant = total_data + get_param_value(data, "redundancy_num")
-                    node_num = get_param_value(data, "node_num")
-                    y_val = total_data_redundant / node_num if node_num else 0
-                else:
-                    y_val = get_param_value(data, args.y)
-                    node_num = get_param_value(data, "node_num")
+    elif args.mode == "detail":
+        series_data, json_file = collect_detail(args)
+        if series_data is None:
+            exit(1)
+        if args.chart == "line":
+            draw_line_single(series_data, args)
+        elif args.chart == "bar":
+            draw_bar_single(series_data, args)
+        elif args.chart == "scatter":
+            draw_scatter_single(series_data, args)
 
-                print(f"File: {f} | {args.x}: {x_val} | {args.y}: {y_val}")
-
-                points[x_val] = y_val
-
-            except Exception as e:
-                print(f"Skipping {f}: {e}")
-    
-        # 按 X 轴排序并绘图
-        points_list = sorted(points.items(), key=lambda p: p[0])
-        if points_list:
-            xs, ys = zip(*points_list)
-            plt.plot(xs, ys, marker='s', linestyle='--', color='b')
-            plt.xlabel(f"{args.x}")
-            plt.title(
-                f"data_name={args.data_name}, m={args.m}, efc={args.ef_construction}, efs={args.ef_search}, ll={args.limited_level}\n"
-                f"node_num={args.node_num}, partition_mode={args.partition_mode}, redundancy={args.redundancy}"
-            )
-            
-            # 在点旁边标注数值
-            for x, y in points_list:
-                plt.text(x, y + 0.1, f"{y:.0f}", fontsize=9, ha='right', va='bottom')
-        else:
-            print("No valid data points found.")
-    
-    # --- 2. 非 Merge 模式: 查看单次实验中每次查询的详细数据 ---
-    else:
-        json_file = args.json_path
-        
-        # 如果输入是目录，则根据参数自动筛选文件
-        if os.path.isdir(args.json_path):
-            target_params = {
-                'data_name': args.data_name,
-                'm': args.m,
-                'ef_construction': args.ef_construction,
-                'ef_search': args.ef_search,
-                'limited_level': args.limited_level,
-                'node_num': args.node_num,
-                'partition_mode': args.partition_mode,
-                'redundancy': args.redundancy,
-                'threads': args.threads,
-                'reduce': args.reduce,
-                'distributed': args.distributed
-            }
-            
-            json_file = find_matching_file(args.json_path, target_params)
-            
-            if json_file is None:
-                print("Error: No matching JSON file found with the specified parameters.")
-                print(f"Target parameters: {target_params}")
-                exit(1)
-            
-            print(f"Found matching file: {json_file}")
-        
-        data = load_json(json_file)
-        
-        # 获取详细数据字典 (例如 recall, remote_transfer_cnt)
-        raw_y_data = data.get(args.y)
-        
-        if raw_y_data and isinstance(raw_y_data, dict):
-            # JSON 中的 key 是字符串 "0", "1"... 需要转成 int 排序
-            # 过滤掉非数字 key (如果有的话)
-            sorted_items = []
-            for k, v in raw_y_data.items():
-                if k.isdigit():
-                    sorted_items.append((int(k), v))
-            
-            sorted_items.sort(key=lambda x: x[0])
-            
-            if sorted_items:
-                x_vals = [item[0] for item in sorted_items]
-                y_vals = [item[1] for item in sorted_items]
-                
-                if args.plot_type == "scatter":
-                    plt.scatter(x_vals, y_vals, alpha=0.6, s=20, label=os.path.basename(json_file))
-                else:  # line plot (default)
-                    plt.plot(x_vals, y_vals, marker='.', linestyle='-', linewidth=0.5, markersize=2, label=os.path.basename(json_file))
-                
-                plt.xlabel("Query Index (nth query)")
-                plt.title(f"{args.y} per Query")
-            else:
-                print(f"Error: No valid numeric keys found in {args.y}")
-        else:
-            print(f"Error: Key '{args.y}' not found or is not a dictionary in the JSON file.")
-            print(f"Available keys: {list(data.keys())}")
-
-    plt.ylabel(args.y)
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend()
-
-    if args.merge:
-        output_filename = (
-            f"{args.x}-{args.y}-{args.data_name}-"
-            f"m{args.m}-efc{args.ef_construction}-efs{args.ef_search}-ll{args.limited_level}-"
-            + (f"node{args.node_num}-" if args.node_num is not None else "")
-            + f"{args.partition_mode}-red{args.redundancy}"
-            + (f"-threads{args.threads}" if args.threads is not None else "")
-            + ("-reduce" if args.reduce else "")
-            + ("-distributed" if args.distributed else "")
-            + ".pdf"
-        )
-    else:
-        base = os.path.splitext(os.path.basename(json_file))[0]
-        output_filename = f"{args.y}-{base}.pdf"
-
-    output_path = os.path.join(args.output_dir, output_filename)
-    plt.savefig(output_path)
-    print(f"Plot saved to {output_path}")
+    elif args.mode == "merge":
+        series_data = collect_merge(args)
+        if series_data is None:
+            exit(1)
+        if args.chart == "line":
+            draw_line_single(series_data, args)
+        elif args.chart == "bar":
+            draw_bar_single(series_data, args)
+        elif args.chart == "scatter":
+            draw_scatter_single(series_data, args)

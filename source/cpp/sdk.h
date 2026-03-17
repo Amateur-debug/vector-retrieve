@@ -523,4 +523,35 @@ public:
         }
         disconnect();
     }
+
+    // 专用参数设置接口：运行时更新已加载图的可调参数。
+    // 约定：ef_search/ef_construction 为负值表示不更新；limited_level 为 -2 表示不更新，-1 表示不限制。
+    void set_hnsw_params(int ef_search = -1, int ef_construction = -1, int limited_level = -2)
+    {
+        if (!connected && !connect()) {
+            throw std::runtime_error("Failed to connect to cluster");
+        }
+
+        try {
+            Buffer buf;
+            buf.write_val((int)MSG_SET_HNSW_PARAMS);
+            buf.write_val(ef_search);
+            buf.write_val(ef_construction);
+            buf.write_val(limited_level);
+
+            uint64_t msg_size = buf.data.size();
+            transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
+            transport->send_raw(sockfd, buf.data.data(), msg_size);
+
+            char ack = 0;
+            transport->recv_raw(sockfd, &ack, 1);
+            if (ack != 1) {
+                throw std::runtime_error("Failed to set hnsw params");
+            }
+        } catch (...) {
+            disconnect();
+            throw;
+        }
+        disconnect();
+    }
 };

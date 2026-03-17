@@ -977,7 +977,7 @@ public:
         while (!payload.candidates.empty())
         {
             auto [cand_dist, cand_vid] = payload.candidates.top();
-            if (cand_dist > lower_bound)
+            if (cand_dist > lower_bound && (int)payload.results.size() >= ef)
                 break;
             payload.candidates.pop();
 
@@ -1071,16 +1071,16 @@ public:
                         lower_bound = payload.results.top().first;
                 }
             }
-        }
 
-        // 有待处理的远程 vid，需要 transfer 到远程节点逐个处理
-        if (!payload.pending_vids.empty())
-        {
-            payload.continue_search = true;
-            payload.require_id = payload.pending_vids.front();  // 路由到第一个待处理 vid 所在节点
-            payload.start_level = level;
-            visited_pool_->release_list(vl);
-            return;
+            // 有待处理的远程 vid，需要 transfer 到远程节点逐个处理
+            if (!payload.pending_vids.empty())
+            {
+                payload.continue_search = true;
+                payload.require_id = payload.pending_vids.front();  // 路由到第一个待处理 vid 所在节点
+                payload.start_level = level;
+                visited_pool_->release_list(vl);
+                return;
+            }
         }
 
         // 本层搜索正常结束，清理中间状态

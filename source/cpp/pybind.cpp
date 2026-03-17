@@ -271,6 +271,11 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("layer_partition_mode") = "round_robin",
              py::arg("layer_replicate_flags") = std::vector<bool>{},
              py::call_guard<py::gil_scoped_release>())
+        .def("set_hnsw_params", &ClusterSDKClient<float>::set_hnsw_params,
+             py::arg("ef_search") = -1,
+             py::arg("ef_construction") = -1,
+             py::arg("limited_level") = -2,
+             py::call_guard<py::gil_scoped_release>())
         .def("load_cluster", &ClusterSDKClient<float>::load_cluster,
              py::arg("filepath"),
              py::call_guard<py::gil_scoped_release>())
@@ -311,6 +316,11 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
              py::arg("layer_partition_mode") = "round_robin",
              py::arg("layer_replicate_flags") = std::vector<bool>{},
+             py::call_guard<py::gil_scoped_release>())
+        .def("set_hnsw_params", &ClusterSDKClient<double>::set_hnsw_params,
+             py::arg("ef_search") = -1,
+             py::arg("ef_construction") = -1,
+             py::arg("limited_level") = -2,
              py::call_guard<py::gil_scoped_release>())
         .def("load_cluster", &ClusterSDKClient<double>::load_cluster,
              py::arg("filepath"),

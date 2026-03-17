@@ -30,15 +30,15 @@ DATASETS = [
 # 参数网格 (将运行所有笛卡尔积组合)
 # ============================================================
 PARAM_GRID = {
-    "node_num":           [1],
+    "node_num":           [5],
     "partition_mode":     ["k-means"],
     "redundancy":         [2, 1, 0],
-    "m":                  [10, 20, 30, 40, 50, 60],
+    "m":                  [10, 15, 20, 25, 30, 35, 40],
     "ef_construction":    [200],
-    "ef_search":          [15, 20, 30, 40, 50],
+    "ef_search":          [15, 20, 25, 30, 35, 40],
     "limited_level":      [5],
     "k":                  [10],
-    "num_query_threads":  [8, 32, 64],
+    "num_query_threads":  [8, 16, 32],
     "reduce":             [False, True],
     "distributed":        [True],
     "layer":              [True, False],

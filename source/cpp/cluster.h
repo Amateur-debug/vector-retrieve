@@ -66,7 +66,8 @@ enum MessageType
     MSG_SAVE_CLUSTER = 9,
     MSG_SAVE_HNSW = 10,
     MSG_QUERY_LOCAL = 11,  // Reduce模式下只执行本地查询（避免递归）
-    MSG_ADD_VECTOR_LOCAL = 12  // Reduce模式下直接添加到本地（避免递归路由）
+    MSG_ADD_VECTOR_LOCAL = 12,  // Reduce模式下直接添加到本地（避免递归路由）
+    MSG_SET_HNSW_PARAMS = 13    // 运行时更新 HNSW 参数（如 ef_search）
 };
 
 // 序列化/反序列化辅助缓冲区（用于 HNSW 图的网络传输、分布式同步和持久化存储）
@@ -2391,6 +2392,53 @@ void Node<T>::handle_sdk_client(int client_fd)
                         ok = true;
                     }
                 }
+                char ack = ok ? 1 : 0;
+                send_all(client_fd, &ack, 1);
+                break;
+            }
+            else if (msg_type == MSG_SET_HNSW_PARAMS)
+            {
+                int ef_search = buf.read_val<int>();
+                int ef_construction = buf.read_val<int>();
+                int limited_level = buf.read_val<int>();
+
+                bool ok = false;
+                if (cluster)
+                {
+                    auto apply_params = [&](HNSWGraph<T> *graph) {
+                        if (!graph)
+                            return;
+                        if (ef_search > 0)
+                            graph->ef_search = ef_search;
+                        if (ef_construction > 0)
+                            graph->ef_construction = ef_construction;
+                        // limited_level = -1 表示不限制；-2 表示保持不变（由 SDK 默认值约定）
+                        if (limited_level >= -1)
+                            graph->limited_level = limited_level;
+                    };
+
+                    bool has_graph = false;
+
+                    if (cluster->hnsw)
+                    {
+                        apply_params(cluster->hnsw);
+                        has_graph = true;
+                    }
+
+                    for (auto &node : cluster->nodes)
+                    {
+                        if (!node.local_hnsw)
+                            continue;
+                        // 避免对同一指针重复设置
+                        if (node.local_hnsw == cluster->hnsw)
+                            continue;
+                        apply_params(node.local_hnsw);
+                        has_graph = true;
+                    }
+
+                    ok = has_graph;
+                }
+
                 char ack = ok ? 1 : 0;
                 send_all(client_fd, &ack, 1);
                 break;
