@@ -9,6 +9,31 @@
 
 using namespace std;
 
+// 序列化用的标量字段打包结构体（POD），一次 memcpy 读写所有标量字段。
+struct PayloadHeader {
+    bool continue_search;
+    int origin_node_id;
+    int require_id;
+    int start_level;
+    int entry_point_id;
+    int remote_transfer_cnt;
+    uint64_t remote_transfer_data;
+    double send_timestamp;
+    int distance_cnt;
+};
+
+// 通用 PQHack：直接访问 priority_queue 的底层 vector 容器（protected 成员 c）。
+// 避免通过 pop/push 逐个操作的 O(n log n) 开销，实现 O(n) 的序列化/反序列化。
+template <typename PQ>
+struct PQAccessor : public PQ {
+    static const auto& get_container(const PQ& pq) {
+        return reinterpret_cast<const PQAccessor&>(pq).c;
+    }
+    static auto& get_container_mut(PQ& pq) {
+        return reinterpret_cast<PQAccessor&>(pq).c;
+    }
+};
+
 template <typename T>
 struct Payload {
     bool continue_search = false;   // 标记本次搜索是否为跨节点跳转后的续搜状态
@@ -17,7 +42,7 @@ struct Payload {
     int start_level = -1;           // 续搜时的起始层级编号
     int entry_point_id = -1;        // 续搜时使用的入口点 vid
     int remote_transfer_cnt = 0;    // 跨节点远程传输次数累计
-    double remote_transfer_latency = 0.0;     // 跨节点传输的累计延迟（单位：毫秒）
+    uint64_t remote_transfer_data = 0;   // 跨节点传输的累计数据量（单位：比特）
     double send_timestamp = 0.0;    // 最近一次发送消息的时间戳（单位：毫秒，用于计算单跳延迟）
     int distance_cnt = 0;           // 本次搜索过程中计算距离的总次数
 
@@ -41,6 +66,26 @@ struct Payload {
     // 结果集（最大堆）：按距离降序排列，堆顶为距离最远的结果向量。
     // 堆大小维持在 ef 以内，堆顶距离作为搜索终止的 lower_bound 阈值。
     priority_queue<pair<T,int>> results;
+
+    // 将标量字段打包为 PayloadHeader（用于高效序列化）
+    PayloadHeader to_header() const {
+        return {continue_search, origin_node_id, require_id, start_level,
+                entry_point_id, remote_transfer_cnt, remote_transfer_data,
+                send_timestamp, distance_cnt};
+    }
+
+    // 从 PayloadHeader 恢复标量字段
+    void from_header(const PayloadHeader& h) {
+        continue_search = h.continue_search;
+        origin_node_id = h.origin_node_id;
+        require_id = h.require_id;
+        start_level = h.start_level;
+        entry_point_id = h.entry_point_id;
+        remote_transfer_cnt = h.remote_transfer_cnt;
+        remote_transfer_data = h.remote_transfer_data;
+        send_timestamp = h.send_timestamp;
+        distance_cnt = h.distance_cnt;
+    }
 
     void clear() {
         visited_vids.clear();
@@ -82,15 +127,7 @@ struct Payload {
         if (results.empty())
             return -1;
 
-        // 技巧：通过继承 hack 访问 priority_queue 的底层 vector 容器。
-        // priority_queue 在 libstdc++/libc++/MSVC STL 中底层容器均命名为 c，
-        // 作为 protected 成员，可通过派生类的 reinterpret_cast 直接访问。
-        struct PQHack : public decltype(results) {
-            static const auto& get_container(const decltype(results)& pq) {
-                return reinterpret_cast<const PQHack&>(pq).c;
-            }
-        };
-        const auto& container = PQHack::get_container(results);
+        const auto& container = PQAccessor<decltype(results)>::get_container(results);
 
         auto best = container[0];
         for (size_t i = 1; i < container.size(); i++)

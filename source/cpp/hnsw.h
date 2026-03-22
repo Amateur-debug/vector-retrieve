@@ -897,22 +897,24 @@ public:
         }
 
         // ---- 逐个处理待处理的远程 vid 列表 ----
-        // 从头部逐个取出 vid：在本地的计算距离加入堆并移除，不在本地的停下 transfer
-        while (!payload.pending_vids.empty())
+        // 用索引遍历，避免 erase(begin()) 的 O(n) 元素移动开销
+        size_t pending_idx = 0;
+        while (pending_idx < payload.pending_vids.size())
         {
-            int rvid = payload.pending_vids.front();
+            int rvid = payload.pending_vids[pending_idx];
             auto it = label_lookup_.find(rvid);
             if (it == label_lookup_.end())
             {
-                // 不在本地，停下来 transfer 到该 vid 所在节点
+                // 不在本地，移除已处理的部分后 transfer
+                payload.pending_vids.erase(payload.pending_vids.begin(), payload.pending_vids.begin() + pending_idx);
                 payload.continue_search = true;
                 payload.require_id = rvid;
                 payload.start_level = level;
                 visited_pool_->release_list(vl);
                 return;
             }
-            // 在本地，处理完毕后 pop 掉
-            payload.pending_vids.erase(payload.pending_vids.begin());
+            // 在本地，标记已处理，继续下一个
+            pending_idx++;
             int riid = it->second;
             if (visited_array[riid] == visited_tag)
                 continue;
@@ -931,6 +933,8 @@ public:
                     payload.results.pop();
             }
         }
+        // 所有 pending_vids 都在本地处理完毕，清空
+        payload.pending_vids.clear();
 
         // ---- 统一使用 (dist, vid) 管理全局搜索状态 ----
         // payload.candidates 和 payload.results 直接作为全局候选集和结果集使用

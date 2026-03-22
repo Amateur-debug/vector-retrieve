@@ -35,6 +35,8 @@ static constexpr int RDMA_MAX_SGE = 1;            // 每个工作请求允许的
 static constexpr int RDMA_CQ_SIZE = 256;          // 完成队列 (CQ) 的容量
 static constexpr int RDMA_MAX_INLINE = 256;       // 允许内联发送的最大数据大小（字节）
 static constexpr size_t RDMA_BUF_SIZE = 4 * 1024 * 1024;  // 每个连接的收发缓冲区大小（4MB）
+static constexpr int RDMA_RECV_SLOTS = 16;                // 预投递的接收 WR 数量（环形缓冲区槽位数）
+static constexpr size_t RDMA_SLOT_SIZE = RDMA_BUF_SIZE / RDMA_RECV_SLOTS;  // 每个接收槽位大小（256KB）
 
 // ==================== RDMA QP 握手交换信息 ====================
 // 客户端与服务端通过 TCP 辅助通道交换以下信息，完成 RDMA QP 的连接建立。
@@ -74,6 +76,7 @@ struct RdmaConnection {
     // 连接有效性标志和关联的节点编号
     bool is_valid = false;
     int node_id = -1;
+    int next_recv_slot = 0;  // 环形接收缓冲区的下一个待消费槽位索引
 
     ~RdmaConnection() {
         // 资源释放统一由 RdmaConnectionPool::destroy_connection() 管理
@@ -274,9 +277,11 @@ private:
             return nullptr;
         }
         
-        // 步骤 3：分配并注册发送/接收缓冲区的 Memory Region
-        conn->send_buf = malloc(RDMA_BUF_SIZE);
-        conn->recv_buf = malloc(RDMA_BUF_SIZE);
+        // 步骤 3：分配页对齐的发送/接收缓冲区并注册 Memory Region
+        if (posix_memalign(&conn->send_buf, 4096, RDMA_BUF_SIZE) != 0)
+            conn->send_buf = nullptr;
+        if (posix_memalign(&conn->recv_buf, 4096, RDMA_BUF_SIZE) != 0)
+            conn->recv_buf = nullptr;
         if (!conn->send_buf || !conn->recv_buf) {
             LOG_DEBUG_STREAM("[RDMA] 缓冲区分配失败");
             goto cleanup;
@@ -323,25 +328,26 @@ private:
             goto cleanup;
         }
         
-        // 步骤 8：预投递接收请求（确保连接建立后立即可接收数据）
-        {
+        // 步骤 8：预投递多个接收请求到环形缓冲区槽位，避免连续发送时 RNR 错误
+        for (int i = 0; i < RDMA_RECV_SLOTS; i++) {
             struct ibv_sge sge;
-            sge.addr = (uint64_t)conn->recv_buf;
-            sge.length = RDMA_BUF_SIZE;
+            sge.addr = (uint64_t)conn->recv_buf + i * RDMA_SLOT_SIZE;
+            sge.length = RDMA_SLOT_SIZE;
             sge.lkey = conn->recv_mr->lkey;
-            
+
             struct ibv_recv_wr recv_wr, *bad_wr;
             memset(&recv_wr, 0, sizeof(recv_wr));
-            recv_wr.wr_id = 0;
+            recv_wr.wr_id = i;
             recv_wr.sg_list = &sge;
             recv_wr.num_sge = 1;
-            
+
             if (ibv_post_recv(conn->qp, &recv_wr, &bad_wr)) {
-                LOG_DEBUG_STREAM("[RDMA] 预投递接收请求失败");
+                LOG_DEBUG_STREAM("[RDMA] 预投递接收请求失败, slot=" << i);
                 goto cleanup;
             }
         }
-        
+        conn->next_recv_slot = 0;
+
         conn->is_valid = true;
         LOG_DEBUG_STREAM("[RDMA] 成功建立到节点 " << node_id << " (" << ip << ":" << port << ") 的RDMA连接");
         return conn;
@@ -494,6 +500,20 @@ public:
         if (nc.active_count > 0) nc.active_count--;
     }
     
+    // 关闭指定节点的所有空闲连接
+    void close_node(int node_id) {
+        std::lock_guard<std::mutex> lock(pools_mutex);
+        auto it = node_pools.find(node_id);
+        if (it == node_pools.end()) return;
+
+        NodeConnections& nc = it->second;
+        std::lock_guard<std::mutex> nc_lock(nc.mutex);
+        for (auto& conn : nc.idle_conns) {
+            destroy_connection(conn);
+        }
+        nc.idle_conns.clear();
+    }
+
     // 关闭所有连接
     void close_all() {
         std::lock_guard<std::mutex> lock(pools_mutex);
@@ -519,8 +539,10 @@ public:
             return nullptr;
         }
         
-        conn->send_buf = malloc(RDMA_BUF_SIZE);
-        conn->recv_buf = malloc(RDMA_BUF_SIZE);
+        if (posix_memalign(&conn->send_buf, 4096, RDMA_BUF_SIZE) != 0)
+            conn->send_buf = nullptr;
+        if (posix_memalign(&conn->recv_buf, 4096, RDMA_BUF_SIZE) != 0)
+            conn->recv_buf = nullptr;
         if (!conn->send_buf || !conn->recv_buf) {
             LOG_DEBUG_STREAM("[RDMA Server] 缓冲区分配失败");
             goto cleanup;
@@ -563,24 +585,25 @@ public:
             goto cleanup;
         }
         
-        {
+        for (int i = 0; i < RDMA_RECV_SLOTS; i++) {
             struct ibv_sge sge;
-            sge.addr = (uint64_t)conn->recv_buf;
-            sge.length = RDMA_BUF_SIZE;
+            sge.addr = (uint64_t)conn->recv_buf + i * RDMA_SLOT_SIZE;
+            sge.length = RDMA_SLOT_SIZE;
             sge.lkey = conn->recv_mr->lkey;
-            
+
             struct ibv_recv_wr recv_wr, *bad_wr;
             memset(&recv_wr, 0, sizeof(recv_wr));
-            recv_wr.wr_id = 0;
+            recv_wr.wr_id = i;
             recv_wr.sg_list = &sge;
             recv_wr.num_sge = 1;
-            
+
             if (ibv_post_recv(conn->qp, &recv_wr, &bad_wr)) {
-                LOG_DEBUG_STREAM("[RDMA Server] 预投递接收请求失败");
+                LOG_DEBUG_STREAM("[RDMA Server] 预投递接收请求失败, slot=" << i);
                 goto cleanup;
             }
         }
-        
+        conn->next_recv_slot = 0;
+
         conn->is_valid = true;
         LOG_DEBUG_STREAM("[RDMA Server] RDMA 握手完成");
         return conn;
@@ -660,8 +683,8 @@ private:
     // RDMA Send 操作
     int rdma_send(std::shared_ptr<RdmaConnection> conn, const void* data, size_t size) {
         if (!conn || !conn->is_valid || !conn->send_mr) return -1;
-        if (size > RDMA_BUF_SIZE) {
-            LOG_DEBUG_STREAM("[RDMA] 发送数据超过缓冲区大小: " << size << " > " << RDMA_BUF_SIZE);
+        if (size > RDMA_SLOT_SIZE) {
+            LOG_DEBUG_STREAM("[RDMA] 发送数据超过槽位大小: " << size << " > " << RDMA_SLOT_SIZE);
             return -1;
         }
         
@@ -698,6 +721,9 @@ private:
                 LOG_DEBUG_STREAM("[RDMA] ibv_poll_cq(send) 失败");
                 return -1;
             }
+            if (polls == 0) {
+                std::this_thread::yield();
+            }
         }
         
         if (wc.status != IBV_WC_SUCCESS) {
@@ -708,10 +734,12 @@ private:
         return 0;
     }
     
-    // RDMA Recv 操作（等待接收完成）
+    // RDMA Recv 操作（等待接收完成，使用环形缓冲区槽位）
     int rdma_recv(std::shared_ptr<RdmaConnection> conn, void* data, size_t max_size, size_t &actual_size) {
         if (!conn || !conn->is_valid || !conn->recv_mr) return -1;
-        
+
+        int slot = conn->next_recv_slot;
+
         // 等待接收完成（使用连接独立的 recv_cq）
         struct ibv_wc wc;
         int polls = 0;
@@ -725,35 +753,36 @@ private:
                 std::this_thread::yield();
             }
         }
-        
+
         if (wc.status != IBV_WC_SUCCESS) {
             LOG_DEBUG_STREAM("[RDMA] Recv 完成错误: " << ibv_wc_status_str(wc.status));
             return -1;
         }
-        
+
         actual_size = wc.byte_len;
         if (actual_size > max_size) actual_size = max_size;
-        
-        // 复制数据
-        memcpy(data, conn->recv_buf, actual_size);
-        
-        // 重新投递接收请求
+
+        // 从当前槽位复制数据
+        memcpy(data, (char*)conn->recv_buf + slot * RDMA_SLOT_SIZE, actual_size);
+
+        // 重新投递该槽位的接收请求，补充环形缓冲区
         struct ibv_sge sge;
-        sge.addr = (uint64_t)conn->recv_buf;
-        sge.length = RDMA_BUF_SIZE;
+        sge.addr = (uint64_t)conn->recv_buf + slot * RDMA_SLOT_SIZE;
+        sge.length = RDMA_SLOT_SIZE;
         sge.lkey = conn->recv_mr->lkey;
-        
+
         struct ibv_recv_wr recv_wr, *bad_wr;
         memset(&recv_wr, 0, sizeof(recv_wr));
-        recv_wr.wr_id = 0;
+        recv_wr.wr_id = slot;
         recv_wr.sg_list = &sge;
         recv_wr.num_sge = 1;
-        
+
         if (ibv_post_recv(conn->qp, &recv_wr, &bad_wr)) {
-            LOG_DEBUG_STREAM("[RDMA] 重新投递接收请求失败");
+            LOG_DEBUG_STREAM("[RDMA] 重新投递接收请求失败, slot=" << slot);
             return -1;
         }
-        
+
+        conn->next_recv_slot = (slot + 1) % RDMA_RECV_SLOTS;
         return 0;
     }
     
@@ -832,17 +861,20 @@ public:
     
     ~RdmaTransport() override {
         stop_server();
-        
-        // 关闭连接池
+
+        // 关闭连接池中的空闲连接
         conn_pool.close_all();
-        
-        // 清理活跃连接
+
+        // 销毁所有活跃连接的底层 RDMA 资源（QP、MR、缓冲区等）
         {
             std::lock_guard<std::mutex> lock(active_conns_mutex);
+            for (auto& kv : active_conns) {
+                conn_pool.destroy_rdma_connection(kv.second);
+            }
             active_conns.clear();
         }
-        
-        // 释放 RDMA 资源（CQ 已随各连接独立释放，无需在此处理）
+
+        // 释放 RDMA 设备资源
         if (pd) { ibv_dealloc_pd(pd); pd = nullptr; }
         if (ib_ctx) { ibv_close_device(ib_ctx); ib_ctx = nullptr; }
     }
@@ -967,9 +999,7 @@ public:
     // --- 资源管理 ---
 
     void close_node(int node_id) override {
-        // RDMA 连接池不支持按节点关闭（所有连接统一管理）
-        // 这里仅记录日志
-        LOG_DEBUG_STREAM("[RDMA] close_node 请求: node_id=" << node_id);
+        conn_pool.close_node(node_id);
     }
 
     void clear() override {
@@ -979,6 +1009,7 @@ public:
     }
 
     std::string get_stats() override {
+        std::lock_guard<std::mutex> lock(active_conns_mutex);
         return "[RdmaTransport] Active connections: " + std::to_string(active_conns.size());
     }
 
@@ -992,7 +1023,8 @@ public:
         const char* ptr = (const char*)data;
         size_t remaining = size;
         while (remaining > 0) {
-            size_t chunk = std::min(remaining, RDMA_BUF_SIZE);
+            // 每次发送不超过 RDMA_SLOT_SIZE，与接收端环形缓冲区槽位大小匹配
+            size_t chunk = std::min(remaining, RDMA_SLOT_SIZE);
             if (rdma_send(conn, ptr, chunk) != 0) {
                 throw std::runtime_error("RDMA send 失败");
             }

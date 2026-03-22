@@ -21,6 +21,7 @@ private:
     bool connected;
     std::vector<QueryEndpoint> query_endpoints;
     size_t current_endpoint_idx;  // 当前已连接的查询端点索引，(size_t)-1 表示未连接任何端点
+    size_t sticky_endpoint_idx;   // 绑定的 endpoint 索引，避免每条查询重连
 
     // 通信中间层的配置及实例，由 TransportFactory 根据 comm_mode 创建
     TransportConfig transport_config;
@@ -104,100 +105,35 @@ public:
                 return false;
             }
 
-            const std::string partition_mode = cluster.value("partition_mode", "");
+            const bool is_reduce = cluster.value("is_reduce", false);
             std::vector<std::string> ips;
             std::vector<int> ports;
 
-            if (partition_mode == "layer" && cluster.contains("layer_config")) {
-                const auto &layer_config = cluster["layer_config"];
-                std::vector<int> configured_levels;
-                std::unordered_map<int, std::vector<int>> parsed_layer_config;
-
-                if (layer_config.is_object()) {
-                    configured_levels.reserve(layer_config.size());
-                    for (auto it = layer_config.begin(); it != layer_config.end(); ++it) {
-                        try {
-                            int level = std::stoi(it.key());
-                            if (level >= 0 && it.value().is_array()) {
-                                parsed_layer_config[level] = it.value().get<std::vector<int>>();
-                                configured_levels.push_back(level);
-                            }
-                        } catch (...) {
-                            continue;
-                        }
-                    }
-                } else if (layer_config.is_array()) {
-                    configured_levels.reserve(layer_config.size());
-                    for (const auto &item : layer_config) {
-                        if (!item.is_array() || item.size() != 2) {
-                            continue;
-                        }
-                        int level = -1;
-                        try {
-                            level = item[0].get<int>();
-                        } catch (...) {
-                            continue;
-                        }
-                        if (level < 0 || !item[1].is_array()) {
-                            continue;
-                        }
-                        try {
-                            parsed_layer_config[level] = item[1].get<std::vector<int>>();
-                            configured_levels.push_back(level);
-                        } catch (...) {
-                            continue;
-                        }
-                    }
+            if (is_reduce) {
+                // Reduce 模式：轮询所有节点，每个节点都能独立处理查询
+                for (const auto &kv : node_addr) {
+                    ips.push_back(kv.second.first);
+                    ports.push_back(kv.second.second);
                 }
-
-                if (!configured_levels.empty()) {
-                    std::sort(configured_levels.begin(), configured_levels.end(), std::greater<int>());
-                    std::vector<int> entry_nodes;
-                    int selected_entry_level = -1;
-                    
-                    for (int level : configured_levels) {
-                        std::vector<int> level_nodes;
-                        const auto it = parsed_layer_config.find(level);
-                        if (it == parsed_layer_config.end()) {
-                            continue;
-                        }
-                        for (int nid : it->second) {
-                            if (node_addr.count(nid)) {
-                                level_nodes.push_back(nid);
-                            }
-                        }
-                        if (!level_nodes.empty()) {
-                            selected_entry_level = level;
-                            entry_nodes = std::move(level_nodes);
-                            break;
-                        }
-                    }
-
-                    if (selected_entry_level >= 0 && !entry_nodes.empty()) {
-                        bool entry_replicated = false;
-                        if (cluster.contains("layer_replicate_flags") && cluster["layer_replicate_flags"].is_array()) {
-                            const auto &flags = cluster["layer_replicate_flags"];
-                            if (selected_entry_level < (int)flags.size()) {
-                                entry_replicated = flags[selected_entry_level].get<bool>();
-                            }
-                        }
-
-                        if (entry_replicated) {
-                            for (int nid : entry_nodes) {
-                                ips.push_back(node_addr[nid].first);
-                                ports.push_back(node_addr[nid].second);
-                            }
-                        } else {
-                            int nid = entry_nodes.front();
+            } else {
+                // Forward 模式（layer / 非 layer）：轮询持有最高层入口点的节点
+                // 服务端在 MSG_GET_INFORMATION 中返回 entry_node_ids
+                if (cluster.contains("entry_node_ids") && cluster["entry_node_ids"].is_array()
+                    && !cluster["entry_node_ids"].empty()) {
+                    for (const auto &nid_json : cluster["entry_node_ids"]) {
+                        int nid = nid_json.get<int>();
+                        if (node_addr.count(nid)) {
                             ips.push_back(node_addr[nid].first);
                             ports.push_back(node_addr[nid].second);
                         }
                     }
                 }
-            } else {
-                for (const auto &kv : node_addr) {
-                    ips.push_back(kv.second.first);
-                    ports.push_back(kv.second.second);
+                // 回退：如果没有 entry_node_ids 信息，使用所有节点
+                if (ips.empty()) {
+                    for (const auto &kv : node_addr) {
+                        ips.push_back(kv.second.first);
+                        ports.push_back(kv.second.second);
+                    }
                 }
             }
 
@@ -213,9 +149,11 @@ public:
     }
 
     ClusterSDKClient(const std::string &ip = "127.0.0.1", int port = 19000, const std::string &comm_mode = "tcp")
-        : host_ip(ip), host_port(port), sockfd(-1), connected(false), current_endpoint_idx((size_t)-1)
+        : host_ip(ip), host_port(port), sockfd(-1), connected(false), current_endpoint_idx((size_t)-1), sticky_endpoint_idx((size_t)-1)
     {
-        transport_config.comm_mode = comm_mode;
+        // SDK 服务端（handle_sdk_client）使用裸 TCP 收发，不走 transport 抽象层，
+        // 因此 SDK 客户端必须始终使用 TCP transport，无论集群节点间通信模式是什么。
+        transport_config.comm_mode = "tcp";
         transport = TransportFactory::create(transport_config);
         // 注册默认 host 节点，使得首次 connect() 可直接使用 transport 连接池
         transport->register_node(SDK_HOST_NODE_ID, host_ip, host_port);
@@ -263,6 +201,19 @@ public:
         for (size_t i = 0; i < ips.size(); ++i) {
             query_endpoints.push_back(QueryEndpoint{ips[i], ports[i]});
         }
+
+        // 每个 SDK 客户端绑定一个 endpoint（基于线程 ID 哈希），避免每条查询重连。
+        // 旧方案：每条查询随机选 endpoint，5 个节点有 80% 概率换节点 → disconnect + connect，
+        //   导致大量 TCP 握手开销、远端 handler 线程频繁创建销毁、TIME_WAIT socket 堆积。
+        // 新方案：init_routes() 后绑定一个 endpoint，后续所有查询复用同一连接。
+        //   多个 SDK 客户端通过线程 ID 哈希自然分布到不同节点，实现负载均衡。
+        if (!query_endpoints.empty()) {
+            // 使用 PID 而非 thread_id：fork() 后所有子进程的 pthread_self() 相同，
+            // 会导致全部客户端打到同一个节点。PID 在进程间唯一，分布更均匀。
+            // 注意：Forward 模式下 entry_node_ids 通常只有少数节点，分布效果有限。
+            size_t hash = std::hash<pid_t>{}(getpid());
+            sticky_endpoint_idx = hash % query_endpoints.size();
+        }
     }
 
     void add_vector(int vid, const std::vector<T> &vec)
@@ -293,16 +244,14 @@ public:
         // 持久连接模式：不主动断开，后续的 add_vector / query 调用可复用同一连接
     }
 
-    std::vector<int> query(int query_id, const std::vector<T> &query_vector, Payload<T> &payload, int k = 10)
+    // 确保连接到绑定的 endpoint
+    void ensure_connected()
     {
-        size_t target_idx = (size_t)-1;
+        size_t target_idx = sticky_endpoint_idx;
         std::string target_ip = host_ip;
         int target_port = host_port;
-        
-        if (!query_endpoints.empty()) {
-            static thread_local std::mt19937 gen(std::random_device{}());
-            std::uniform_int_distribution<size_t> dist(0, query_endpoints.size() - 1);
-            target_idx = dist(gen);
+
+        if (target_idx != (size_t)-1 && target_idx < query_endpoints.size()) {
             const QueryEndpoint &ep = query_endpoints[target_idx];
             target_ip = ep.ip;
             target_port = ep.port;
@@ -316,6 +265,12 @@ public:
             throw std::runtime_error("Failed to connect to cluster");
         }
         current_endpoint_idx = target_idx;
+    }
+
+    // 发送查询，不等待结果（流水线模式）
+    void query_send(int query_id, const std::vector<T> &query_vector, Payload<T> &payload, int k = 10)
+    {
+        ensure_connected();
 
         try {
             Buffer buf;
@@ -328,7 +283,17 @@ public:
             uint64_t msg_size = buf.data.size();
             transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
             transport->send_raw(sockfd, buf.data.data(), msg_size);
+        } catch (...) {
+            disconnect();
+            throw;
+        }
+    }
 
+    // 接收一个已完成的查询结果（阻塞直到有结果）
+    // 返回 (query_id, results, payload)
+    std::tuple<int, std::vector<int>, Payload<T>> query_recv()
+    {
+        try {
             uint64_t resp_size = 0;
             transport->recv_raw(sockfd, &resp_size, sizeof(uint64_t));
 
@@ -338,19 +303,41 @@ public:
             Buffer resp_buf;
             resp_buf.data = std::move(resp_data);
 
+            int query_id = resp_buf.read_val<int>();
             int result_cnt = resp_buf.read_val<int>();
             std::vector<int> results;
             for (int i = 0; i < result_cnt; i++) {
                 resp_buf.read_val<T>(); // dist
                 results.push_back(resp_buf.read_val<int>());
             }
+            Payload<T> payload;
             deserialize_payload(resp_buf, payload);
 
-            return results;
+            return {query_id, std::move(results), std::move(payload)};
         } catch (...) {
             disconnect();
             throw;
         }
+    }
+
+    // 便捷批量接口：发送一批查询，全部接收后返回
+    std::vector<std::tuple<int, std::vector<int>, Payload<T>>>
+    query_batch(const std::vector<int> &query_ids,
+                const std::vector<std::vector<T>> &query_vectors,
+                std::vector<Payload<T>> &payloads, int k = 10)
+    {
+        if (query_ids.size() != query_vectors.size() || query_ids.size() != payloads.size())
+            throw std::runtime_error("query_batch: size mismatch");
+
+        for (size_t i = 0; i < query_ids.size(); i++)
+            query_send(query_ids[i], query_vectors[i], payloads[i], k);
+
+        std::vector<std::tuple<int, std::vector<int>, Payload<T>>> results;
+        results.reserve(query_ids.size());
+        for (size_t i = 0; i < query_ids.size(); i++)
+            results.push_back(query_recv());
+
+        return results;
     }
 
     std::string get_information()
@@ -385,7 +372,7 @@ public:
         }
     }
 
-    void partition(const std::string &mode, int redundancy = 1, const std::unordered_map<int, std::vector<int>> &layer_config = {}, const std::string &layer_partition_mode = "round_robin", const std::vector<bool> &layer_replicate_flags = {})
+    void partition(const std::string &mode, int redundancy = 1, const std::unordered_map<int, std::vector<int>> &layer_config = {}, const std::string &layer_partition_mode = "round_robin", const std::vector<bool> &layer_replicate_flags = {}, int num_threads = 0)
     {
         if (!connected && !connect()) {
             throw std::runtime_error("Failed to connect to cluster");
@@ -399,6 +386,7 @@ public:
             serialize_layer_config(buf, layer_config);
             buf.write_string(layer_partition_mode);
             serialize_layer_replicate_flags(buf, layer_replicate_flags);
+            buf.write_val(num_threads);
 
             uint64_t msg_size = buf.data.size();
             transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));

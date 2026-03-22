@@ -1,9 +1,13 @@
-import subprocess
 import os
+os.environ["GRPC_VERBOSITY"] = "NONE"
+
+import subprocess
 import itertools
 import time
 import argparse
 import concurrent.futures
+import threading
+import sys
 
 SCRIPT_PATH = "main.py"
 DATASET_ROOT = "/home/CONNECT/xchen740/workspace/vector-retrieve/dataset"
@@ -30,17 +34,31 @@ DATASETS = [
 # 参数网格 (将运行所有笛卡尔积组合)
 # ============================================================
 PARAM_GRID = {
-    "node_num":           [1],
-    "m":                  [10, 20, 30, 40, 50, 60],
+    "node_num":           [5],
+    "m":                  [10, 15, 20, 25, 30, 35, 40],
     "ef_construction":    [200],
-    "ef_search":          [15, 20, 30, 40, 50],
+    "ef_search":          [15, 20, 25, 30, 35, 40],
     "k":                  [10],
-    "num_query_threads":  [8, 32, 64],
-    "num_cpu":            [8],
+    "num_query_threads":  [40],      # 客户端查询进程数
+    "num_threads":        [8],       # 服务端线程数（GOMAXPROCS）
+    "num_cpu":            [0],
 }
 
 # 并行任务数 (1 = 顺序执行)
 MAX_WORKERS = 1
+# 每个实验重复运行次数（去掉最高最低取均值）
+NUM_RUNS = 5
+
+
+_GRPC_NOISE = ("instrument.cc", "absl::InitializeLog", "grpc.resource_quota")
+
+
+def _pipe_filtered_stderr(proc):
+    """将子进程 stderr 实时转发，过滤 gRPC 初始化噪声"""
+    for line in proc.stderr:
+        if not any(p in line for p in _GRPC_NOISE):
+            sys.stderr.write(line)
+            sys.stderr.flush()
 
 
 def run_worker(cmd, task_id, total_tasks, description):
@@ -49,7 +67,13 @@ def run_worker(cmd, task_id, total_tasks, description):
     start_time = time.time()
 
     try:
-        subprocess.run(cmd, check=True)
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
+        t = threading.Thread(target=_pipe_filtered_stderr, args=(proc,), daemon=True)
+        t.start()
+        proc.wait()
+        t.join()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
     except subprocess.CalledProcessError as e:
         print(f"[{task_id}/{total_tasks}] ERROR: {e}")
 
@@ -75,6 +99,7 @@ def build_command(dataset, params, deploy=False, build=False):
         "--ef_search", str(params['ef_search']),
         "--k", str(params['k']),
         "--num_query_threads", str(params['num_query_threads']),
+        "--num_threads", str(params['num_threads']),
         "--num_cpu", str(params['num_cpu']),
     ]
 
@@ -82,61 +107,41 @@ def build_command(dataset, params, deploy=False, build=False):
         cmd.append("--deploy")
     if build:
         cmd.append("--build")
+    # 多次运行取均值
+    cmd += ['--num_runs', str(NUM_RUNS)]
 
     return cmd
 
 
 def get_result_path(dataset_name, params):
-    """生成结果文件路径（与 main.py 的 report() 保存路径对齐，不含时间戳）"""
+    """生成结果文件的完整路径（与 main.py 的命名格式一致，无时间戳）"""
     cpu_suffix = f"-cpus{params['num_cpu']}" if params.get('num_cpu', 0) != 0 else ""
 
-    # 匹配 main.py 中的命名格式：results-{data_name}-m{m}-efc{efc}-efs{efs}-node{node}-threads{threads}[-cpus{cpu}]-{timestamp}.json
-    # 这里使用前缀匹配（不含时间戳），用于检查是否已有结果
-    prefix = (f"results-{dataset_name}-m{params['m']}-"
-              f"efc{params['ef_construction']}-efs{params['ef_search']}-"
-              f"node{params['node_num']}-"
-              f"threads{params['num_query_threads']}{cpu_suffix}-")
-
-    return prefix
+    results_dir = "./results/weaviate"
+    return (f"{results_dir}/results-{dataset_name}-m{params['m']}-"
+            f"efc{params['ef_construction']}-efs{params['ef_search']}-"
+            f"node{params['node_num']}-"
+            f"threads{params['num_threads']}-query_threads{params['num_query_threads']}{cpu_suffix}.json")
 
 
 def check_result_exists(dataset_name, params):
-    """检查是否已存在匹配的结果文件（前缀匹配，因为文件名含时间戳）"""
-    results_dir = "./results"
-    if not os.path.exists(results_dir):
-        return False
-
-    prefix = get_result_path(dataset_name, params)
-    for filename in os.listdir(results_dir):
-        if filename.startswith(prefix) and filename.endswith(".json"):
-            filepath = os.path.join(results_dir, filename)
-            try:
-                with open(filepath, 'r') as f:
-                    content = f.read().strip()
-                    if content and content != '{}':
-                        return True
-            except Exception:
-                pass
-    return False
+    """检查是否已存在结果文件"""
+    filepath = get_result_path(dataset_name, params)
+    return os.path.exists(filepath)
 
 
 def find_result_file(dataset_name, params):
-    """查找匹配的结果文件路径（用于最终检查）"""
-    results_dir = "./results"
-    if not os.path.exists(results_dir):
+    """查找结果文件路径（用于最终检查）"""
+    filepath = get_result_path(dataset_name, params)
+    if not os.path.exists(filepath):
         return None
-
-    prefix = get_result_path(dataset_name, params)
-    for filename in os.listdir(results_dir):
-        if filename.startswith(prefix) and filename.endswith(".json"):
-            filepath = os.path.join(results_dir, filename)
-            try:
-                with open(filepath, 'r') as f:
-                    content = f.read().strip()
-                    if content and content != '{}':
-                        return filepath
-            except Exception:
-                pass
+    try:
+        with open(filepath, 'r') as f:
+            content = f.read().strip()
+            if content and content != '{}':
+                return filepath
+    except Exception:
+        pass
     return None
 
 
@@ -199,7 +204,7 @@ def run_batch():
         description = (f"Dataset: {dataset['name']} | "
                        f"node={params['node_num']} m={params['m']} efc={params['ef_construction']} "
                        f"efs={params['ef_search']} k={params['k']} "
-                       f"threads={params['num_query_threads']} cpus={params['num_cpu']}"
+                       f"threads={params['num_threads']} cpus={params['num_cpu']}"
                        f"{' | deploy+build' if need_deploy or need_build else ''}")
 
         tasks.append((cmd, description, dataset, params))
@@ -233,7 +238,7 @@ def run_batch():
     for cmd, desc, dataset, params in tasks:
         result_file = find_result_file(dataset['name'], params)
         if not result_file:
-            print(f"MISSING: {get_result_path(dataset['name'], params)}*.json")
+            print(f"MISSING: {get_result_path(dataset['name'], params)}")
             missing_results.append((cmd, desc))
 
     # 重新运行缺失结果的任务
@@ -259,7 +264,7 @@ def run_batch():
         if still_missing:
             print(f"WARNING: {len(still_missing)} results still missing after retry:")
             for path in still_missing:
-                print(f"  - {path}*.json")
+                print(f"  - {path}")
         else:
             print("All results generated successfully!")
     else:

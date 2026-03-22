@@ -114,11 +114,24 @@ static bool SSECapable() {
     return false;
 }
 
+static bool AVX2Capable() {
+    int cpuInfo[4];
+    cpuid(cpuInfo, 0);
+    int nIds = cpuInfo[0];
+    if (nIds >= 7) {
+        cpuid(cpuInfo, 7);
+    // 检测 AVX2 支持：位于 CPUID 功能 7 的 EBX 寄存器第 5 位
+        return (cpuInfo[1] & (1 << 5)) != 0;
+    }
+    return false;
+}
+
 #else
 // 非 x86 平台：所有 SIMD 指令集能力检测均返回 false，回退使用标量实现
 static bool AVX512Capable() { return false; }
 static bool AVXCapable() { return false; }
 static bool SSECapable() { return false; }
+static bool AVX2Capable() { return false; }
 #endif
 
 //============================================================
@@ -147,6 +160,30 @@ static double L2SqrScalarDouble(const void* pVect1v, const void* pVect2v, const 
     for (size_t i = 0; i < qty; i++) {
         double t = pVect1[i] - pVect2[i];
         res += t * t;
+    }
+    return res;
+}
+
+static int32_t L2SqrScalarInt32(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
+    const int32_t* pVect1 = (const int32_t*)pVect1v;
+    const int32_t* pVect2 = (const int32_t*)pVect2v;
+    size_t qty = *((const size_t*)qty_ptr);
+    int32_t res = 0;
+    for (size_t i = 0; i < qty; i++) {
+        int32_t t = pVect1[i] - pVect2[i];
+        res += t * t;
+    }
+    return res;
+}
+
+static uint32_t L2SqrScalarUInt32(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
+    const uint32_t* pVect1 = (const uint32_t*)pVect1v;
+    const uint32_t* pVect2 = (const uint32_t*)pVect2v;
+    size_t qty = *((const size_t*)qty_ptr);
+    uint32_t res = 0;
+    for (size_t i = 0; i < qty; i++) {
+        int32_t t = (int32_t)pVect1[i] - (int32_t)pVect2[i];
+        res += (uint32_t)(t * t);
     }
     return res;
 }
@@ -252,6 +289,101 @@ static float L2SqrSIMD16ExtSSE(const void* pVect1v, const void* pVect2v, const v
     }
 
     return res;
+}
+
+// SSE 整数 L2 距离（需要 SSE4.1 的 _mm_mullo_epi32）
+// int32 和 uint32 共用同一 SIMD 实现：2's complement 下 sub + mullo 低32位结果一致
+
+static int32_t L2SqrSIMD4ExtSSEInt32(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
+    int32_t PORTABLE_ALIGN32 TmpRes[4];
+    const int32_t* pVect1 = (const int32_t*)pVect1v;
+    const int32_t* pVect2 = (const int32_t*)pVect2v;
+    size_t qty = *((const size_t*)qty_ptr);
+    size_t qty4 = qty >> 2;
+
+    const int32_t* pEnd1 = pVect1 + (qty4 << 2);
+
+    __m128i diff, v1, v2;
+    __m128i sum = _mm_setzero_si128();
+
+    while (pVect1 < pEnd1) {
+        _mm_prefetch((char*)(pVect1 + 16), _MM_HINT_T0);
+        _mm_prefetch((char*)(pVect2 + 16), _MM_HINT_T0);
+
+        v1 = _mm_loadu_si128((const __m128i*)pVect1); pVect1 += 4;
+        v2 = _mm_loadu_si128((const __m128i*)pVect2); pVect2 += 4;
+        diff = _mm_sub_epi32(v1, v2);
+        sum = _mm_add_epi32(sum, _mm_mullo_epi32(diff, diff));
+    }
+
+    _mm_store_si128((__m128i*)TmpRes, sum);
+    int32_t res = TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3];
+
+    size_t remaining = qty & 3;
+    for (size_t i = 0; i < remaining; i++) {
+        int32_t t = pVect1[i] - pVect2[i];
+        res += t * t;
+    }
+
+    return res;
+}
+
+static int32_t L2SqrSIMD16ExtSSEInt32(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
+    int32_t PORTABLE_ALIGN32 TmpRes[4];
+    const int32_t* pVect1 = (const int32_t*)pVect1v;
+    const int32_t* pVect2 = (const int32_t*)pVect2v;
+    size_t qty = *((const size_t*)qty_ptr);
+    size_t qty16 = qty >> 4;
+
+    const int32_t* pEnd1 = pVect1 + (qty16 << 4);
+
+    __m128i diff, v1, v2;
+    __m128i sum = _mm_setzero_si128();
+
+    while (pVect1 < pEnd1) {
+        _mm_prefetch((char*)(pVect1 + 16), _MM_HINT_T0);
+        _mm_prefetch((char*)(pVect2 + 16), _MM_HINT_T0);
+
+        v1 = _mm_loadu_si128((const __m128i*)pVect1); pVect1 += 4;
+        v2 = _mm_loadu_si128((const __m128i*)pVect2); pVect2 += 4;
+        diff = _mm_sub_epi32(v1, v2);
+        sum = _mm_add_epi32(sum, _mm_mullo_epi32(diff, diff));
+
+        v1 = _mm_loadu_si128((const __m128i*)pVect1); pVect1 += 4;
+        v2 = _mm_loadu_si128((const __m128i*)pVect2); pVect2 += 4;
+        diff = _mm_sub_epi32(v1, v2);
+        sum = _mm_add_epi32(sum, _mm_mullo_epi32(diff, diff));
+
+        v1 = _mm_loadu_si128((const __m128i*)pVect1); pVect1 += 4;
+        v2 = _mm_loadu_si128((const __m128i*)pVect2); pVect2 += 4;
+        diff = _mm_sub_epi32(v1, v2);
+        sum = _mm_add_epi32(sum, _mm_mullo_epi32(diff, diff));
+
+        v1 = _mm_loadu_si128((const __m128i*)pVect1); pVect1 += 4;
+        v2 = _mm_loadu_si128((const __m128i*)pVect2); pVect2 += 4;
+        diff = _mm_sub_epi32(v1, v2);
+        sum = _mm_add_epi32(sum, _mm_mullo_epi32(diff, diff));
+    }
+
+    _mm_store_si128((__m128i*)TmpRes, sum);
+    int32_t res = TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3];
+
+    size_t remaining = qty & 15;
+    for (size_t i = 0; i < remaining; i++) {
+        int32_t t = pVect1[i] - pVect2[i];
+        res += t * t;
+    }
+
+    return res;
+}
+
+// uint32 版本：内部位模式与 int32 完全一致，仅返回类型不同
+static uint32_t L2SqrSIMD4ExtSSEUInt32(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
+    return (uint32_t)L2SqrSIMD4ExtSSEInt32(pVect1v, pVect2v, qty_ptr);
+}
+
+static uint32_t L2SqrSIMD16ExtSSEUInt32(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
+    return (uint32_t)L2SqrSIMD16ExtSSEInt32(pVect1v, pVect2v, qty_ptr);
 }
 
 #endif // __SSE__
@@ -442,6 +574,92 @@ static float IPSqrSIMD16ExtAVX(const void* pVect1v, const void* pVect2v, const v
     return (1.0f - res);
 }
 
+// AVX2 整数 L2 距离（需要 AVX2 的 _mm256_mullo_epi32）
+
+static int32_t L2SqrSIMD8ExtAVX2Int32(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
+    int32_t PORTABLE_ALIGN32 TmpRes[8];
+    const int32_t* pVect1 = (const int32_t*)pVect1v;
+    const int32_t* pVect2 = (const int32_t*)pVect2v;
+    size_t qty = *((const size_t*)qty_ptr);
+    size_t qty8 = qty >> 3;
+
+    const int32_t* pEnd1 = pVect1 + (qty8 << 3);
+
+    __m256i diff, v1, v2;
+    __m256i sum = _mm256_setzero_si256();
+
+    while (pVect1 < pEnd1) {
+        _mm_prefetch((char*)(pVect1 + 32), _MM_HINT_T0);
+        _mm_prefetch((char*)(pVect2 + 32), _MM_HINT_T0);
+
+        v1 = _mm256_loadu_si256((const __m256i*)pVect1); pVect1 += 8;
+        v2 = _mm256_loadu_si256((const __m256i*)pVect2); pVect2 += 8;
+        diff = _mm256_sub_epi32(v1, v2);
+        sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(diff, diff));
+    }
+
+    _mm256_store_si256((__m256i*)TmpRes, sum);
+    int32_t res = TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3] +
+                  TmpRes[4] + TmpRes[5] + TmpRes[6] + TmpRes[7];
+
+    size_t remaining = qty & 7;
+    for (size_t i = 0; i < remaining; i++) {
+        int32_t t = pVect1[i] - pVect2[i];
+        res += t * t;
+    }
+
+    return res;
+}
+
+static int32_t L2SqrSIMD16ExtAVX2Int32(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
+    int32_t PORTABLE_ALIGN32 TmpRes[8];
+    const int32_t* pVect1 = (const int32_t*)pVect1v;
+    const int32_t* pVect2 = (const int32_t*)pVect2v;
+    size_t qty = *((const size_t*)qty_ptr);
+    size_t qty16 = qty >> 4;
+
+    const int32_t* pEnd1 = pVect1 + (qty16 << 4);
+
+    __m256i diff, v1, v2;
+    __m256i sum = _mm256_setzero_si256();
+
+    while (pVect1 < pEnd1) {
+        _mm_prefetch((char*)(pVect1 + 32), _MM_HINT_T0);
+        _mm_prefetch((char*)(pVect2 + 32), _MM_HINT_T0);
+
+        v1 = _mm256_loadu_si256((const __m256i*)pVect1); pVect1 += 8;
+        v2 = _mm256_loadu_si256((const __m256i*)pVect2); pVect2 += 8;
+        diff = _mm256_sub_epi32(v1, v2);
+        sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(diff, diff));
+
+        v1 = _mm256_loadu_si256((const __m256i*)pVect1); pVect1 += 8;
+        v2 = _mm256_loadu_si256((const __m256i*)pVect2); pVect2 += 8;
+        diff = _mm256_sub_epi32(v1, v2);
+        sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(diff, diff));
+    }
+
+    _mm256_store_si256((__m256i*)TmpRes, sum);
+    int32_t res = TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3] +
+                  TmpRes[4] + TmpRes[5] + TmpRes[6] + TmpRes[7];
+
+    size_t remaining = qty & 15;
+    for (size_t i = 0; i < remaining; i++) {
+        int32_t t = pVect1[i] - pVect2[i];
+        res += t * t;
+    }
+
+    return res;
+}
+
+// uint32 版本：委托给 int32 实现
+static uint32_t L2SqrSIMD8ExtAVX2UInt32(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
+    return (uint32_t)L2SqrSIMD8ExtAVX2Int32(pVect1v, pVect2v, qty_ptr);
+}
+
+static uint32_t L2SqrSIMD16ExtAVX2UInt32(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
+    return (uint32_t)L2SqrSIMD16ExtAVX2Int32(pVect1v, pVect2v, qty_ptr);
+}
+
 #endif // __AVX__
 
 //============================================================
@@ -543,6 +761,44 @@ static float IPSqrSIMD16ExtAVX512(const void* pVect1v, const void* pVect2v, cons
     }
 
     return (1.0f - res);
+}
+
+// AVX-512 整数 L2 距离
+
+static int32_t L2SqrSIMD16ExtAVX512Int32(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
+    const int32_t* pVect1 = (const int32_t*)pVect1v;
+    const int32_t* pVect2 = (const int32_t*)pVect2v;
+    size_t qty = *((const size_t*)qty_ptr);
+    size_t qty16 = qty >> 4;
+
+    const int32_t* pEnd1 = pVect1 + (qty16 << 4);
+
+    __m512i diff, v1, v2;
+    __m512i sum = _mm512_setzero_si512();
+
+    while (pVect1 < pEnd1) {
+        _mm_prefetch((char*)(pVect1 + 64), _MM_HINT_T0);
+        _mm_prefetch((char*)(pVect2 + 64), _MM_HINT_T0);
+
+        v1 = _mm512_loadu_si512((const __m512i*)pVect1); pVect1 += 16;
+        v2 = _mm512_loadu_si512((const __m512i*)pVect2); pVect2 += 16;
+        diff = _mm512_sub_epi32(v1, v2);
+        sum = _mm512_add_epi32(sum, _mm512_mullo_epi32(diff, diff));
+    }
+
+    int32_t res = _mm512_reduce_add_epi32(sum);
+
+    size_t remaining = qty & 15;
+    for (size_t i = 0; i < remaining; i++) {
+        int32_t t = pVect1[i] - pVect2[i];
+        res += t * t;
+    }
+
+    return res;
+}
+
+static uint32_t L2SqrSIMD16ExtAVX512UInt32(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
+    return (uint32_t)L2SqrSIMD16ExtAVX512Int32(pVect1v, pVect2v, qty_ptr);
 }
 
 #endif // __AVX512F__
@@ -664,6 +920,95 @@ public:
 };
 
 //============================================================
+// L2 距离空间 —— int32_t 特化
+// 运行时根据 CPU SIMD 能力动态选择：AVX-512 > AVX2 > SSE4.1 > Scalar
+//============================================================
+
+class L2SpaceInt32 : public SpaceInterface<int32_t> {
+    DISTFUNC<int32_t> dist_func_;
+    size_t data_size_;
+    size_t dim_;
+
+public:
+    L2SpaceInt32(size_t dim) : dim_(dim), data_size_(dim * sizeof(int32_t)) {
+        dist_func_ = L2SqrScalarInt32;
+
+#if defined(__AVX512F__) || defined(USE_AVX512)
+        if (AVX512Capable()) {
+            dist_func_ = L2SqrSIMD16ExtAVX512Int32;
+        } else
+#endif
+#if defined(__AVX2__) || defined(USE_AVX2)
+        if (AVX2Capable()) {
+            if (dim % 16 == 0) {
+                dist_func_ = L2SqrSIMD16ExtAVX2Int32;
+            } else {
+                dist_func_ = L2SqrSIMD8ExtAVX2Int32;
+            }
+        } else
+#endif
+#if defined(__SSE4_1__) || defined(__SSE__) || defined(USE_SSE)
+        if (SSECapable()) {
+            if (dim % 16 == 0) {
+                dist_func_ = L2SqrSIMD16ExtSSEInt32;
+            } else if (dim % 4 == 0) {
+                dist_func_ = L2SqrSIMD4ExtSSEInt32;
+            }
+        }
+#endif
+        ;
+    }
+
+    DISTFUNC<int32_t> get_dist_func() override { return dist_func_; }
+    void* get_dist_func_param() override { return &dim_; }
+    size_t get_data_size() override { return data_size_; }
+};
+
+//============================================================
+// L2 距离空间 —— uint32_t 特化
+//============================================================
+
+class L2SpaceUInt32 : public SpaceInterface<uint32_t> {
+    DISTFUNC<uint32_t> dist_func_;
+    size_t data_size_;
+    size_t dim_;
+
+public:
+    L2SpaceUInt32(size_t dim) : dim_(dim), data_size_(dim * sizeof(uint32_t)) {
+        dist_func_ = L2SqrScalarUInt32;
+
+#if defined(__AVX512F__) || defined(USE_AVX512)
+        if (AVX512Capable()) {
+            dist_func_ = L2SqrSIMD16ExtAVX512UInt32;
+        } else
+#endif
+#if defined(__AVX2__) || defined(USE_AVX2)
+        if (AVX2Capable()) {
+            if (dim % 16 == 0) {
+                dist_func_ = L2SqrSIMD16ExtAVX2UInt32;
+            } else {
+                dist_func_ = L2SqrSIMD8ExtAVX2UInt32;
+            }
+        } else
+#endif
+#if defined(__SSE4_1__) || defined(__SSE__) || defined(USE_SSE)
+        if (SSECapable()) {
+            if (dim % 16 == 0) {
+                dist_func_ = L2SqrSIMD16ExtSSEUInt32;
+            } else if (dim % 4 == 0) {
+                dist_func_ = L2SqrSIMD4ExtSSEUInt32;
+            }
+        }
+#endif
+        ;
+    }
+
+    DISTFUNC<uint32_t> get_dist_func() override { return dist_func_; }
+    void* get_dist_func_param() override { return &dim_; }
+    size_t get_data_size() override { return data_size_; }
+};
+
+//============================================================
 // 便捷工厂函数：根据模板类型 T 自动创建对应的 L2 距离空间实例。
 // 在 HNSWGraph 的模板代码中使用，根据 T=float/double 自动分发。
 //============================================================
@@ -681,32 +1026,13 @@ inline std::unique_ptr<SpaceInterface<double>> create_l2_space<double>(size_t di
     return std::make_unique<L2SpaceDouble>(dim);
 }
 
-//============================================================
-// 旧接口兼容包装函数（供过渡期使用）
-// 封装为直接接受指针/维度参数的调用形式，
-// 内部通过 Scalar 实现计算，与原有调用方式完全兼容。
-//============================================================
-
-inline float L2Sqr(const float* pVect1, const float* pVect2, const void* qty_ptr) {
-    return L2SqrScalar((const void*)pVect1, (const void*)pVect2, qty_ptr);
+template<>
+inline std::unique_ptr<SpaceInterface<int32_t>> create_l2_space<int32_t>(size_t dim) {
+    return std::make_unique<L2SpaceInt32>(dim);
 }
 
-inline float L2Sqr(const float* pVect1, const float* pVect2, size_t qty) {
-    return L2SqrScalar((const void*)pVect1, (const void*)pVect2, (const void*)&qty);
+template<>
+inline std::unique_ptr<SpaceInterface<uint32_t>> create_l2_space<uint32_t>(size_t dim) {
+    return std::make_unique<L2SpaceUInt32>(dim);
 }
 
-inline double L2Sqr(const double* pVect1, const double* pVect2, const void* qty_ptr) {
-    return L2SqrScalarDouble((const void*)pVect1, (const void*)pVect2, qty_ptr);
-}
-
-inline double L2Sqr(const double* pVect1, const double* pVect2, size_t qty) {
-    return L2SqrScalarDouble((const void*)pVect1, (const void*)pVect2, (const void*)&qty);
-}
-
-inline float IPSqr(const float* pVect1, const float* pVect2, size_t qty) {
-    return IPSqrScalar((const void*)pVect1, (const void*)pVect2, (const void*)&qty);
-}
-
-inline float IPSqr(const float* pVect1, const float* pVect2, const void* qty_ptr) {
-    return IPSqrScalar((const void*)pVect1, (const void*)pVect2, qty_ptr);
-}

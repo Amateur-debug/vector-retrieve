@@ -1,13 +1,14 @@
+import os
+os.environ["GRPC_VERBOSITY"] = "NONE"
+
 import argparse
 import numpy as np
 import time
 import weaviate
 import subprocess
 import json
-import os
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances, Reconfigure
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing  # [新增] 引入 multiprocessing
+import multiprocessing
 from typing import List, Dict
 from monitor import WeaviateMonitor
 import yaml
@@ -31,7 +32,8 @@ GRPC_PORT = 19604
 
 # --- 独立的 Worker 函数 (必须定义在顶层以便 pickle) ---
 
-def query_worker(node_ips, data_name, queries, global_indices, k, ground_truth):
+def query_worker(worker_id, node_ips, data_name, queries, global_indices, k, ground_truth,
+                 progress_counter, result_queue):
     """
     单个进程的查询任务：建立到所有节点的连接，每次查询随机选择节点
     """
@@ -48,12 +50,14 @@ def query_worker(node_ips, data_name, queries, global_indices, k, ground_truth):
                 grpc_host=ip, grpc_port=GRPC_PORT, grpc_secure=False,
             )
             clients[ip] = client
-            collections[ip] = client.collections.get(data_name) 
+            collections[ip] = client.collections.get(data_name)
     except Exception as e:
         print(f"  [Fatal] Failed to connect to nodes: {e}")
-        return [], []
+        result_queue.put((worker_id, [], [], time.time()))
+        return
 
     try:
+        local_count = 0
         for i, vec in enumerate(queries):
             # 每次查询随机选择一个节点
             target_ip = np.random.choice(node_ips)
@@ -66,7 +70,7 @@ def query_worker(node_ips, data_name, queries, global_indices, k, ground_truth):
                 )
                 ids = [obj.properties['original_index'] for obj in response.objects]
                 latencies.append(time.time() - start_time)
-                
+
                 # 计算该查询的召回率
                 gt_ids = set(ground_truth[global_indices[i]][:k])
                 recall = len(gt_ids.intersection(set(ids))) / k
@@ -74,6 +78,17 @@ def query_worker(node_ips, data_name, queries, global_indices, k, ground_truth):
             except Exception as e:
                 latencies.append(0.0)
                 recalls.append(0.0)
+
+            local_count += 1
+            if local_count % 10 == 0:
+                with progress_counter.get_lock():
+                    progress_counter.value += 10
+                local_count = 0
+        # 补上余数
+        if local_count > 0:
+            with progress_counter.get_lock():
+                progress_counter.value += local_count
+        query_end_time = time.time()
     finally:
         for client in clients.values():
             try:
@@ -81,7 +96,7 @@ def query_worker(node_ips, data_name, queries, global_indices, k, ground_truth):
             except:
                 pass
 
-    return latencies, recalls
+    result_queue.put((worker_id, latencies, recalls, query_end_time))
 
 class ClusterController:
     """负责集群节点的部署、资源限制和信息管理"""
@@ -99,8 +114,11 @@ class ClusterController:
         ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
         if control_path:
             ssh_opts.extend(["-o", f"ControlPath={control_path}"])
-        
-        full_cmd = ["ssh"] + ssh_opts + [f"{self.user}@{ip}", cmd]
+
+        # 设置 XDG_RUNTIME_DIR 以支持非交互式 SSH 下的 systemctl --user
+        uid_cmd = "id -u"
+        env_prefix = f'export XDG_RUNTIME_DIR="/run/user/$(id -u)" && '
+        full_cmd = ["ssh"] + ssh_opts + [f"{self.user}@{ip}", env_prefix + cmd]
         
         if capture_output:
             return subprocess.run(full_cmd, capture_output=True, check=check)
@@ -114,7 +132,8 @@ class ClusterController:
         if control_path:
             ssh_opts.extend(["-o", f"ControlPath={control_path}"])
         
-        full_cmd = ["ssh"] + ssh_opts + [f"{self.user}@{ip}", cmd]
+        env_prefix = f'export XDG_RUNTIME_DIR="/run/user/$(id -u)" && '
+        full_cmd = ["ssh"] + ssh_opts + [f"{self.user}@{ip}", env_prefix + cmd]
         return subprocess.check_output(full_cmd).decode().strip()
 
     def setup_ssh_connections(self, nodes: List[Dict]):
@@ -186,23 +205,30 @@ class ClusterController:
             except Exception as e:
                 print(f"  [WARN] 关闭 {ip} SSH 连接失败: {e}")
         
-        # 终止所有 master 进程
+        # 终止所有 master 进程并关闭管道
         for proc in self.ssh_processes:
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                if pipe:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
             if proc.poll() is None:
                 proc.terminate()
                 try:
                     proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-        
+
         self.ssh_processes = []
         self.ssh_control_paths = {}
         print("=== SSH 连接清理完成 ===\n")
 
-    def _generate_compose_file(self, active_nodes: List[Dict]):
+    def _generate_compose_file(self, active_nodes: List[Dict], num_threads: int = 0):
         """
         为每个节点生成独立的 docker-compose-{i}.yml
         关键点：动态计算 RAFT_BOOTSTRAP_EXPECT 和 CLUSTER_JOIN
+        num_threads: GOMAXPROCS 值（Go 运行时线程数），0 表示不限制
         """
         print(f"正在生成 {len(active_nodes)} 个节点的 docker-compose 配置...")
         
@@ -245,7 +271,9 @@ class ClusterController:
                         # 关键动态参数
                         "CLUSTER_JOIN": cluster_join_str,
                         "RAFT_JOIN": raft_join_str,
-                        "RAFT_BOOTSTRAP_EXPECT": bootstrap_expect
+                        "RAFT_BOOTSTRAP_EXPECT": bootstrap_expect,
+                        # Go 运行时线程数（对应 CoTra/自研系统的 num_threads）
+                        **({"GOMAXPROCS": str(num_threads)} if num_threads > 0 else {}),
                     }
                 }
             }
@@ -275,7 +303,7 @@ class ClusterController:
         
         print(f"  [OK] 共生成 {len(active_nodes)} 个配置文件 (Expect: {bootstrap_expect})")
 
-    def deploy(self, nodes: List[Dict]):
+    def deploy(self, nodes: List[Dict], num_threads: int = 0):
         print(f"\n=== 开始部署 {len(nodes)} 节点 Weaviate 集群 ===")
         
         # 0. 建立 SSH 持久连接
@@ -302,7 +330,7 @@ class ClusterController:
                 print(f"  [WARN] 清理节点 {name} 失败: {e}")
 
         # 2. 动态生成配置文件 (此时生成，确保启动时使用的是最新配置)
-        self._generate_compose_file(nodes)
+        self._generate_compose_file(nodes, num_threads)
 
         # 3. 启动新容器
         print("\n>>> [Step 2/2] 正在启动新环境...")
@@ -319,7 +347,13 @@ class ClusterController:
                 self._run_ssh_cmd(ip, start_cmd, check=True)
                 print(f"  [OK] 节点 {name} 启动完成")
             except subprocess.CalledProcessError as e:
+                stderr_msg = e.stderr.decode() if e.stderr else ""
+                stdout_msg = e.stdout.decode() if e.stdout else ""
                 print(f"  [FAIL] 节点 {name} 启动失败: {e}")
+                if stderr_msg:
+                    print(f"  STDERR: {stderr_msg}")
+                if stdout_msg:
+                    print(f"  STDOUT: {stdout_msg}")
                 raise e
         print(f"=== 集群部署完成! ===\n")
 
@@ -461,17 +495,33 @@ class WeaviateIndexer:
                 total_count = client.collections.get(self.collection_name).aggregate.over_all(total_count=True).total_count
                 print(f"  集合总向量数: {total_count}")
                 
-                # 获取每个分片的信息
-                print("\n=== 各分片向量数 ===")
+                # 获取每个分片的信息（通过 cluster nodes API 获取分片-节点映射）
+                print("\n=== 各分片分布 ===")
                 try:
-                    shards_response = collection.shards()
-                    if shards_response:
-                        for shard in shards_response:
-                            print(f"  Shard {shard.name}: {shard.object_count} vectors (state: {shard.state})")
-                    else:
-                        print("  无法获取分片信息")
+                    nodes_status = client.cluster.nodes(output="verbose")
+                    for node_info in nodes_status:
+                        node_name = getattr(node_info, 'name', 'unknown')
+                        shards = getattr(node_info, 'shards', [])
+                        if shards:
+                            for shard in shards:
+                                shard_name = getattr(shard, 'name', 'unknown')
+                                obj_count = getattr(shard, 'object_count', 0)
+                                collection_name = getattr(shard, 'collection', '')
+                                if collection_name.lower() == self.collection_name.lower() or not collection_name:
+                                    print(f"  Node {node_name} → Shard {shard_name}: {obj_count} vectors")
+                        else:
+                            print(f"  Node {node_name} → 无分片")
                 except Exception as shard_e:
-                    print(f"  获取分片信息失败: {shard_e}")
+                    # 回退：使用 collection.shards()
+                    print(f"  cluster nodes API 失败 ({shard_e})，回退到 collection.shards():")
+                    try:
+                        shards_response = collection.shards()
+                        if shards_response:
+                            for shard in shards_response:
+                                status = getattr(shard, 'status', getattr(shard, 'state', 'N/A'))
+                                print(f"  Shard {shard.name}: {shard.object_count} vectors (status: {status})")
+                    except Exception as e2:
+                        print(f"  获取分片信息失败: {e2}")
             except Exception as e:
                 print(f"  获取配置失败: {e}")
         finally:
@@ -501,7 +551,9 @@ class QueryBenchmark:
                     grpc_host=ip, grpc_port=GRPC_PORT, grpc_secure=False,
                 )
                 client.collections.get(self.args.data_name).config.update(
-                    vector_index_config=Reconfigure.VectorIndex.hnsw(ef=self.args.ef_search)
+                    vector_config=Reconfigure.Vectors.update(
+                        vector_index_config=Reconfigure.VectorIndex.hnsw(ef=self.args.ef_search)
+                    )
                 )
                 print(f"  [OK] ef_search 参数已更新")
             except Exception as e:
@@ -531,53 +583,72 @@ class QueryBenchmark:
         np.random.shuffle(indices)
         shuffled_vectors = self.query_vectors[indices]
 
-        # 每个进程都处理所有查询向量
-        all_tasks = []
+        # 共享进度计数器（fork 模式直接使用 mp 原语）
+        progress_counter = multiprocessing.Value('i', 0)
+        result_queue = multiprocessing.Queue()
+
+        print(f"启动 {num_threads} 个进程，每进程处理 {total_queries} 个查询...")
+
+        # 使用 fork 模式（默认），与自研系统对齐
+        processes = []
         for t in range(num_threads):
-            all_tasks.append((
-                node_ips,
-                self.args.data_name,
-                shuffled_vectors,
-                indices,
-                self.args.k,
-                self.ground_truth,  # 传递 ground_truth
+            p = multiprocessing.Process(target=query_worker, args=(
+                t, node_ips, self.args.data_name, shuffled_vectors, indices,
+                self.args.k, self.ground_truth, progress_counter, result_queue,
             ))
+            p.start()
+            processes.append(p)
 
-        print(f"启动 {len(all_tasks)} 个进程，每进程处理 {total_queries} 个查询...")
+        total_client_queries = total_queries * num_threads
+        query_start_time = time.time()
 
-        # 使用 spawn 上下文
-        ctx = multiprocessing.get_context('spawn')
-        with ProcessPoolExecutor(max_workers=len(all_tasks), mp_context=ctx) as executor:
-            futures = [executor.submit(query_worker, *task) for task in all_tasks]
+        # 轮询共享计数器实时更新进度条（每0.5秒更新一次，与自研系统对齐）
+        with tqdm(total=total_client_queries, desc="Querying", unit="qry",
+                  bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, QPS: {postfix}]') as pbar:
+            pbar.set_postfix_str("0.0")
+            last_value = 0
+            last_update_time = time.time()
+            while True:
+                current_count = progress_counter.value
+                now = time.time()
+                if now - last_update_time >= 0.5 or current_count >= total_client_queries:
+                    elapsed = now - query_start_time
+                    current_qps = current_count / elapsed if elapsed > 0 else 0.0
+                    pbar.update(current_count - last_value)
+                    pbar.set_postfix_str(f"{current_qps:.1f}")
+                    last_value = current_count
+                    last_update_time = now
+                if current_count >= total_client_queries:
+                    break
+                time.sleep(0.1)
 
-            all_latencies = []
-            all_recalls = []
-            total_client_queries = total_queries * num_threads
-            query_start_time = time.time()
-            
-            with tqdm(total=total_client_queries, desc="Querying", unit="qry") as pbar:
-                last_count = 0
-                for future in as_completed(futures):
-                    lats, recs = future.result()
-                    all_latencies.extend(lats)
-                    all_recalls.extend(recs)
-                    # 更新进度
-                    current_count = len(all_latencies)
-                    pbar.update(current_count - last_count)
-                    last_count = current_count
-                    # 更新 QPS
-                    elapsed = time.time() - query_start_time
-                    if elapsed > 0:
-                        current_qps = current_count / elapsed
-                        pbar.set_postfix(QPS=f"{current_qps:.1f}")
+        # 先从 Queue 读结果（必须在 join 之前，否则管道满时会死锁）
+        all_latencies = []
+        all_recalls = []
+        thread_query_end_times = [0.0] * num_threads
+        for _ in range(num_threads):
+            worker_id, lats, recs, query_end_time = result_queue.get()
+            all_latencies.extend(lats)
+            all_recalls.extend(recs)
+            thread_query_end_times[worker_id] = query_end_time
 
-        global_end_time = time.time()
-        total_duration = global_end_time - global_start_time
+        for p in processes:
+            p.join()
+
+        # 用各线程查询结束时间的平均值计算 QPS（与自研系统对齐）
+        valid_times = [t for t in thread_query_end_times if t > 0]
+        if valid_times:
+            avg_query_end = sum(valid_times) / len(valid_times)
+            total_query_time = avg_query_end - query_start_time
+        else:
+            total_query_time = time.time() - query_start_time
 
         # 3. 统计结果
-        self.report(all_latencies, all_recalls, total_duration, start_stats)
+        avg_recall = np.mean(all_recalls) if all_recalls else 0.0
+        client_qps = self.report(all_latencies, all_recalls, total_query_time, start_stats)
+        return client_qps, avg_recall
 
-    def report(self, latencies, recalls, duration, start_stats):
+    def report(self, latencies, recalls, duration, start_stats, qps_override=None, qps_runs=None):
         # 召回率直接取平均
         avg_recall = np.mean(recalls) if recalls else 0.0
         avg_latency = np.mean(latencies) * 1000
@@ -611,6 +682,8 @@ class QueryBenchmark:
         # 理论 QPS (客户端发送的查询总数)
         total_client_queries = len(self.query_vectors) * self.args.num_query_threads
         client_qps = total_client_queries / duration
+        # 支持外部覆盖 QPS（多次运行取均值时使用）
+        save_qps = qps_override if qps_override is not None else client_qps
 
         print(f"--------------------------------")
         print(f"=== 测试结果 ===")
@@ -625,9 +698,8 @@ class QueryBenchmark:
         print(f"服务器 QPS: {global_qps:.2f}")
 
         # 保存结果到 JSON 文件
-        results_dir = "./results"
+        results_dir = "./results/weaviate"
         os.makedirs(results_dir, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
         cpu_suffix = f"-cpus{self.args.num_cpu}" if self.args.num_cpu != 0 else ""
 
         stats = {
@@ -641,16 +713,20 @@ class QueryBenchmark:
                 "node_num": len(self.active_nodes),
             },
             "num_queries": len(self.query_vectors),
+            "num_query_threads": self.args.num_query_threads,
+            "num_threads": self.args.num_threads,
             "k": self.args.k,
-            "qps": round(client_qps, 2),
+            "qps": round(save_qps, 2),
+            "qps_runs": [round(q, 2) for q in qps_runs] if qps_runs else [round(client_qps, 2)],
             f"avg_recall@{self.args.k}": round(avg_recall, 4),
             "recall": [round(r, 4) for r in recalls],
         }
 
         results_path = (
             f"{results_dir}/results-{self.args.data_name}-m{self.args.m}-"
-            f"efc{self.args.ef_construction}-efs{self.args.ef_search}-node{len(self.active_nodes)}-"
-            f"threads{self.args.num_query_threads}{cpu_suffix}-{timestamp}.json"
+            f"efc{self.args.ef_construction}-efs{self.args.ef_search}-"
+            f"node{len(self.active_nodes)}-"
+            f"threads{self.args.num_threads}-query_threads{self.args.num_query_threads}{cpu_suffix}.json"
         )
 
         with open(results_path, 'w') as f:
@@ -659,6 +735,8 @@ class QueryBenchmark:
         print(f"\n{'=' * 50}")
         print(f"Results saved: {os.path.abspath(results_path)}")
         print(f"{'=' * 50}\n")
+
+        return client_qps
 
 
 def main(args):
@@ -676,7 +754,7 @@ def main(args):
     try:
         # 1. 如果指定了部署标志，先执行部署
         if args.deploy:
-            controller.deploy(active_nodes)
+            controller.deploy(active_nodes, num_threads=args.num_threads)
         elif args.num_cpu != 0:
             # 如果没有部署但需要设置 CPU 限制，先建立 SSH 连接
             controller.setup_ssh_connections(active_nodes)
@@ -706,7 +784,46 @@ def main(args):
 
         # 4. 执行压测
         benchmark = QueryBenchmark(args, active_nodes, query_vectors, ground_truth)
-        benchmark.run()
+        num_runs = args.num_runs
+        if num_runs <= 1:
+            benchmark.run()
+        else:
+            qps_list = []
+            for run_idx in range(num_runs):
+                print(f"\n{'='*60}")
+                print(f"  Query Run {run_idx + 1}/{num_runs}")
+                print(f"{'='*60}")
+                qps, _ = benchmark.run()
+                qps_list.append(qps)
+                print(f"  Run {run_idx + 1}/{num_runs} QPS: {qps:.2f}")
+
+            # 去掉最高最低取均值
+            if len(qps_list) >= 3:
+                sorted_qps = sorted(qps_list)
+                trimmed = sorted_qps[1:-1]
+                avg_qps = sum(trimmed) / len(trimmed)
+            else:
+                avg_qps = sum(qps_list) / len(qps_list)
+
+            print(f"\n{'='*60}")
+            print(f"  QPS runs: {[round(q, 2) for q in qps_list]}")
+            print(f"  QPS avg (trimmed): {avg_qps:.2f}")
+            print(f"{'='*60}")
+
+            # 读取最后一次保存的结果文件，更新 qps、qps_runs、recall
+            cpu_suffix = f"-cpus{args.num_cpu}" if args.num_cpu != 0 else ""
+            results_path = (
+                f"./results/weaviate/results-{args.data_name}-m{args.m}-"
+                f"efc{args.ef_construction}-efs{args.ef_search}-"
+                f"node{len(active_nodes)}-"
+                f"threads{args.num_threads}-query_threads{args.num_query_threads}{cpu_suffix}.json"
+            )
+            with open(results_path, 'r') as f:
+                data = json.load(f)
+            data['qps'] = round(avg_qps, 2)
+            data['qps_runs'] = [round(q, 2) for q in qps_list]
+            with open(results_path, 'w') as f:
+                json.dump(data, f, indent=4)
     finally:
         # 清理 SSH 连接
         controller.cleanup_ssh_connections()
@@ -723,7 +840,7 @@ if __name__ == "__main__":
     # 节点与部署配置
     parser.add_argument("--node_num", type=int, default=1, help="Number of nodes to use (and deploy)")
     parser.add_argument("--deploy", action="store_true", default=False, help="Deploy/Restart cluster before running benchmark")
-    parser.add_argument("--num_cpu", type=float, default=8, help="Number of CPU cores per node (e.g. 4.0). 0 means no limit.")
+    parser.add_argument("--num_cpu", type=int, default=8, help="Number of CPU cores per node. 0 means no limit.")
     parser.add_argument("--build", action="store_true", default=False, help="Build index (load data) before querying")
 
     # HNSW 参数 (用于建图)
@@ -736,6 +853,8 @@ if __name__ == "__main__":
     # 查询参数
     parser.add_argument("--k", type=int, default=10, help="Top K")
     parser.add_argument("--num_query_threads", type=int, default=32, help="Total number of query processes (each process executes all queries)")
+    parser.add_argument("--num_threads", type=int, default=8, help="Server-side threads per node (for result filename, Weaviate manages threads internally)")
+    parser.add_argument("--num_runs", type=int, default=1, help="Number of query runs (>=3: trim max/min then average QPS)")
 
     args = parser.parse_args()
     main(args)

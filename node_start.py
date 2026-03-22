@@ -18,19 +18,35 @@ if os.path.isdir(build_dir):
     if build_dir not in sys.path:
         sys.path.insert(0, build_dir)
 
+_DTYPE_CLASS_MAP = {
+    "float":  ("PayloadFloat",  "HNSWGraphFloat",  "ClusterFloat"),
+    "double": ("PayloadDouble", "HNSWGraphDouble", "ClusterDouble"),
+    "int32":  ("PayloadInt32",  "HNSWGraphInt32",  "ClusterInt32"),
+    "uint32": ("PayloadUInt32", "HNSWGraphUInt32", "ClusterUInt32"),
+}
+
+# 提前解析 --dtype 参数
+_pre_parser = argparse.ArgumentParser(add_help=False)
+_pre_parser.add_argument("--dtype", type=str, default="float")
+_pre_args, _ = _pre_parser.parse_known_args()
+
 try:
-    from vector_retrieve import PayloadFloat as Payload
-    from vector_retrieve import HNSWGraphFloat as HNSWGraph
-    from vector_retrieve import ClusterFloat as Cluster
-except ImportError:
-    print("Error: Could not import vector_retrieve module. Please ensure the C++ project is built.")
+    import vector_retrieve as _vr
+    _payload_cls, _hnsw_cls, _cluster_cls = _DTYPE_CLASS_MAP[_pre_args.dtype]
+    Payload = getattr(_vr, _payload_cls)
+    HNSWGraph = getattr(_vr, _hnsw_cls)
+    Cluster = getattr(_vr, _cluster_cls)
+except (ImportError, KeyError) as e:
+    print(f"Error: Could not import vector_retrieve module (dtype={_pre_args.dtype}): {e}")
     sys.exit(1)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Distributed HNSW Node Start")
-    
+
     parser.add_argument("--node_id", type=int, required=True, help="ID of the current node")
     parser.add_argument("--node_ips", type=str, required=True, help="Comma separated list of IPs")
+    parser.add_argument("--dtype", type=str, default="float", choices=list(_DTYPE_CLASS_MAP.keys()),
+                        help="Vector element type")
     
     # HNSW params (needed for initialization)
     parser.add_argument("--m", type=int, default=8)
@@ -45,6 +61,7 @@ if __name__ == "__main__":
     parser.add_argument("--ib_dev", type=str, default="", help="RDMA IB device name (auto-detect if empty)")
     parser.add_argument("--ib_port", type=int, default=1, help="RDMA IB port number")
     parser.add_argument("--gid_index", type=int, default=-1, help="RDMA GID index (-1 for auto-detect)")
+    parser.add_argument("--num_threads", type=int, default=32, help="Message thread pool size (should match query threads)")
 
 
     args = parser.parse_args()
@@ -87,7 +104,7 @@ if __name__ == "__main__":
         print(f"[Node {node_id}] Configured Node {i}: IP={ip}, Port={port}, Remote={is_remote}")
 
     print(f"[Node {node_id}] Starting server...")
-    cluster.start_node_server(node_id)
+    cluster.start_node_server(node_id, msg_pool_size=args.num_threads)
     
     print(f"[Node {node_id}] Server running. Waiting for tasks...")
     # 使用 Python 循环保持主线程存活，这样可以响应 Ctrl+C 信号

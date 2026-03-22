@@ -12,14 +12,15 @@ services:
       CLUSTER_DATA_BIND_PORT: '19602'
       CLUSTER_GOSSIP_BIND_PORT: '19601'
       CLUSTER_HOSTNAME: node0
-      CLUSTER_JOIN: 192.168.200.204:19601
+      CLUSTER_JOIN: 192.168.200.204:19601,192.168.200.205:19601,192.168.200.206:19601,192.168.200.207:19601,192.168.200.208:19601
       ENABLE_MODULES: ''
+      GOMAXPROCS: '8'
       GRPC_PORT: '19604'
       PERSISTENCE_DATA_PATH: /var/lib/weaviate
       PROMETHEUS_MONITORING_ENABLED: 'true'
       QUERY_DEFAULTS_LIMIT: 25
-      RAFT_BOOTSTRAP_EXPECT: 1
-      RAFT_JOIN: node0
+      RAFT_BOOTSTRAP_EXPECT: 5
+      RAFT_JOIN: node0,node1,node2,node3,node4
       RAFT_PORT: '19600'
     image: cr.weaviate.io/semitechnologies/weaviate:1.34.2
     network_mode: host

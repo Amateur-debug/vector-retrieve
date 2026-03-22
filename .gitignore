@@ -7,6 +7,7 @@
 !/dataset/
 !/weaviate/
 !/CoTra/
+!/results/
 
 # === 白名单文件 ===
 !/*.md

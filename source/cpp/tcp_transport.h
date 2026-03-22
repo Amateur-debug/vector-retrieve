@@ -12,6 +12,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -20,8 +21,12 @@
 #include "log.h"
 
 // ==================== TCP 连接池实现 ====================
-// 基于每节点独立管理的 TCP 连接池，支持连接复用、有效性检测和自动创建新连接。
-// 与 cluster.h 中的 TcpConnectionPool 为同一实现，迁移至此处统一管理。
+// 优化要点：
+//   1. pools_mutex 改为 shared_mutex：acquire/release 热路径只取读锁（并发），
+//      register_node/close_node/clear 等冷路径取写锁（互斥）。
+//   2. acquire 中不再调用 is_socket_valid()（poll 系统调用）：直接取 idle socket，
+//      若已失效则在 send/recv 时由调用方捕获异常处理，避免在锁内做系统调用。
+//   3. release 中 is_socket_valid() 移到锁外执行，缩短临界区。
 class TcpConnectionPool {
 private:
     struct NodeConnections {
@@ -31,150 +36,140 @@ private:
         int port = 0;
         int active_count = 0;
     };
-    
+
     std::unordered_map<int, NodeConnections> node_pools;
-    std::mutex pools_mutex;
-    
+    std::shared_mutex pools_mutex;  // 读写锁：热路径读共享，冷路径写互斥
+
     int create_connection(const std::string& ip, int port) {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) return -1;
-        
+
         int flag = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-        
+
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
         inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
-        
+
         if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
             close(sock);
             return -1;
         }
-        
+
         return sock;
     }
-    
+
     bool is_socket_valid(int sock) {
         struct pollfd pfd;
         pfd.fd = sock;
         pfd.events = POLLIN | POLLOUT;
         pfd.revents = 0;
-        
+
         int ret = poll(&pfd, 1, 0);
         if (ret <= 0) return true;
-        
+
         if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
             return false;
         }
         return true;
     }
-    
+
+    // 通过读锁查找节点，返回指针（查询阶段 node_pools 不会增删，指针稳定）
+    NodeConnections* find_node(int node_id) {
+        std::shared_lock<std::shared_mutex> map_lock(pools_mutex);
+        auto it = node_pools.find(node_id);
+        if (it == node_pools.end()) return nullptr;
+        return &it->second;
+    }
+
 public:
     void register_node(int node_id, const std::string& ip, int port) {
-        std::lock_guard<std::mutex> lock(pools_mutex);
+        std::unique_lock<std::shared_mutex> lock(pools_mutex);  // 写锁，冷路径
         auto result = node_pools.try_emplace(node_id);
         NodeConnections& nc = result.first->second;
         nc.ip = ip;
         nc.port = port;
     }
-    
+
     int acquire(int node_id) {
+        // 1. 读锁查找节点（多线程并发）
+        NodeConnections* nc = find_node(node_id);
+        if (!nc) return -1;
+
         std::string ip;
         int port = 0;
-        
+
+        // 2. 仅持 per-node 锁，尝试取 idle socket（无系统调用，极短临界区）
         {
-            std::lock_guard<std::mutex> lock(pools_mutex);
-            auto it = node_pools.find(node_id);
-            if (it == node_pools.end()) {
-                return -1;
+            std::lock_guard<std::mutex> nc_lock(nc->mutex);
+            if (!nc->idle_sockets.empty()) {
+                int sock = nc->idle_sockets.front();
+                nc->idle_sockets.pop_front();
+                nc->active_count++;
+                LOG_DEBUG_STREAM("[ConnectionPool] Acquired (reused) connection for node " << node_id
+                    << ", socket=" << sock
+                    << ", idle=" << (int)nc->idle_sockets.size()
+                    << ", active=" << nc->active_count);
+                return sock;
             }
-            
-            NodeConnections& nc = it->second;
-            std::lock_guard<std::mutex> nc_lock(nc.mutex);
-            
-            while (!nc.idle_sockets.empty()) {
-                int sock = nc.idle_sockets.front();
-                nc.idle_sockets.pop_front();
-                
-                if (is_socket_valid(sock)) {
-                    nc.active_count++;
-                    int idle = (int)nc.idle_sockets.size();
-                    int active = nc.active_count;
-                    LOG_DEBUG_STREAM("[ConnectionPool] Acquired (reused) connection for node " << node_id 
-                        << ", socket=" << sock 
-                        << ", idle=" << idle
-                        << ", active=" << active
-                        << ", total=" << (idle + active));
-                    return sock;
-                }
-                close(sock);
-            }
-            
-            ip = nc.ip;
-            port = nc.port;
+            ip = nc->ip;
+            port = nc->port;
         }
-        
+
+        // 3. 无 idle 可用，在锁外创建新连接（TCP 握手不阻塞其他线程）
         if (!ip.empty() && port > 0) {
             int new_sock = create_connection(ip, port);
             if (new_sock >= 0) {
-                std::lock_guard<std::mutex> lock(pools_mutex);
-                auto it = node_pools.find(node_id);
-                if (it != node_pools.end()) {
-                    std::lock_guard<std::mutex> nc_lock(it->second.mutex);
-                    it->second.active_count++;
-                    int idle = (int)it->second.idle_sockets.size();
-                    int active = it->second.active_count;
-                    LOG_DEBUG_STREAM("[ConnectionPool] Acquired (created) connection for node " << node_id 
-                        << ", socket=" << new_sock 
-                        << ", idle=" << idle
-                        << ", active=" << active
-                        << ", total=" << (idle + active));
-                }
+                std::lock_guard<std::mutex> nc_lock(nc->mutex);
+                nc->active_count++;
+                LOG_DEBUG_STREAM("[ConnectionPool] Acquired (created) connection for node " << node_id
+                    << ", socket=" << new_sock
+                    << ", idle=" << (int)nc->idle_sockets.size()
+                    << ", active=" << nc->active_count);
             }
             return new_sock;
         }
         return -1;
     }
-    
+
     void release(int node_id, int sock, bool valid = true) {
         if (sock < 0) return;
-        
-        std::lock_guard<std::mutex> lock(pools_mutex);
-        auto it = node_pools.find(node_id);
-        if (it == node_pools.end()) {
-            close(sock);
-            return;
-        }
-        
-        NodeConnections& nc = it->second;
-        std::lock_guard<std::mutex> nc_lock(nc.mutex);
-        
+
+        // 在锁外做 poll 检查，不阻塞其他线程
         if (!valid || !is_socket_valid(sock)) {
             close(sock);
-            if (nc.active_count > 0) nc.active_count--;
+            NodeConnections* nc = find_node(node_id);
+            if (nc) {
+                std::lock_guard<std::mutex> nc_lock(nc->mutex);
+                if (nc->active_count > 0) nc->active_count--;
+            }
             LOG_DEBUG_STREAM("[ConnectionPool] Closed invalid connection for node " << node_id << ", socket=" << sock);
             return;
         }
-        
-        nc.idle_sockets.push_back(sock);
-        if (nc.active_count > 0) nc.active_count--;
-        
-        int idle = (int)nc.idle_sockets.size();
-        int active = nc.active_count;
-        LOG_DEBUG_STREAM("[ConnectionPool] Released connection for node " << node_id 
-            << ", socket=" << sock 
-            << ", idle=" << idle
-            << ", active=" << active
-            << ", total=" << (idle + active));
+
+        // 仅持 per-node 锁归还（极短临界区）
+        NodeConnections* nc = find_node(node_id);
+        if (!nc) {
+            close(sock);
+            return;
+        }
+
+        std::lock_guard<std::mutex> nc_lock(nc->mutex);
+        nc->idle_sockets.push_back(sock);
+        if (nc->active_count > 0) nc->active_count--;
+        LOG_DEBUG_STREAM("[ConnectionPool] Released connection for node " << node_id
+            << ", socket=" << sock
+            << ", idle=" << (int)nc->idle_sockets.size()
+            << ", active=" << nc->active_count);
     }
-    
+
     void close_node(int node_id) {
-        std::lock_guard<std::mutex> lock(pools_mutex);
+        std::unique_lock<std::shared_mutex> lock(pools_mutex);  // 写锁，冷路径
         auto it = node_pools.find(node_id);
         if (it == node_pools.end()) return;
-        
+
         NodeConnections& nc = it->second;
         std::lock_guard<std::mutex> nc_lock(nc.mutex);
         size_t closed_count = nc.idle_sockets.size();
@@ -183,23 +178,23 @@ public:
         }
         nc.idle_sockets.clear();
         nc.active_count = 0;
-        
-        LOG_DEBUG_STREAM("[ConnectionPool] Closed all connections for node " << node_id 
+
+        LOG_DEBUG_STREAM("[ConnectionPool] Closed all connections for node " << node_id
             << ", closed_idle=" << closed_count);
     }
-    
+
     std::string get_stats() {
-        std::lock_guard<std::mutex> lock(pools_mutex);
+        std::shared_lock<std::shared_mutex> lock(pools_mutex);  // 读锁即可
         std::string stats;
         for (const auto& kv : node_pools) {
-            stats += "Node " + std::to_string(kv.first) + 
+            stats += "Node " + std::to_string(kv.first) +
                      ": " + std::to_string(kv.second.idle_sockets.size()) + " idle\n";
         }
         return stats;
     }
-    
+
     void clear() {
-        std::lock_guard<std::mutex> lock(pools_mutex);
+        std::unique_lock<std::shared_mutex> lock(pools_mutex);  // 写锁，冷路径
         size_t total_closed = 0;
         for (auto& kv : node_pools) {
             std::lock_guard<std::mutex> nc_lock(kv.second.mutex);

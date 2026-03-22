@@ -1,10 +1,9 @@
-import subprocess
 import itertools
 import argparse
-import concurrent.futures
 import time
+from types import SimpleNamespace
 
-SCRIPT_PATH = "draw.py"
+from draw import run_draw
 
 # ============================================================
 # 画图任务配置
@@ -24,6 +23,7 @@ DRAW_TASKS = [
             "limited_level": [5],
             "node_num":     [5],
             "redundancy":   [2],
+            "num_query_threads": [40],
         },
     },
     # --- compare 模式：三路对比柱状图，threads vs qps ---
@@ -39,41 +39,578 @@ DRAW_TASKS = [
             "limited_level": [5],
             "node_num":     [5],
             "redundancy":   [2],
+            "num_query_threads": [40],
+        },
+    },
+    # --- compare 模式：固定 recall，threads vs qps 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["threads"],
+            "y":            ["qps"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "redundancy":   [2],
+            "num_query_threads": [40],
+            "recall":       [0.95, 0.9, 0.85],
+        },
+    },
+    # --- compare 模式：固定 recall，threads vs qps 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["threads"],
+            "y":            ["qps"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "redundancy":   [2],
+            "num_query_threads": [40],
+            "recall":       [0.95, 0.9, 0.85],
+        },
+    },
+    # --- compare 模式：redundancy vs redundancy_num 折线图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["redundancy"],
+            "y":            ["redundancy_num"],
+            "data_name":    ["sift"],
+            "m":            [10],
+            "ef_construction": [200],
+            "ef_search":    [15],
+            "limited_level": [5],
+            "node_num":     [5],
+            "threads":      [8],
+            "num_query_threads": [40],
+        },
+    },
+    # --- compare 模式：redundancy vs avg_remote_transfer_cnt 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["redundancy"],
+            "y":            ["avg_remote_transfer_cnt"],
+            "data_name":    ["sift"],
+            "m":            [10],
+            "ef_construction": [200],
+            "ef_search":    [15],
+            "limited_level": [5],
+            "node_num":     [5],
+            "threads":      [8],
+            "num_query_threads": [40],
+        },
+    },
+    # --- compare 模式：redundancy vs avg_remote_transfer_cnt 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["redundancy"],
+            "y":            ["avg_remote_transfer_cnt"],
+            "data_name":    ["sift"],
+            "m":            [10],
+            "ef_construction": [200],
+            "ef_search":    [15],
+            "limited_level": [5],
+            "node_num":     [5],
+            "threads":      [8],
+            "num_query_threads": [40],
+        },
+    },
+    # --- compare 模式：redundancy vs avg_remote_transfer_data_per_transfer 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["redundancy"],
+            "y":            ["avg_remote_transfer_data_per_transfer"],
+            "data_name":    ["sift"],
+            "m":            [10],
+            "ef_construction": [200],
+            "ef_search":    [15],
+            "limited_level": [5],
+            "node_num":     [5],
+        },
+    },
+    # --- compare 模式：redundancy vs avg_remote_transfer_data_per_transfer 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["redundancy"],
+            "y":            ["avg_remote_transfer_data_per_transfer"],
+            "data_name":    ["sift"],
+            "m":            [10],
+            "ef_construction": [200],
+            "ef_search":    [15],
+            "limited_level": [5],
+            "node_num":     [5],
+        },
+    },
+    # --- compare 模式：redundancy vs avg_remote_transfer_data_per_query 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["redundancy"],
+            "y":            ["avg_remote_transfer_data_per_query"],
+            "data_name":    ["sift"],
+            "m":            [10],
+            "ef_construction": [200],
+            "ef_search":    [15],
+            "limited_level": [5],
+            "node_num":     [5],
+        },
+    },
+    # --- compare 模式：redundancy vs avg_remote_transfer_data_per_query 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["redundancy"],
+            "y":            ["avg_remote_transfer_data_per_query"],
+            "data_name":    ["sift"],
+            "m":            [10],
+            "ef_construction": [200],
+            "ef_search":    [15],
+            "limited_level": [5],
+            "node_num":     [5],
+        },
+    },
+    # --- compare 模式：avg_distance_cnt vs recall 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["avg_distance_cnt"],
+            "y":            ["avg_recall@10"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+            "threads":      [8],
+            "num_query_threads": [40],
+        },
+    },
+    # --- compare 模式：avg_remote_transfer_cnt vs qps 折线图（split）---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["avg_remote_transfer_cnt"],
+            "y":            ["qps"],
+            "data_name":    ["sift"],
+            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+            "threads":      [8, 16, 32, 64],
+            "num_query_threads": [40],
+            "split":        [True],
+        },
+    },
+    # --- compare 模式：efs vs qps 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["ef_search"],
+            "y":            ["qps"],
+            "data_name":    ["sift"],
+            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+            "threads":      [8, 16, 32, 64],
+            "num_query_threads": [40],
+        },
+    },
+    # --- compare 模式：efs vs qps 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["ef_search"],
+            "y":            ["qps"],
+            "data_name":    ["sift"],
+            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+            "threads":      [8, 16, 32, 64],
+            "num_query_threads": [40],
+        },
+    },
+    # --- compare 模式：efs vs recall 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["ef_search"],
+            "y":            ["avg_recall@10"],
+            "data_name":    ["sift"],
+            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+            "threads":      [8, 16, 32, 64],
+            "num_query_threads": [40],
+        },
+    },
+    # --- compare 模式：efs vs recall 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["ef_search"],
+            "y":            ["avg_recall@10"],
+            "data_name":    ["sift"],
+            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+            "threads":      [8, 16, 32, 64],
+            "num_query_threads": [40],
+        },
+    },
+    # --- compare 模式：efs vs avg_remote_transfer_cnt 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["ef_search"],
+            "y":            ["avg_remote_transfer_cnt"],
+            "data_name":    ["sift"],
+            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+            "threads":      [8, 16, 32, 64],
+            "num_query_threads": [40],
+        },
+    },
+    # --- compare 模式：efs vs avg_remote_transfer_data_per_transfer 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["ef_search"],
+            "y":            ["avg_remote_transfer_data_per_transfer"],
+            "data_name":    ["sift"],
+            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+        },
+    },
+    # --- compare 模式：efs vs avg_remote_transfer_data_per_transfer 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["ef_search"],
+            "y":            ["avg_remote_transfer_data_per_transfer"],
+            "data_name":    ["sift"],
+            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+        },
+    },
+    # --- compare 模式：efs vs avg_remote_transfer_data_per_query 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["ef_search"],
+            "y":            ["avg_remote_transfer_data_per_query"],
+            "data_name":    ["sift"],
+            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+        },
+    },
+    # --- compare 模式：efs vs avg_remote_transfer_data_per_query 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["ef_search"],
+            "y":            ["avg_remote_transfer_data_per_query"],
+            "data_name":    ["sift"],
+            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+        },
+    },
+    # --- compare 模式：recall vs avg_remote_transfer_data_per_transfer 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["avg_recall@10"],
+            "y":            ["avg_remote_transfer_data_per_transfer"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+        },
+    },
+    # --- compare 模式：recall vs avg_remote_transfer_data_per_transfer 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["avg_recall@10"],
+            "y":            ["avg_remote_transfer_data_per_transfer"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+        },
+    },
+    # --- compare 模式：recall vs avg_remote_transfer_data_per_query 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["avg_recall@10"],
+            "y":            ["avg_remote_transfer_data_per_query"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+        },
+    },
+    # --- compare 模式：recall vs avg_remote_transfer_data_per_query 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["avg_recall@10"],
+            "y":            ["avg_remote_transfer_data_per_query"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+        },
+    },
+    # --- compare 模式：recall vs avg_distance_cnt 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["avg_recall@10"],
+            "y":            ["avg_distance_cnt"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+        },
+    },
+    # --- compare 模式：recall vs avg_distance_cnt 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["avg_recall@10"],
+            "y":            ["avg_distance_cnt"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+        },
+    },
+    # --- compare 模式：recall vs avg_remote_transfer_cnt 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["avg_recall@10"],
+            "y":            ["avg_remote_transfer_cnt"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+        },
+    },
+    # --- compare 模式：recall vs avg_remote_transfer_cnt 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["avg_recall@10"],
+            "y":            ["avg_remote_transfer_cnt"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+        },
+    },
+    # --- group 模式：x=ef_search, y=qps, 按 m 分组 ---
+    {
+        "chart": "line",
+        "mode": "group",
+        "grid": {
+            "x":            ["ef_search"],
+            "y":            ["qps"],
+            "group_by":     ["m"],
+            "data_name":    ["sift"],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+            "threads":      [8, 16, 32, 64],
+            "num_query_threads": [40],
+            "layer":        [True, False],
+        },
+    },
+    # --- group 模式：x=m, y=qps, 按 ef_search 分组 ---
+    {
+        "chart": "line",
+        "mode": "group",
+        "grid": {
+            "x":            ["m"],
+            "y":            ["qps"],
+            "group_by":     ["ef_search"],
+            "data_name":    ["sift"],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+            "threads":      [8, 16, 32, 64],
+            "num_query_threads": [40],
+            "layer":        [True, False],
+        },
+    },
+    # --- group 模式：recall vs avg_remote_transfer_cnt，按 redundancy 分组 ---
+    {
+        "chart": "line",
+        "mode": "group",
+        "grid": {
+            "x":            ["avg_recall@10"],
+            "y":            ["avg_remote_transfer_cnt"],
+            "group_by":     ["redundancy"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "threads":      [8, 16, 32, 64],
+            "num_query_threads": [40],
+            "layer":        [True, False],
+        },
+    },
+    # --- compare 模式：recall vs qps 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["avg_recall@10"],
+            "y":            ["qps"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+            "threads":      [8, 16, 32, 64],
+            "num_query_threads": [40],
+            "layer":        [True, False],
+        },
+    },
+    # --- compare 模式：recall vs qps 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["avg_recall@10"],
+            "y":            ["qps"],
+            "data_name":    ["sift"],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+            "threads":      [8, 16, 32, 64],
+            "num_query_threads": [40],
+            "layer":        [True, False],
+        },
+    },
+    # --- compare 模式：efs vs avg_distance_cnt 折线图 ---
+    {
+        "chart": "line",
+        "mode": "compare",
+        "grid": {
+            "x":            ["ef_search"],
+            "y":            ["avg_distance_cnt"],
+            "data_name":    ["sift"],
+            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+            "threads":      [8, 16, 32, 64],
+            "num_query_threads": [40],
+        },
+    },
+    # --- compare 模式：efs vs avg_distance_cnt 柱状图 ---
+    {
+        "chart": "bar",
+        "mode": "compare",
+        "grid": {
+            "x":            ["ef_search"],
+            "y":            ["avg_distance_cnt"],
+            "data_name":    ["sift"],
+            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "ef_construction": [200],
+            "limited_level": [5],
+            "node_num":     [5],
+            "redundancy":   [0, 1, 2],
+            "threads":      [8, 16, 32, 64],
+            "num_query_threads": [40],
         },
     },
 ]
 
-# 并行进程数
-MAX_WORKERS = 4
+
+# 默认参数（与 draw.py 的 argparse 默认值对齐）
+DEFAULTS = {
+    "json_path": "./results/cpp",
+    "weaviate_path": "./weaviate/results/",
+    "output_dir": "./plot",
+    "chart": "line",
+    "mode": "compare",
+    "x": "ef_search",
+    "y": "qps",
+    "data_name": "sift",
+    "m": None,
+    "ef_construction": None,
+    "ef_search": None,
+    "limited_level": None,
+    "node_num": 5,
+    "partition_mode": "k-means",
+    "layer": None,
+    "no_layer": False,
+    "redundancy": None,
+    "threads": None,
+    "num_query_threads": None,
+    "reduce": False,
+    "distributed": False,
+    "recall": None,
+    "group_by": None,
+    "debug": False,
+    "split": False,
+    "vertical": False,
+}
 
 
-def build_command(chart, mode, params):
-    """根据参数构建 draw.py 命令"""
-    cmd = ["python", SCRIPT_PATH, "--chart", chart, "--mode", mode]
-    for key, val in params.items():
-        cmd += [f"--{key}", str(val)]
-    return cmd
-
-
-def run_worker(cmd, task_id, total_tasks, description):
-    """运行单个画图任务"""
-    print(f"[{task_id}/{total_tasks}] STARTING: {description}")
-    start_time = time.time()
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        for line in result.stdout.strip().split('\n'):
-            if 'saved to' in line.lower():
-                print(f"[{task_id}/{total_tasks}] {line}")
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            if stderr:
-                print(f"[{task_id}/{total_tasks}] ERROR: {stderr}")
-    except Exception as e:
-        print(f"[{task_id}/{total_tasks}] ERROR: {e}")
-
-    elapsed = time.time() - start_time
-    print(f"[{task_id}/{total_tasks}] FINISHED in {elapsed:.2f}s")
+def make_args(chart, mode, params, debug=False):
+    """构建 SimpleNamespace 参数对象（直接传给 run_draw）"""
+    d = dict(DEFAULTS)
+    d["chart"] = chart
+    d["mode"] = mode
+    d["debug"] = debug
+    d.update(params)
+    return SimpleNamespace(**d)
 
 
 def run_batch(args):
@@ -89,31 +626,24 @@ def run_batch(args):
 
         for combo in combinations:
             params = dict(zip(keys, combo))
-            cmd = build_command(chart, mode, params)
+            draw_args = make_args(chart, mode, params, debug=args.debug)
             desc = f"{chart}/{mode} | " + " | ".join(
-                f"{k}={v}" for k, v in params.items() if k in ("x", "y", "ef_search"))
-            tasks.append((cmd, desc))
+                f"{k}={v}" for k, v in params.items() if k in ("x", "y"))
+            tasks.append((draw_args, desc))
 
     print("=" * 60)
     print(f"Total plots to generate: {len(tasks)}")
-    print(f"Parallel workers: {args.workers}")
     print("=" * 60)
 
-    if args.dry_run:
-        for i, (cmd, desc) in enumerate(tasks):
-            print(f"[{i+1}/{len(tasks)}] {' '.join(cmd)}")
-        return
-
-    if args.workers > 1:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
-            futures = [
-                executor.submit(run_worker, cmd, i + 1, len(tasks), desc)
-                for i, (cmd, desc) in enumerate(tasks)
-            ]
-            concurrent.futures.wait(futures)
-    else:
-        for i, (cmd, desc) in enumerate(tasks):
-            run_worker(cmd, i + 1, len(tasks), desc)
+    for i, (draw_args, desc) in enumerate(tasks):
+        task_id = i + 1
+        print(f"[{task_id}/{len(tasks)}] {desc}")
+        start_time = time.time()
+        try:
+            run_draw(draw_args)
+        except Exception as e:
+            print(f"[{task_id}/{len(tasks)}] ERROR: {e}")
+        print(f"[{task_id}/{len(tasks)}] FINISHED in {time.time() - start_time:.2f}s")
 
     print("=" * 60)
     print("All plots generated!")
@@ -122,10 +652,8 @@ def run_batch(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch draw plots")
-    parser.add_argument("--workers", type=int, default=MAX_WORKERS,
-                        help="Number of parallel workers")
-    parser.add_argument("--dry_run", action='store_true',
-                        help="Only print commands without running")
+    parser.add_argument("--debug", action='store_true',
+                        help="Pass --debug to each draw call")
     args = parser.parse_args()
 
     run_batch(args)
