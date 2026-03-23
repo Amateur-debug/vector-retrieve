@@ -1092,6 +1092,7 @@ class VectorRetrieveRunner:
                     ))
                     p.start()
                     processes.append(p)
+                self.query_worker_processes = processes
 
                 # 进度条显示
                 # 进度条：只跟踪查询发送进度，到 100% 后立即关闭
@@ -1102,7 +1103,7 @@ class VectorRetrieveRunner:
                     last_update_time = time.time()
                     stall_last_value = 0
                     stall_check_time = time.time()
-                    STALL_TIMEOUT = 10
+                    STALL_TIMEOUT = 60
 
                     while True:
                         current = progress_counter_mp.value
@@ -1158,7 +1159,7 @@ class VectorRetrieveRunner:
                     last_update_time = time.time()
                     stall_last_value = 0
                     stall_check_time = time.time()
-                    STALL_TIMEOUT = 10
+                    STALL_TIMEOUT = 60
 
                     while any(t.is_alive() for t in threads):
                         current = progress_counter[0]
@@ -1516,6 +1517,22 @@ class VectorRetrieveRunner:
         if not force and self.args.no_cleanup:
             print("Skipping worker cleanup (--no_cleanup)")
             return
+        # 终止查询 worker 进程（避免成为孤儿进程继续尝试连接已关闭的节点）
+        for proc in getattr(self, 'query_worker_processes', []):
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+            except Exception:
+                pass
+        for proc in getattr(self, 'query_worker_processes', []):
+            try:
+                proc.join(timeout=2)
+                if proc.is_alive():
+                    proc.kill()
+            except Exception:
+                pass
+        self.query_worker_processes = []
+
         if self.args.distributed and self.worker_processes:
             print("\nCleaning up worker processes...")
             # 1. 先 terminate 本地管理的进程句柄（本地 worker + SSH 进程）
@@ -1691,6 +1708,9 @@ if __name__ == "__main__":
                 print(f"\n{'='*60}")
                 print(f"  Query Run {run_idx + 1}/{num_runs}")
                 print(f"{'='*60}")
+                if run_idx > 0:
+                    # 等待上一轮 worker 进程完全退出，让服务端 msg_pool_ 排空
+                    time.sleep(3)
                 thread_stats, total_query_time, qps = runner.run_queries()
                 qps_list.append(qps)
                 last_thread_stats = thread_stats

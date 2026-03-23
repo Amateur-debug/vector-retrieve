@@ -1,6 +1,8 @@
 #pragma once
 
 #include "cluster.h"
+#include <thread>
+#include <chrono>
 
 // SDK Client：通过通信中间层与远程集群进行交互的客户端。
 // 提供向量添加、K 近邻查询、分区、保存加载等远程操作接口，
@@ -244,7 +246,7 @@ public:
         // 持久连接模式：不主动断开，后续的 add_vector / query 调用可复用同一连接
     }
 
-    // 确保连接到绑定的 endpoint
+    // 确保连接到绑定的 endpoint，失败时带指数退避重试
     void ensure_connected()
     {
         size_t target_idx = sticky_endpoint_idx;
@@ -261,8 +263,19 @@ public:
             disconnect();
         }
 
-        if (!connected && !connect(target_ip, target_port)) {
-            throw std::runtime_error("Failed to connect to cluster");
+        if (!connected) {
+            static constexpr int MAX_RETRIES = 5;
+            static constexpr int BASE_DELAY_MS = 100;
+            for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
+                if (connect(target_ip, target_port)) break;
+                if (attempt + 1 < MAX_RETRIES) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(BASE_DELAY_MS << attempt));
+                }
+            }
+            if (!connected) {
+                throw std::runtime_error("Failed to connect to cluster");
+            }
         }
         current_endpoint_idx = target_idx;
     }

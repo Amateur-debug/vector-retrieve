@@ -142,7 +142,7 @@ def get_graph_path(data_name, params):
 def get_result_path(dataset_name, params):
     """生成结果文件路径（与 main.py 的 save_results 对齐）"""
     distributed_suffix = "-distributed" if params.get('distributed') else ""
-    cpus = params.get('cpus', 8)
+    cpus = params.get('num_cpu', 0)
     cpu_suffix = f"-cpus{cpus}" if params.get('distributed') and cpus != 0 else ""
     qt_suffix = f"-query_threads{params['num_query_threads']}"
 
