@@ -41,7 +41,7 @@ PARAM_GRID = {
     "redundancy":         [2, 1, 0],
     "m":                  [10, 15, 20, 25, 30, 35, 40],
     "ef_construction":    [200],
-    "ef_search":          [15, 20, 25, 30, 35, 40],
+    "ef_search":          [15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
     "limited_level":      [5],
     "k":                  [10],
     "num_query_threads":  [40],      # 客户端查询进程数

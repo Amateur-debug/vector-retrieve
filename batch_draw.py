@@ -1,9 +1,15 @@
 import itertools
 import argparse
+import os
 import time
 from types import SimpleNamespace
 
 from draw import run_draw
+
+# ============================================================
+# 数据集总控：所有任务都会对每个 data_name 分别运行
+# ============================================================
+DATA_NAMES = ["sift100m"]
 
 # ============================================================
 # 画图任务配置
@@ -17,7 +23,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["threads"],
             "y":            ["qps"],
-            "data_name":    ["sift"],
             "m":            [10],
             "ef_construction": [200],
             "limited_level": [5],
@@ -33,7 +38,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["threads"],
             "y":            ["qps"],
-            "data_name":    ["sift"],
             "m":            [10],
             "ef_construction": [200],
             "limited_level": [5],
@@ -49,7 +53,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["threads"],
             "y":            ["qps"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "redundancy":   [2],
             "num_query_threads": [40],
@@ -63,7 +66,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["threads"],
             "y":            ["qps"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "redundancy":   [2],
             "num_query_threads": [40],
@@ -77,7 +79,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["redundancy"],
             "y":            ["redundancy_num"],
-            "data_name":    ["sift"],
             "m":            [10],
             "ef_construction": [200],
             "ef_search":    [15],
@@ -94,7 +95,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["redundancy"],
             "y":            ["avg_remote_transfer_cnt"],
-            "data_name":    ["sift"],
             "m":            [10],
             "ef_construction": [200],
             "ef_search":    [15],
@@ -111,7 +111,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["redundancy"],
             "y":            ["avg_remote_transfer_cnt"],
-            "data_name":    ["sift"],
             "m":            [10],
             "ef_construction": [200],
             "ef_search":    [15],
@@ -128,7 +127,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["redundancy"],
             "y":            ["avg_remote_transfer_data_per_transfer"],
-            "data_name":    ["sift"],
             "m":            [10],
             "ef_construction": [200],
             "ef_search":    [15],
@@ -143,7 +141,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["redundancy"],
             "y":            ["avg_remote_transfer_data_per_transfer"],
-            "data_name":    ["sift"],
             "m":            [10],
             "ef_construction": [200],
             "ef_search":    [15],
@@ -158,7 +155,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["redundancy"],
             "y":            ["avg_remote_transfer_data_per_query"],
-            "data_name":    ["sift"],
             "m":            [10],
             "ef_construction": [200],
             "ef_search":    [15],
@@ -173,7 +169,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["redundancy"],
             "y":            ["avg_remote_transfer_data_per_query"],
-            "data_name":    ["sift"],
             "m":            [10],
             "ef_construction": [200],
             "ef_search":    [15],
@@ -188,7 +183,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["avg_distance_cnt"],
             "y":            ["avg_recall@10"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "redundancy":   [0, 1, 2],
             "threads":      [8],
@@ -202,7 +196,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["avg_remote_transfer_cnt"],
             "y":            ["qps"],
-            "data_name":    ["sift"],
             "m":            [10, 15, 20, 25, 30, 35, 40],
             "ef_construction": [200],
             "limited_level": [5],
@@ -220,7 +213,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["qps"],
-            "data_name":    ["sift"],
             "m":            [10, 15, 20, 25, 30, 35, 40],
             "ef_construction": [200],
             "limited_level": [5],
@@ -237,7 +229,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["qps"],
-            "data_name":    ["sift"],
             "m":            [10, 15, 20, 25, 30, 35, 40],
             "ef_construction": [200],
             "limited_level": [5],
@@ -254,7 +245,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_recall@10"],
-            "data_name":    ["sift"],
             "m":            [10, 15, 20, 25, 30, 35, 40],
             "ef_construction": [200],
             "limited_level": [5],
@@ -271,7 +261,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_recall@10"],
-            "data_name":    ["sift"],
             "m":            [10, 15, 20, 25, 30, 35, 40],
             "ef_construction": [200],
             "limited_level": [5],
@@ -288,7 +277,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_remote_transfer_cnt"],
-            "data_name":    ["sift"],
             "m":            [10, 15, 20, 25, 30, 35, 40],
             "ef_construction": [200],
             "limited_level": [5],
@@ -305,7 +293,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_remote_transfer_data_per_transfer"],
-            "data_name":    ["sift"],
             "m":            [10, 15, 20, 25, 30, 35, 40],
             "ef_construction": [200],
             "limited_level": [5],
@@ -320,7 +307,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_remote_transfer_data_per_transfer"],
-            "data_name":    ["sift"],
             "m":            [10, 15, 20, 25, 30, 35, 40],
             "ef_construction": [200],
             "limited_level": [5],
@@ -335,7 +321,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_remote_transfer_data_per_query"],
-            "data_name":    ["sift"],
             "m":            [10, 15, 20, 25, 30, 35, 40],
             "ef_construction": [200],
             "limited_level": [5],
@@ -350,7 +335,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_remote_transfer_data_per_query"],
-            "data_name":    ["sift"],
             "m":            [10, 15, 20, 25, 30, 35, 40],
             "ef_construction": [200],
             "limited_level": [5],
@@ -365,7 +349,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_data_per_transfer"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "redundancy":   [0, 1, 2],
         },
@@ -377,7 +360,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_data_per_transfer"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "redundancy":   [0, 1, 2],
         },
@@ -389,7 +371,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_data_per_query"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "redundancy":   [0, 1, 2],
         },
@@ -401,7 +382,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_data_per_query"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "redundancy":   [0, 1, 2],
         },
@@ -413,7 +393,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["avg_recall@10"],
             "y":            ["avg_distance_cnt"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "redundancy":   [0, 1, 2],
         },
@@ -425,7 +404,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["avg_recall@10"],
             "y":            ["avg_distance_cnt"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "redundancy":   [0, 1, 2],
         },
@@ -437,7 +415,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_cnt"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "redundancy":   [0, 1, 2],
         },
@@ -449,7 +426,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_cnt"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "redundancy":   [0, 1, 2],
         },
@@ -462,7 +438,6 @@ DRAW_TASKS = [
             "x":            ["ef_search"],
             "y":            ["qps"],
             "group_by":     ["m"],
-            "data_name":    ["sift"],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
@@ -480,7 +455,6 @@ DRAW_TASKS = [
             "x":            ["m"],
             "y":            ["qps"],
             "group_by":     ["ef_search"],
-            "data_name":    ["sift"],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
@@ -498,7 +472,6 @@ DRAW_TASKS = [
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_cnt"],
             "group_by":     ["redundancy"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
@@ -512,7 +485,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["avg_recall@10"],
             "y":            ["qps"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "redundancy":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
@@ -527,7 +499,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["avg_recall@10"],
             "y":            ["qps"],
-            "data_name":    ["sift"],
             "node_num":     [5],
             "redundancy":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
@@ -542,7 +513,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_distance_cnt"],
-            "data_name":    ["sift"],
             "m":            [10, 15, 20, 25, 30, 35, 40],
             "ef_construction": [200],
             "limited_level": [5],
@@ -559,7 +529,6 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_distance_cnt"],
-            "data_name":    ["sift"],
             "m":            [10, 15, 20, 25, 30, 35, 40],
             "ef_construction": [200],
             "limited_level": [5],
@@ -610,26 +579,31 @@ def make_args(chart, mode, params, debug=False):
     d["mode"] = mode
     d["debug"] = debug
     d.update(params)
+    # Route output to ./plot/<data_name>/{pdf,png}
+    if d.get("data_name"):
+        d["output_dir"] = os.path.join(DEFAULTS["output_dir"], d["data_name"])
     return SimpleNamespace(**d)
 
 
 def run_batch(args):
     """批量画图"""
     tasks = []
-    for task_def in DRAW_TASKS:
-        chart = task_def["chart"]
-        mode = task_def["mode"]
-        grid = task_def["grid"]
+    for data_name in DATA_NAMES:
+        for task_def in DRAW_TASKS:
+            chart = task_def["chart"]
+            mode = task_def["mode"]
+            grid = task_def["grid"]
 
-        keys = list(grid.keys())
-        combinations = list(itertools.product(*[grid[k] for k in keys]))
+            keys = list(grid.keys())
+            combinations = list(itertools.product(*[grid[k] for k in keys]))
 
-        for combo in combinations:
-            params = dict(zip(keys, combo))
-            draw_args = make_args(chart, mode, params, debug=args.debug)
-            desc = f"{chart}/{mode} | " + " | ".join(
-                f"{k}={v}" for k, v in params.items() if k in ("x", "y"))
-            tasks.append((draw_args, desc))
+            for combo in combinations:
+                params = dict(zip(keys, combo))
+                params["data_name"] = data_name
+                draw_args = make_args(chart, mode, params, debug=args.debug)
+                desc = f"[{data_name}] {chart}/{mode} | " + " | ".join(
+                    f"{k}={v}" for k, v in params.items() if k in ("x", "y"))
+                tasks.append((draw_args, desc))
 
     print("=" * 60)
     print(f"Total plots to generate: {len(tasks)}")

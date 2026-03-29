@@ -61,7 +61,7 @@ def parse_filename_params(filename):
     """从结果文件名中解析参数，返回参数字典"""
     params = {}
 
-    match = re.search(r'results-([a-z]+?)-m', filename)
+    match = re.search(r'results-([a-z][a-z0-9]*)-m', filename)
     if match:
         params['data_name'] = match.group(1)
 
