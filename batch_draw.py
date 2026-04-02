@@ -196,7 +196,7 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["avg_remote_transfer_cnt"],
             "y":            ["qps"],
-            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
@@ -213,7 +213,7 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["qps"],
-            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
@@ -229,7 +229,7 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["qps"],
-            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
@@ -245,7 +245,7 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_recall@10"],
-            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
@@ -261,7 +261,7 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_recall@10"],
-            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
@@ -277,7 +277,7 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_remote_transfer_cnt"],
-            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
@@ -293,7 +293,7 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_remote_transfer_data_per_transfer"],
-            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
@@ -307,7 +307,7 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_remote_transfer_data_per_transfer"],
-            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
@@ -321,7 +321,7 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_remote_transfer_data_per_query"],
-            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
@@ -335,7 +335,7 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_remote_transfer_data_per_query"],
-            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
@@ -513,7 +513,7 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_distance_cnt"],
-            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
@@ -529,7 +529,7 @@ DRAW_TASKS = [
         "grid": {
             "x":            ["ef_search"],
             "y":            ["avg_distance_cnt"],
-            "m":            [10, 15, 20, 25, 30, 35, 40],
+            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],

@@ -46,7 +46,7 @@ PARAM_GRID = {
     "k":                  [10],
     "num_query_threads":  [40],      # 客户端查询进程数
     "num_threads":        [8],       # 服务端每 node 搜索线程数
-    "reduce":             [False],
+    "reduce":             [False, True],
     "distributed":        [True],
     "layer":              [True, False],
     "comm_mode":          ["tcp"],  # 通信模式："tcp" 或 "rdma"
