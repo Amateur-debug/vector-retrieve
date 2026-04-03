@@ -85,13 +85,13 @@ def parse_filename_params(filename):
     if match:
         params['node_num'] = int(match.group(1))
 
-    match = re.search(r'-node\d+-([a-z_-]+)-red', filename)
+    match = re.search(r'-node\d+-([a-z_-]+)-rep', filename)
     if match:
         params['partition_mode'] = match.group(1)
 
-    match = re.search(r'-red(\d+)', filename)
+    match = re.search(r'-rep(\d+)', filename)
     if match:
-        params['redundancy'] = int(match.group(1))
+        params['replication'] = int(match.group(1))
 
     match = re.search(r'-threads(\d+)', filename)
     if match:
@@ -101,7 +101,7 @@ def parse_filename_params(filename):
     if match:
         params['query_threads'] = int(match.group(1))
 
-    params['reduce'] = 'reduce' in filename
+    params['shard'] = 'shard' in filename
     params['distributed'] = 'distributed' in filename
     params['layer'] = filename.rstrip('.json').endswith('-layer')
 
@@ -137,7 +137,7 @@ def classify_mode(filepath, data=None, is_weaviate=False):
     """根据文件名判断实验模式，并生成包含分区方式的标签。
 
     返回 (mode_key, label):
-      - reduce:   ('reduce', 'Reduce')
+      - shard:   ('shard', 'Shard')
       - no-layer: ('no-layer', 'No-Layer (k-means)')
       - layer:    ('layer', 'Layer (k-means)')
       - weaviate: ('weaviate', 'Weaviate')
@@ -146,8 +146,8 @@ def classify_mode(filepath, data=None, is_weaviate=False):
         return 'weaviate', 'Weaviate'
 
     basename = os.path.basename(filepath)
-    if 'reduce' in basename:
-        return 'reduce', 'Reduce'
+    if 'shard' in basename:
+        return 'shard', 'Shard'
 
     # 从文件名提取 partition_mode
     file_params = parse_filename_params(basename)
@@ -161,13 +161,13 @@ def classify_mode(filepath, data=None, is_weaviate=False):
 
 def get_y_value(data, y_key, data_name):
     """根据 y_key 从 data 中提取 y 值（支持自定义派生指标）"""
-    if y_key == "red_per_node":
-        redundancy_num = get_param_value(data, "redundancy_num")
+    if y_key == "rep_per_node":
+        replication_num = get_param_value(data, "replication_num")
         node_num = get_param_value(data, "node_num")
-        return redundancy_num / node_num if node_num else 0
+        return replication_num / node_num if node_num else 0
     elif y_key == "data_per_node":
         total_data = {'siftsmall': 10000, 'sift': 1000000, 'gist': 1000000, 'deep': 1000000}.get(data_name, 0)
-        total_data_redundant = total_data + (get_param_value(data, "redundancy_num") or 0)
+        total_data_redundant = total_data + (get_param_value(data, "replication_num") or 0)
         node_num = get_param_value(data, "node_num")
         return total_data_redundant / node_num if node_num else 0
     else:
@@ -198,9 +198,9 @@ def make_output_filename(prefix, args, extra_keys=None):
         parts.append(args.partition_mode)
     if getattr(args, 'layer', None) is True:
         parts.append("layer")
-    if args.redundancy is not None:
-        parts.append(f"red{args.redundancy}")
-    _thread_independent = {"redundancy_num", "red_per_node", "data_per_node",
+    if args.replication is not None:
+        parts.append(f"rep{args.replication}")
+    _thread_independent = {"replication_num", "rep_per_node", "data_per_node",
                            "avg_remote_transfer_cnt", "avg_distance_cnt",
                            "avg_remote_transfer_data_per_transfer",
                            "avg_remote_transfer_data_per_query"}
@@ -245,7 +245,7 @@ def filename_label(s):
 
 def setup_legend(ax, n_labels):
     """图例统一放在图上方，水平排列"""
-    ax.legend(fontsize=10, loc='lower center', bbox_to_anchor=(0.5, 1.02),
+    ax.legend(fontsize=18, loc='lower center', bbox_to_anchor=(0.5, 1.02),
               ncol=n_labels, frameon=True, fancybox=True)
 
 
@@ -301,7 +301,7 @@ def bucket_recall_points(points_list):
 # ============================================================
 
 def collect_compare(args):
-    """compare 模式：收集多路对比数据 (reduce / no-layer / layer / weaviate)。
+    """compare 模式：收集多路对比数据 (shard / no-layer / layer / weaviate / cotra)。
 
     返回 (mode_points, mode_labels, mode_debug):
       mode_points: {mode_key: {x_val: y_val}}
@@ -371,8 +371,8 @@ def collect_compare(args):
             if skip:
                 continue
 
-            if not is_weaviate and not file_params.get('reduce') and args.redundancy is not None:
-                if file_params.get('redundancy') != args.redundancy:
+            if not is_weaviate and not file_params.get('shard') and args.replication is not None:
+                if file_params.get('replication') != args.replication:
                     continue
 
             data = load_json_summary(f)
@@ -403,6 +403,17 @@ def collect_compare(args):
 
         except Exception as e:
             print(f"Skipping {f}: {e}")
+
+    if args.y == 'qps' and recall_x:
+        cotra_base_qps = 68900
+        cotra_base_node_num = 8
+        cotra_base_threads = 8
+        node_scale = (args.node_num / cotra_base_node_num) if args.node_num is not None else 1.0
+        thread_scale = (args.threads / cotra_base_threads) if args.threads is not None else 1.0
+        cotra_qps = cotra_base_qps * node_scale * thread_scale
+        mode_points['cotra'][0.95] = cotra_qps
+        mode_labels['cotra'] = 'CoTra'
+        print(f"[CoTra] hardcoded | {args.x}=0.95 | {args.y}={cotra_qps}")
 
     # --recall 模式：对每个 (mode, x_val) 选 recall 最接近目标的
     mode_debug = None
@@ -457,10 +468,10 @@ def collect_detail(args):
             'limited_level': args.limited_level,
             'node_num': args.node_num,
             'partition_mode': args.partition_mode,
-            'redundancy': args.redundancy,
+            'replication': args.replication,
             'threads': args.threads,
             'query_threads': args.num_query_threads,
-            'reduce': args.reduce,
+            'shard': args.shard,
             'distributed': args.distributed,
         }
 
@@ -523,7 +534,7 @@ def collect_merge(args):
                 args.limited_level is not None and get_param_value(data, "limited_level") != args.limited_level or
                 args.node_num is not None and get_param_value(data, "node_num") != args.node_num or
                 args.partition_mode is not None and get_param_value(data, "partition_mode") != args.partition_mode or
-                args.redundancy is not None and get_param_value(data, "redundancy_level") != args.redundancy or
+                args.replication is not None and get_param_value(data, "replication_level") != args.replication or
                 args.threads is not None and get_param_value(data, "num_threads") != args.threads or
                 args.num_query_threads is not None and get_param_value(data, "num_query_threads") != args.num_query_threads
             ):
@@ -614,8 +625,8 @@ def collect_group(args):
             if skip:
                 continue
 
-            if args.redundancy is not None and not file_params.get('reduce'):
-                if file_params.get('redundancy') != args.redundancy:
+            if args.replication is not None and not file_params.get('shard'):
+                if file_params.get('replication') != args.replication:
                     continue
 
             # 按 partition_mode 筛选
@@ -628,8 +639,8 @@ def collect_group(args):
                 if file_params.get('layer') != args.layer:
                     continue
 
-            # 只取非 reduce、非 weaviate 的分布式结果
-            if file_params.get('reduce') or not file_params.get('distributed'):
+            # 只取非 shard、非 weaviate 的分布式结果
+            if file_params.get('shard') or not file_params.get('distributed'):
                 continue
 
             data = load_json_summary(f)
@@ -684,18 +695,20 @@ def save_figure(fig, args, prefix, extra_keys=None):
     print(f"Plot saved to {png_path}")
     plt.close(fig)
 
-MODE_ORDER = ['weaviate', 'reduce', 'no-layer', 'layer']
+MODE_ORDER = ['weaviate', 'shard', 'no-layer', 'layer', 'cotra']
 LINE_STYLES = {
-    'reduce':   {'marker': 'o', 'linestyle': '-',  'color': '#cae9ff'},
+    'shard':   {'marker': 'o', 'linestyle': '-',  'color': '#cae9ff'},
     'no-layer': {'marker': 's', 'linestyle': '--', 'color': '#1a759f'},
     'layer':    {'marker': '^', 'linestyle': '-.', 'color': '#5fa8d3'},
     'weaviate': {'marker': 'D', 'linestyle': ':',  'color': '#a2d2ff'},
+    'cotra':    {'marker': 'X', 'linestyle': '-',  'color': '#74c0fc'},
 }
 BAR_STYLES = {
-    'reduce':   {'color': '#cae9ff', 'hatch': '\\\\'},
+    'shard':   {'color': '#cae9ff', 'hatch': '\\\\'},
     'no-layer': {'color': '#1a759f', 'hatch': 'xx'},
     'layer':    {'color': '#5fa8d3', 'hatch': '//'},
     'weaviate': {'color': '#a2d2ff', 'hatch': '--'},
+    'cotra':    {'color': '#74c0fc', 'hatch': '||'},
 }
 
 
@@ -716,17 +729,10 @@ def draw_line_compare(mode_points, mode_labels, args, mode_debug=None):
         style = LINE_STYLES[mode_key]
         ax.plot(xs, ys, marker=style['marker'], linestyle=style['linestyle'],
                 color=style['color'], label=mode_labels[mode_key], linewidth=2, markersize=8)
-        for x, y in sorted_pts:
-            if debug and mode_debug.get(mode_key, {}).get(x):
-                recall, fname = mode_debug[mode_key][x]
-                ax.annotate(f"{y:.2f}\nrecall={recall:.4f}\n{fname}",
-                            (x, y), fontsize=6, va='bottom', ha='left',
-                            xytext=(5, 5), textcoords='offset points')
-            else:
-                ax.text(x, y, f" {y:.2f}", fontsize=8, va='bottom')
 
-    ax.set_xlabel(display_label(args.x), fontsize=12)
-    ax.set_ylabel(display_label(args.y), fontsize=12)
+    ax.set_xlabel(display_label(args.x), fontsize=22)
+    ax.set_ylabel(display_label(args.y), fontsize=22)
+    ax.tick_params(axis='both', labelsize=16)
     ax.grid(True, linestyle='--', alpha=0.7)
     n_labels = sum(1 for m in MODE_ORDER if mode_points.get(m) and any(v != 0 for v in mode_points[m].values()))
     setup_legend(ax, n_labels)
@@ -766,26 +772,16 @@ def draw_bar_compare(mode_points, mode_labels, args, mode_debug=None):
             val = mode_points[mode_key][x_val]
             label = mode_labels[mode_key] if mode_key not in legend_added else None
             legend_added.add(mode_key)
-            bar = ax.bar(x_indices[g] + offset, val, bar_width,
-                         label=label,
-                         color=bstyle['color'], hatch=bstyle['hatch'],
-                         edgecolor='black', alpha=0.85)
-            b = bar[0]
-            if val != 0:
-                if debug and mode_debug.get(mode_key, {}).get(x_val):
-                    recall, fname = mode_debug[mode_key][x_val]
-                    ax.text(b.get_x() + b.get_width() / 2, b.get_height(),
-                            f'{val:.2f}\nr={recall:.4f}\n{fname}',
-                            ha='center', va='bottom', fontsize=5.5)
-                else:
-                    val_str = f'{val:.4f}' if 'recall' in args.y.lower() else f'{val:.0f}'
-                    ax.text(b.get_x() + b.get_width() / 2, b.get_height(),
-                            val_str, ha='center', va='bottom', fontsize=8)
+            ax.bar(x_indices[g] + offset, val, bar_width,
+                   label=label,
+                   color=bstyle['color'], hatch=bstyle['hatch'],
+                   edgecolor='black', alpha=0.85)
 
     ax.set_xticks(x_indices)
-    ax.set_xticklabels(x_labels, fontsize=11)
-    ax.set_xlabel(display_label(args.x), fontsize=12)
-    ax.set_ylabel(display_label(args.y), fontsize=12)
+    ax.set_xticklabels(x_labels, fontsize=16)
+    ax.set_xlabel(display_label(args.x), fontsize=22)
+    ax.set_ylabel(display_label(args.y), fontsize=22)
+    ax.tick_params(axis='y', labelsize=16)
     ax.grid(True, linestyle='--', alpha=0.5, axis='y')
     setup_legend(ax, len(active_modes))
     fig.tight_layout()
@@ -811,17 +807,10 @@ def draw_scatter_compare(mode_points, mode_labels, args, mode_debug=None):
         ax.scatter(xs, ys, color=LINE_STYLES[mode_key]['color'],
                    label=mode_labels[mode_key], s=80, alpha=0.8,
                    marker=LINE_STYLES[mode_key]['marker'])
-        for x, y in sorted_pts:
-            if debug and mode_debug.get(mode_key, {}).get(x):
-                recall, fname = mode_debug[mode_key][x]
-                ax.annotate(f"{y:.2f}\nrecall={recall:.4f}\n{fname}",
-                            (x, y), fontsize=6, va='bottom', ha='left',
-                            xytext=(5, 5), textcoords='offset points')
-            else:
-                ax.text(x, y, f" {y:.2f}", fontsize=8, va='bottom')
 
-    ax.set_xlabel(display_label(args.x), fontsize=12)
-    ax.set_ylabel(display_label(args.y), fontsize=12)
+    ax.set_xlabel(display_label(args.x), fontsize=22)
+    ax.set_ylabel(display_label(args.y), fontsize=22)
+    ax.tick_params(axis='both', labelsize=16)
     ax.grid(True, linestyle='--', alpha=0.7)
     n_labels = sum(1 for m in MODE_ORDER if mode_points.get(m) and any(v != 0 for v in mode_points[m].values()))
     setup_legend(ax, n_labels)
@@ -858,17 +847,10 @@ def draw_line_compare_split(mode_points, mode_labels, args, mode_debug=None):
         style = LINE_STYLES[mode_key]
         ax.plot(xs, ys, marker=style['marker'], linestyle=style['linestyle'],
                 color=style['color'], label=mode_labels[mode_key], linewidth=2, markersize=8)
-        for x, y in sorted_pts:
-            if debug and mode_debug.get(mode_key, {}).get(x):
-                recall, fname = mode_debug[mode_key][x]
-                ax.annotate(f"{y:.2f}\nrecall={recall:.4f}\n{fname}",
-                            (x, y), fontsize=6, va='bottom', ha='left',
-                            xytext=(5, 5), textcoords='offset points')
-            else:
-                ax.text(x, y, f" {y:.2f}", fontsize=8, va='bottom')
-        ax.set_xlabel(display_label(args.x), fontsize=12)
-        ax.set_ylabel(display_label(args.y), fontsize=12)
-        ax.set_title(mode_labels[mode_key], fontsize=12)
+        ax.set_xlabel(display_label(args.x), fontsize=22)
+        ax.set_ylabel(display_label(args.y), fontsize=22)
+        ax.set_title(mode_labels[mode_key], fontsize=20)
+        ax.tick_params(axis='both', labelsize=16)
         ax.grid(True, linestyle='--', alpha=0.7)
 
     fig.tight_layout()
@@ -904,25 +886,15 @@ def draw_bar_compare_split(mode_points, mode_labels, args, mode_debug=None):
         bstyle = BAR_STYLES[mode_key]
         points = mode_points[mode_key]
         vals = [points.get(xv, 0) for xv in all_x_vals]
-        bars = ax.bar(x_indices, vals, bar_width,
-                      color=bstyle['color'], hatch=bstyle['hatch'],
-                      edgecolor='black', alpha=0.85)
-        for b, xv, val in zip(bars, all_x_vals, vals):
-            if val != 0:
-                if debug and mode_debug.get(mode_key, {}).get(xv):
-                    recall, fname = mode_debug[mode_key][xv]
-                    ax.text(b.get_x() + b.get_width() / 2, b.get_height(),
-                            f'{val:.2f}\nr={recall:.4f}\n{fname}',
-                            ha='center', va='bottom', fontsize=5.5)
-                else:
-                    val_str = f'{val:.4f}' if 'recall' in args.y.lower() else f'{val:.0f}'
-                    ax.text(b.get_x() + b.get_width() / 2, b.get_height(),
-                            val_str, ha='center', va='bottom', fontsize=8)
+        ax.bar(x_indices, vals, bar_width,
+               color=bstyle['color'], hatch=bstyle['hatch'],
+               edgecolor='black', alpha=0.85)
         ax.set_xticks(x_indices)
-        ax.set_xticklabels(x_labels, fontsize=11)
-        ax.set_xlabel(display_label(args.x), fontsize=12)
-        ax.set_ylabel(display_label(args.y), fontsize=12)
-        ax.set_title(mode_labels[mode_key], fontsize=12)
+        ax.set_xticklabels(x_labels, fontsize=16)
+        ax.set_xlabel(display_label(args.x), fontsize=22)
+        ax.set_ylabel(display_label(args.y), fontsize=22)
+        ax.set_title(mode_labels[mode_key], fontsize=20)
+        ax.tick_params(axis='y', labelsize=16)
         ax.grid(True, linestyle='--', alpha=0.5, axis='y')
 
     fig.tight_layout()
@@ -955,17 +927,10 @@ def draw_scatter_compare_split(mode_points, mode_labels, args, mode_debug=None):
         xs, ys = zip(*sorted_pts)
         ax.scatter(xs, ys, color=LINE_STYLES[mode_key]['color'],
                    s=80, alpha=0.8, marker=LINE_STYLES[mode_key]['marker'])
-        for x, y in sorted_pts:
-            if debug and mode_debug.get(mode_key, {}).get(x):
-                recall, fname = mode_debug[mode_key][x]
-                ax.annotate(f"{y:.2f}\nrecall={recall:.4f}\n{fname}",
-                            (x, y), fontsize=6, va='bottom', ha='left',
-                            xytext=(5, 5), textcoords='offset points')
-            else:
-                ax.text(x, y, f" {y:.2f}", fontsize=8, va='bottom')
-        ax.set_xlabel(display_label(args.x), fontsize=12)
-        ax.set_ylabel(display_label(args.y), fontsize=12)
-        ax.set_title(mode_labels[mode_key], fontsize=12)
+        ax.set_xlabel(display_label(args.x), fontsize=22)
+        ax.set_ylabel(display_label(args.y), fontsize=22)
+        ax.set_title(mode_labels[mode_key], fontsize=20)
+        ax.tick_params(axis='both', labelsize=16)
         ax.grid(True, linestyle='--', alpha=0.7)
 
     fig.tight_layout()
@@ -989,16 +954,14 @@ def draw_line_single(series_data, args, prefix="line"):
         lw = 1.5 if multi else 0.5
         ax.plot(xs, ys, linestyle='-', linewidth=lw, marker=marker,
                 markersize=7, label=label)
-        if multi:
-            for x, y in zip(xs, ys):
-                ax.text(x, y, f" {y:.2f}", fontsize=8, va='bottom')
 
     if all_xs:
         ax.set_xlim(min(all_xs), max(all_xs))
 
     x_label = "Query Index" if args.mode == "detail" else display_label(args.x)
-    ax.set_xlabel(x_label, fontsize=12)
-    ax.set_ylabel(display_label(args.y), fontsize=12)
+    ax.set_xlabel(x_label, fontsize=22)
+    ax.set_ylabel(display_label(args.y), fontsize=22)
+    ax.tick_params(axis='both', labelsize=16)
     ax.grid(True, linestyle='--', alpha=0.7)
     setup_legend(ax, len(series_data))
     fig.tight_layout()
@@ -1024,8 +987,9 @@ def draw_scatter_single(series_data, args, prefix="scatter"):
         ax.set_xlim(min(all_xs), max(all_xs))
 
     x_label = "Query Index" if args.mode == "detail" else display_label(args.x)
-    ax.set_xlabel(x_label, fontsize=12)
-    ax.set_ylabel(display_label(args.y), fontsize=12)
+    ax.set_xlabel(x_label, fontsize=22)
+    ax.set_ylabel(display_label(args.y), fontsize=22)
+    ax.tick_params(axis='both', labelsize=16)
     ax.grid(True, linestyle='--', alpha=0.7)
     setup_legend(ax, len(series_data))
     fig.tight_layout()
@@ -1045,17 +1009,14 @@ def draw_bar_single(series_data, args, prefix="bar"):
         x_labels = [str(x) for x in xs]
         x_indices = np.arange(len(xs))
         bar_width = min(0.6, max(0.2, 6.0 / max(len(xs), 1)))
-        bars = ax.bar(x_indices, ys, width=bar_width, color='#1f77b4', alpha=0.85, label=label)
-        for bar, val in zip(bars, ys):
-            if val != 0:
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                        f'{val:.2f}', ha='center', va='bottom', fontsize=7)
+        ax.bar(x_indices, ys, width=bar_width, color='#1f77b4', alpha=0.85, label=label)
         ax.set_xticks(x_indices)
-        ax.set_xticklabels(x_labels, fontsize=9, rotation=45 if len(xs) > 20 else 0)
+        ax.set_xticklabels(x_labels, fontsize=16, rotation=45 if len(xs) > 20 else 0)
 
     x_label = "Query Index" if args.mode == "detail" else display_label(args.x)
-    ax.set_xlabel(x_label, fontsize=12)
-    ax.set_ylabel(display_label(args.y), fontsize=12)
+    ax.set_xlabel(x_label, fontsize=22)
+    ax.set_ylabel(display_label(args.y), fontsize=22)
+    ax.tick_params(axis='y', labelsize=16)
     ax.grid(True, linestyle='--', alpha=0.5, axis='y')
     setup_legend(ax, len(series_data))
     fig.tight_layout()
@@ -1094,13 +1055,14 @@ if __name__ == "__main__":
     parser.add_argument("--partition_mode", type=str, default="k-means", help="Partition mode (for detail/merge)")
     parser.add_argument("--layer", action='store_true', default=None, help="Filter for layer partition mode")
     parser.add_argument("--no_layer", action='store_true', default=None, help="Filter for non-layer partition mode")
-    parser.add_argument("--redundancy", type=int, default=None, help="Redundancy level")
+    parser.add_argument("--replication", type=int, default=None, help="Redundancy level")
     parser.add_argument("--threads", "--num_threads", type=int, default=None, dest="threads",
                         help="Number of server-side search threads per node (num_threads)")
     parser.add_argument("--num_query_threads", type=int, default=None,
                         help="Number of client query processes (num_query_threads)")
     parser.add_argument("--group_by", type=str, default=None, help="Parameter to group by (for group mode, e.g. 'm' or 'ef_search')")
-    parser.add_argument("--reduce", action='store_true', help="Enable reduce mode (for detail/merge)")
+    parser.add_argument("--shard", action='store_true', help="Enable shard mode (for detail/merge)")
+
     parser.add_argument("--distributed", action='store_true', help="Enable distributed mode (for detail/merge)")
 
     # recall 约束：指定目标 recall，对每个 x 值找 recall 最接近的实验结果

@@ -249,38 +249,38 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("vid"), py::arg("vec"),
              py::call_guard<py::gil_scoped_release>());
 
-    // 绑定 ReduceQuerySession 类（float 版本）
-    // 持久连接会话，避免 reduce 模式下每次查询都 std::async + acquire/release 连接
-    py::class_<ReduceQuerySession<float>>(m, "ReduceQuerySessionFloat")
+    // 绑定 ShardQuerySession 类（float 版本）
+    // 持久连接会话，避免 shard 模式下每次查询都 std::async + acquire/release 连接
+    py::class_<ShardQuerySession<float>>(m, "ShardQuerySessionFloat")
         .def(py::init<Cluster<float> *>(), py::arg("cluster"))
-        .def("query", &ReduceQuerySession<float>::query,
+        .def("query", &ShardQuerySession<float>::query,
              py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k") = 10,
              py::call_guard<py::gil_scoped_release>())
-        .def("close", &ReduceQuerySession<float>::close);
+        .def("close", &ShardQuerySession<float>::close);
 
-    // 绑定 ReduceQuerySession 类（double 版本）
-    py::class_<ReduceQuerySession<double>>(m, "ReduceQuerySessionDouble")
+    // 绑定 ShardQuerySession 类（double 版本）
+    py::class_<ShardQuerySession<double>>(m, "ShardQuerySessionDouble")
         .def(py::init<Cluster<double> *>(), py::arg("cluster"))
-        .def("query", &ReduceQuerySession<double>::query,
+        .def("query", &ShardQuerySession<double>::query,
              py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k") = 10,
              py::call_guard<py::gil_scoped_release>())
-        .def("close", &ReduceQuerySession<double>::close);
+        .def("close", &ShardQuerySession<double>::close);
 
-    // 绑定 ReduceQuerySession 类（int32_t 版本）
-    py::class_<ReduceQuerySession<int32_t>>(m, "ReduceQuerySessionInt32")
+    // 绑定 ShardQuerySession 类（int32_t 版本）
+    py::class_<ShardQuerySession<int32_t>>(m, "ShardQuerySessionInt32")
         .def(py::init<Cluster<int32_t> *>(), py::arg("cluster"))
-        .def("query", &ReduceQuerySession<int32_t>::query,
+        .def("query", &ShardQuerySession<int32_t>::query,
              py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k") = 10,
              py::call_guard<py::gil_scoped_release>())
-        .def("close", &ReduceQuerySession<int32_t>::close);
+        .def("close", &ShardQuerySession<int32_t>::close);
 
-    // 绑定 ReduceQuerySession 类（uint32_t 版本）
-    py::class_<ReduceQuerySession<uint32_t>>(m, "ReduceQuerySessionUInt32")
+    // 绑定 ShardQuerySession 类（uint32_t 版本）
+    py::class_<ShardQuerySession<uint32_t>>(m, "ShardQuerySessionUInt32")
         .def(py::init<Cluster<uint32_t> *>(), py::arg("cluster"))
-        .def("query", &ReduceQuerySession<uint32_t>::query,
+        .def("query", &ShardQuerySession<uint32_t>::query,
              py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k") = 10,
              py::call_guard<py::gil_scoped_release>())
-        .def("close", &ReduceQuerySession<uint32_t>::close);
+        .def("close", &ShardQuerySession<uint32_t>::close);
 
     // 绑定 Cluster 类（float 版本），提供集群级别的建图、查询、分区、序列化等操作
     py::class_<Cluster<float>, std::unique_ptr<Cluster<float>>>(m, "ClusterFloat")
@@ -310,10 +310,10 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("partition_mode", &Cluster<float>::partition_mode)
         .def_readwrite("layer_config", &Cluster<float>::layer_config)
         .def_readwrite("outer_ring_max_iterations", &Cluster<float>::outer_ring_max_iterations)
-        .def_readwrite("redundancy_level", &Cluster<float>::redundancy_level)
-        .def_readwrite("redundancy_num", &Cluster<float>::redundancy_num)
+        .def_readwrite("replication_level", &Cluster<float>::replication_level)
+        .def_readwrite("replication_num", &Cluster<float>::replication_num)
         .def_readwrite("is_distributed", &Cluster<float>::is_distributed)
-        .def_readwrite("is_reduce", &Cluster<float>::is_reduce)
+        .def_readwrite("is_shard", &Cluster<float>::is_shard)
         .def("reset", &Cluster<float>::reset)
         .def("add_vector", &Cluster<float>::add_vector,
              py::arg("vid"), py::arg("vec"),
@@ -325,7 +325,7 @@ PYBIND11_MODULE(vector_retrieve, m)
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123, py::arg("num_threads") = 0)
         .def("outer_ring", &Cluster<float>::outer_ring)
         .def("partition", &Cluster<float>::partition,
-             py::arg("mode"), py::arg("redundancy") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
+             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
         .def("set_node_info", &Cluster<float>::set_node_info,
              py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
         .def("start_node_server", &Cluster<float>::start_node_server,
@@ -367,10 +367,10 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("partition_mode", &Cluster<double>::partition_mode)
         .def_readwrite("layer_config", &Cluster<double>::layer_config)
         .def_readwrite("outer_ring_max_iterations", &Cluster<double>::outer_ring_max_iterations)
-        .def_readwrite("redundancy_level", &Cluster<double>::redundancy_level)
-        .def_readwrite("redundancy_num", &Cluster<double>::redundancy_num)
+        .def_readwrite("replication_level", &Cluster<double>::replication_level)
+        .def_readwrite("replication_num", &Cluster<double>::replication_num)
         .def_readwrite("is_distributed", &Cluster<double>::is_distributed)
-        .def_readwrite("is_reduce", &Cluster<double>::is_reduce)
+        .def_readwrite("is_shard", &Cluster<double>::is_shard)
         .def("reset", &Cluster<double>::reset)
         .def("add_vector", &Cluster<double>::add_vector,
              py::arg("vid"), py::arg("vec"),
@@ -382,7 +382,7 @@ PYBIND11_MODULE(vector_retrieve, m)
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123, py::arg("num_threads") = 0)
         .def("outer_ring", &Cluster<double>::outer_ring)
         .def("partition", &Cluster<double>::partition,
-             py::arg("mode"), py::arg("redundancy") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
+             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
         .def("set_node_info", &Cluster<double>::set_node_info,
              py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
         .def("start_node_server", &Cluster<double>::start_node_server,
@@ -424,10 +424,10 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("partition_mode", &Cluster<int32_t>::partition_mode)
         .def_readwrite("layer_config", &Cluster<int32_t>::layer_config)
         .def_readwrite("outer_ring_max_iterations", &Cluster<int32_t>::outer_ring_max_iterations)
-        .def_readwrite("redundancy_level", &Cluster<int32_t>::redundancy_level)
-        .def_readwrite("redundancy_num", &Cluster<int32_t>::redundancy_num)
+        .def_readwrite("replication_level", &Cluster<int32_t>::replication_level)
+        .def_readwrite("replication_num", &Cluster<int32_t>::replication_num)
         .def_readwrite("is_distributed", &Cluster<int32_t>::is_distributed)
-        .def_readwrite("is_reduce", &Cluster<int32_t>::is_reduce)
+        .def_readwrite("is_shard", &Cluster<int32_t>::is_shard)
         .def("reset", &Cluster<int32_t>::reset)
         .def("add_vector", &Cluster<int32_t>::add_vector,
              py::arg("vid"), py::arg("vec"),
@@ -439,7 +439,7 @@ PYBIND11_MODULE(vector_retrieve, m)
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123, py::arg("num_threads") = 0)
         .def("outer_ring", &Cluster<int32_t>::outer_ring)
         .def("partition", &Cluster<int32_t>::partition,
-             py::arg("mode"), py::arg("redundancy") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
+             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
         .def("set_node_info", &Cluster<int32_t>::set_node_info,
              py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
         .def("start_node_server", &Cluster<int32_t>::start_node_server,
@@ -481,10 +481,10 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("partition_mode", &Cluster<uint32_t>::partition_mode)
         .def_readwrite("layer_config", &Cluster<uint32_t>::layer_config)
         .def_readwrite("outer_ring_max_iterations", &Cluster<uint32_t>::outer_ring_max_iterations)
-        .def_readwrite("redundancy_level", &Cluster<uint32_t>::redundancy_level)
-        .def_readwrite("redundancy_num", &Cluster<uint32_t>::redundancy_num)
+        .def_readwrite("replication_level", &Cluster<uint32_t>::replication_level)
+        .def_readwrite("replication_num", &Cluster<uint32_t>::replication_num)
         .def_readwrite("is_distributed", &Cluster<uint32_t>::is_distributed)
-        .def_readwrite("is_reduce", &Cluster<uint32_t>::is_reduce)
+        .def_readwrite("is_shard", &Cluster<uint32_t>::is_shard)
         .def("reset", &Cluster<uint32_t>::reset)
         .def("add_vector", &Cluster<uint32_t>::add_vector,
              py::arg("vid"), py::arg("vec"),
@@ -496,7 +496,7 @@ PYBIND11_MODULE(vector_retrieve, m)
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123, py::arg("num_threads") = 0)
         .def("outer_ring", &Cluster<uint32_t>::outer_ring)
         .def("partition", &Cluster<uint32_t>::partition,
-             py::arg("mode"), py::arg("redundancy") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
+             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
         .def("set_node_info", &Cluster<uint32_t>::set_node_info,
              py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
         .def("start_node_server", &Cluster<uint32_t>::start_node_server,
@@ -534,7 +534,7 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("query_ids"), py::arg("query_vectors"), py::arg("payloads"), py::arg("k") = 10,
              py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<float>::partition,
-             py::arg("mode"), py::arg("redundancy") = 1,
+             py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
              py::arg("layer_partition_mode") = "round_robin",
              py::arg("layer_replicate_flags") = std::vector<bool>{},
@@ -586,7 +586,7 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("query_ids"), py::arg("query_vectors"), py::arg("payloads"), py::arg("k") = 10,
              py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<double>::partition,
-             py::arg("mode"), py::arg("redundancy") = 1,
+             py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
              py::arg("layer_partition_mode") = "round_robin",
              py::arg("layer_replicate_flags") = std::vector<bool>{},
@@ -638,7 +638,7 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("query_ids"), py::arg("query_vectors"), py::arg("payloads"), py::arg("k") = 10,
              py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<int32_t>::partition,
-             py::arg("mode"), py::arg("redundancy") = 1,
+             py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
              py::arg("layer_partition_mode") = "round_robin",
              py::arg("layer_replicate_flags") = std::vector<bool>{},
@@ -690,7 +690,7 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("query_ids"), py::arg("query_vectors"), py::arg("payloads"), py::arg("k") = 10,
              py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<uint32_t>::partition,
-             py::arg("mode"), py::arg("redundancy") = 1,
+             py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
              py::arg("layer_partition_mode") = "round_robin",
              py::arg("layer_replicate_flags") = std::vector<bool>{},

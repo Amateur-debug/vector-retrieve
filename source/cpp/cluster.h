@@ -173,7 +173,7 @@ struct SDKCompletionQueue {
     }
 };
 
-// ==================== Reduce 模式异步查询累积器 ====================
+// ==================== Shard 模式异步查询累积器 ====================
 // 收集所有节点的查询结果，全部到齐后合并取 top-k 并推入完成队列。
 template <typename T>
 struct ReduceQueryAccumulator {
@@ -224,11 +224,11 @@ enum MessageType
     MSG_GET_INFORMATION = 8,
     MSG_SAVE_CLUSTER = 9,
     MSG_SAVE_HNSW = 10,
-    MSG_QUERY_LOCAL = 11,  // Reduce模式下只执行本地查询（避免递归）
-    MSG_ADD_VECTOR_LOCAL = 12,  // Reduce模式下直接添加到本地（避免递归路由）
+    MSG_QUERY_LOCAL = 11,  // Shard模式下只执行本地查询（避免递归）
+    MSG_ADD_VECTOR_LOCAL = 12,  // Shard模式下直接添加到本地（避免递归路由）
     MSG_SET_HNSW_PARAMS = 13,   // 运行时更新 HNSW 参数（如 ef_search）
-    MSG_QUERY_REDUCE = 14,      // 异步 reduce 查询请求（远程节点执行本地查询后通过 MSG_REDUCE_RESULT 回传）
-    MSG_REDUCE_RESULT = 15      // reduce 查询结果异步回传（携带 distance+vid 对，用于合并排序）
+    MSG_QUERY_SHARD = 14,      // 异步 shard 查询请求（远程节点执行本地查询后通过 MSG_SHARD_RESULT 回传）
+    MSG_SHARD_RESULT = 15      // shard 查询结果异步回传（携带 distance+vid 对，用于合并排序）
 };
 
 // 序列化/反序列化辅助缓冲区（用于 HNSW 图的网络传输、分布式同步和持久化存储）
@@ -764,7 +764,7 @@ public:
     std::mutex sdk_cq_map_mu_;
     std::unordered_map<int, std::shared_ptr<SDKCompletionQueue<T>>> sdk_cq_map_;  // query_id -> completion queue
 
-    // Reduce 模式异步累积器：query_id -> accumulator
+    // Shard 模式异步累积器：query_id -> accumulator
     std::mutex reduce_accum_mu_;
     std::unordered_map<int, std::shared_ptr<ReduceQueryAccumulator<T>>> reduce_accum_map_;
 
@@ -842,11 +842,11 @@ public:
 
     int outer_ring_max_iterations = 0;
 
-    int redundancy_level = 0;
-    uint64_t redundancy_num = 0;
+    int replication_level = 0;
+    uint64_t replication_num = 0;
 
     bool is_distributed = false;
-    bool is_reduce = false;
+    bool is_shard = false;
 
     std::atomic<int> add_round_robin_counter{0};
 
@@ -912,7 +912,7 @@ public:
 
     void add_vector(int vid, const std::vector<T> &vec)
     {
-        if (is_reduce)
+        if (is_shard)
         {
             // 采用轮询策略将向量均匀分配到各个节点
             int target_node = add_round_robin_counter % node_num;
@@ -1323,11 +1323,11 @@ public:
         return (int)removed.size();
     }
 
-    void partition(const string &mode, int redundancy = 1, const std::unordered_map<int, std::vector<int>> &layer_config = {}, const std::string &layer_partition_mode = "round_robin", const std::vector<bool> &layer_replicate_flags = {}, int num_threads = 0)
+    void partition(const string &mode, int replication = 1, const std::unordered_map<int, std::vector<int>> &layer_config = {}, const std::string &layer_partition_mode = "round_robin", const std::vector<bool> &layer_replicate_flags = {}, int num_threads = 0)
     {
         partition_mode = mode;
-        redundancy_level = redundancy;
-        redundancy_num = 0;
+        replication_level = replication;
+        replication_num = 0;
         this->layer_replicate_flags = layer_replicate_flags;
 
         int max_level = hnsw->max_level;
@@ -1483,7 +1483,7 @@ public:
                         if (!route_nodes.empty())
                         {
                             if (route_nodes.size() > 1)
-                                redundancy_num += (route_nodes.size() - 1);
+                                replication_num += (route_nodes.size() - 1);
                             vector_node_map[level][vid] = std::move(route_nodes);
                         }
                     }
@@ -1533,12 +1533,12 @@ public:
         }
 
         // 冗余机制：直接遍历 HNSW linklist，将远程邻居的 vid 添加到本地节点
-        if (redundancy > 0)
+        if (replication > 0)
         {
-            LOG_INFO_STREAM("[partition] Adding redundancy (direct HNSW traversal)...");
+            LOG_INFO_STREAM("[partition] Adding replication (direct HNSW traversal)...");
             size_t n = hnsw->get_cur_element_count();
 
-            for (int r = 0; r < redundancy; r++)
+            for (int r = 0; r < replication; r++)
             {
                 vector<unordered_set<int>> updates(node_num);
                 vector<unordered_map<int, std::vector<int>>> route_updates(vector_node_map.size());
@@ -1575,7 +1575,7 @@ public:
                                     !updates[node_id].count(neighbor_vid))
                                 {
                                     updates[node_id].insert(neighbor_vid);
-                                    redundancy_num++;
+                                    replication_num++;
 
                                     auto &route = route_updates[level][neighbor_vid];
                                     if (std::find(route.begin(), route.end(), node_id) == route.end())
@@ -1605,7 +1605,7 @@ public:
                     }
                 }
 
-                LOG_INFO_STREAM("[partition] Redundancy round " << r << " done, redundancy_num=" << redundancy_num);
+                LOG_INFO_STREAM("[partition] Redundancy round " << r << " done, replication_num=" << replication_num);
             }
         }
 
@@ -1701,11 +1701,11 @@ public:
 
     std::vector<int> query(int query_id, const vector<T> &query_vector, Payload<T> &payload, int k)
     {
-        if (is_reduce)
+        if (is_shard)
         {
             std::vector<pair<T, int>> all_results;
 
-    // Reduce 模式查询：并行向所有节点发送查询请求并合并结果
+    // Shard 模式查询：并行向所有节点发送查询请求并合并结果
             struct NodeQueryOutput
             {
                 std::vector<pair<T, int>> results;
@@ -1942,10 +1942,10 @@ public:
             j["bandwidth"] = bandwidth;
             j["partition_mode"] = partition_mode;
             j["outer_ring_max_iterations"] = outer_ring_max_iterations;
-            j["redundancy_level"] = redundancy_level;
-            j["redundancy_num"] = redundancy_num;
+            j["replication_level"] = replication_level;
+            j["replication_num"] = replication_num;
             j["is_distributed"] = is_distributed;
-            j["is_reduce"] = is_reduce;
+            j["is_shard"] = is_shard;
             j["add_round_robin_counter"] = add_round_robin_counter.load();
 
             if (partition_mode == "layer")
@@ -2080,10 +2080,10 @@ public:
         cluster->bandwidth = j.value("bandwidth", 1000.0);
         cluster->partition_mode = j.value("partition_mode", "");
         cluster->outer_ring_max_iterations = j.value("outer_ring_max_iterations", 0);
-        cluster->redundancy_level = j.value("redundancy_level", 0);
-        cluster->redundancy_num = j.value("redundancy_num", (uint64_t)0);
+        cluster->replication_level = j.value("replication_level", 0);
+        cluster->replication_num = j.value("replication_num", (uint64_t)0);
         cluster->is_distributed = j.value("is_distributed", false);
-        cluster->is_reduce = j.value("is_reduce", false);
+        cluster->is_shard = j.value("is_shard", false);
         cluster->add_round_robin_counter = j.value("add_round_robin_counter", 0);
 
         if (cluster->partition_mode == "layer")
@@ -2178,7 +2178,7 @@ public:
     }
 };
 
-// ==================== Reduce 模式查询会话 ====================
+// ==================== Shard 模式查询会话 ====================
 // 持久连接 + 流水线发送，避免每次查询都 std::async + acquire/release 连接。
 // 用法：每个查询线程创建一个 session，复用到所有查询，结束后 close。
 // 查询流程：
@@ -2187,16 +2187,16 @@ public:
 //   3. 依次接收所有远程节点的响应
 //   4. 合并排序取 top-k
 template <typename T>
-class ReduceQuerySession
+class ShardQuerySession
 {
 public:
     Cluster<T> *cluster_;
     std::vector<int> node_conns_; // node_conns_[i] = 到节点 i 的持久连接，本地节点为 -1
     bool valid_ = false;
 
-    ReduceQuerySession() : cluster_(nullptr) {}
+    ShardQuerySession() : cluster_(nullptr) {}
 
-    explicit ReduceQuerySession(Cluster<T> *cluster) : cluster_(cluster)
+    explicit ShardQuerySession(Cluster<T> *cluster) : cluster_(cluster)
     {
         node_conns_.resize(cluster->node_num, -1);
         for (int i = 0; i < cluster->node_num; i++)
@@ -2206,29 +2206,29 @@ public:
                 node_conns_[i] = cluster->transport->acquire_connection(i);
                 if (node_conns_[i] < 0)
                 {
-                    LOG_DEBUG_STREAM("[ReduceQuerySession] Failed to acquire connection to node " << i);
+                    LOG_DEBUG_STREAM("[ShardQuerySession] Failed to acquire connection to node " << i);
                 }
             }
         }
         valid_ = true;
     }
 
-    ~ReduceQuerySession()
+    ~ShardQuerySession()
     {
         close();
     }
 
     // 禁止拷贝
-    ReduceQuerySession(const ReduceQuerySession &) = delete;
-    ReduceQuerySession &operator=(const ReduceQuerySession &) = delete;
+    ShardQuerySession(const ShardQuerySession &) = delete;
+    ShardQuerySession &operator=(const ShardQuerySession &) = delete;
 
     // 支持移动
-    ReduceQuerySession(ReduceQuerySession &&other) noexcept
+    ShardQuerySession(ShardQuerySession &&other) noexcept
         : cluster_(other.cluster_), node_conns_(std::move(other.node_conns_)), valid_(other.valid_)
     {
         other.valid_ = false;
     }
-    ReduceQuerySession &operator=(ReduceQuerySession &&other) noexcept
+    ShardQuerySession &operator=(ShardQuerySession &&other) noexcept
     {
         if (this != &other)
         {
@@ -2332,7 +2332,7 @@ public:
                 }
                 catch (const std::exception &e)
                 {
-                    LOG_DEBUG_STREAM("[ReduceQuerySession] Error receiving from node " << i << ": " << e.what());
+                    LOG_DEBUG_STREAM("[ShardQuerySession] Error receiving from node " << i << ": " << e.what());
                 }
             }
         }
@@ -2590,8 +2590,8 @@ void Node<T>::handle_node_client(int conn_id)
                 continue;
             }
 
-            // MSG_REDUCE_RESULT：reduce 模式异步结果回传，推入累积器
-            if (msg_type == MSG_REDUCE_RESULT)
+            // MSG_SHARD_RESULT：shard 模式异步结果回传，推入累积器
+            if (msg_type == MSG_SHARD_RESULT)
             {
                 msg_pool_->submit_urgent([this, buf]() {
                     int query_id = buf->read_val<int>();
@@ -2616,7 +2616,7 @@ void Node<T>::handle_node_client(int conn_id)
                     if (accum) {
                         accum->add_node_results(results, payload);
                     } else {
-                        LOG_DEBUG_STREAM("[Node " << node_id << "] Warning: No reduce accumulator for query " << query_id);
+                        LOG_DEBUG_STREAM("[Node " << node_id << "] Warning: No shard accumulator for query " << query_id);
                     }
                 });
                 continue;
@@ -2646,7 +2646,7 @@ void Node<T>::handle_node_client(int conn_id)
 
                         char ack = 1;
                         try {
-                            if (local_hnsw == nullptr && cluster && cluster->is_reduce)
+                            if (local_hnsw == nullptr && cluster && cluster->is_shard)
                             {
                                 std::lock_guard<std::mutex> lk(local_hnsw_mutex);
                                 if (local_hnsw == nullptr)
@@ -2699,9 +2699,9 @@ void Node<T>::handle_node_client(int conn_id)
                         cluster->transport->send_raw(conn_id, &resp_size, sizeof(uint64_t));
                         cluster->transport->send_raw(conn_id, resp_buf.data.data(), resp_size);
                     }
-                    else if (msg_type == MSG_QUERY_REDUCE)
+                    else if (msg_type == MSG_QUERY_SHARD)
                     {
-                        // 异步 reduce 查询：执行本地搜索，结果通过 MSG_REDUCE_RESULT 回传给 origin
+                        // 异步 shard 查询：执行本地搜索，结果通过 MSG_SHARD_RESULT 回传给 origin
                         int query_id = buf->read_val<int>();
                         int k = buf->read_val<int>();
                         std::vector<T> query_vector = buf->read_vec<T>();
@@ -2737,12 +2737,12 @@ void Node<T>::handle_node_client(int conn_id)
                         }
                         else
                         {
-                            // origin 在远程，通过网络发送 MSG_REDUCE_RESULT
+                            // origin 在远程，通过网络发送 MSG_SHARD_RESULT
                             int sock = cluster->transport->acquire_connection(origin_node_id);
                             if (sock >= 0) {
                                 try {
                                     Buffer resp_buf;
-                                    resp_buf.write_val((int)MSG_REDUCE_RESULT);
+                                    resp_buf.write_val((int)MSG_SHARD_RESULT);
                                     resp_buf.write_val(query_id);
                                     resp_buf.write_val((int)results.size());
                                     for (const auto &p : results) {
@@ -2756,7 +2756,7 @@ void Node<T>::handle_node_client(int conn_id)
                                     cluster->transport->release_connection(origin_node_id, sock, true);
                                 } catch (...) {
                                     cluster->transport->release_connection(origin_node_id, sock, false);
-                                    LOG_DEBUG_STREAM("[Node " << node_id << "] Failed to send MSG_REDUCE_RESULT to origin " << origin_node_id);
+                                    LOG_DEBUG_STREAM("[Node " << node_id << "] Failed to send MSG_SHARD_RESULT to origin " << origin_node_id);
                                 }
                             }
                         }
@@ -2866,7 +2866,7 @@ void Node<T>::handle_sdk_client(int client_fd)
 
                 char ack = 1;
                 try {
-                    if (cluster && cluster->is_reduce)
+                    if (cluster && cluster->is_shard)
                         cluster->add_vector(vid, vec);
                     else if (cluster && cluster->hnsw)
                         cluster->hnsw->add_vector(vid, vec);
@@ -2892,9 +2892,9 @@ void Node<T>::handle_sdk_client(int client_fd)
                 auto pl = std::make_shared<Payload<T>>(std::move(payload));
 
                 msg_pool_->submit([this, query_id, k, qv, pl, completion_queue, &inflight_count]() {
-                    if (cluster && cluster->is_reduce)
+                    if (cluster && cluster->is_shard)
                     {
-                        // Reduce 模式：异步流水线
+                        // Shard 模式：异步流水线
                         inflight_count++;
 
                         auto accum = std::make_shared<ReduceQueryAccumulator<T>>();
@@ -2912,7 +2912,7 @@ void Node<T>::handle_sdk_client(int client_fd)
                             reduce_accum_map_[query_id] = accum;
                         }
 
-                        // Phase 1: 向所有远程节点发送 MSG_QUERY_REDUCE
+                        // Phase 1: 向所有远程节点发送 MSG_QUERY_SHARD
                         for (int i = 0; i < cluster->node_num; i++)
                         {
                             if (cluster->is_distributed && cluster->nodes[i].is_remote_node)
@@ -2921,7 +2921,7 @@ void Node<T>::handle_sdk_client(int client_fd)
                                 if (sock >= 0) {
                                     try {
                                         Buffer sbuf;
-                                        sbuf.write_val((int)MSG_QUERY_REDUCE);
+                                        sbuf.write_val((int)MSG_QUERY_SHARD);
                                         sbuf.write_val(query_id);
                                         sbuf.write_val(k);
                                         sbuf.write_vec(*qv);
@@ -2996,7 +2996,7 @@ void Node<T>::handle_sdk_client(int client_fd)
             else if (msg_type == MSG_PARTITION)
             {
                 std::string mode = buf.read_string();
-                int redundancy = buf.read_val<int>();
+                int replication = buf.read_val<int>();
                 std::unordered_map<int, std::vector<int>> layer_config;
                 std::string layer_partition_mode = "round_robin";
                 std::vector<bool> layer_replicate_flags;
@@ -3009,7 +3009,7 @@ void Node<T>::handle_sdk_client(int client_fd)
                     num_threads = buf.read_val<int>();
 
                 if (cluster)
-                    cluster->partition(mode, redundancy, layer_config, layer_partition_mode, layer_replicate_flags, num_threads);
+                    cluster->partition(mode, replication, layer_config, layer_partition_mode, layer_replicate_flags, num_threads);
 
                 char ack = 1;
                 send_all(client_fd, &ack, 1);
@@ -3030,10 +3030,10 @@ void Node<T>::handle_sdk_client(int client_fd)
                         cluster->bandwidth = loaded->bandwidth;
                         cluster->partition_mode = loaded->partition_mode;
                         cluster->outer_ring_max_iterations = loaded->outer_ring_max_iterations;
-                        cluster->redundancy_level = loaded->redundancy_level;
-                        cluster->redundancy_num = loaded->redundancy_num;
+                        cluster->replication_level = loaded->replication_level;
+                        cluster->replication_num = loaded->replication_num;
                         cluster->is_distributed = loaded->is_distributed;
-                        cluster->is_reduce = loaded->is_reduce;
+                        cluster->is_shard = loaded->is_shard;
                         cluster->add_round_robin_counter.store(loaded->add_round_robin_counter.load());
                         cluster->vector_node_map = std::move(loaded->vector_node_map);
                         cluster->layer_config = std::move(loaded->layer_config);
@@ -3155,10 +3155,10 @@ void Node<T>::handle_sdk_client(int client_fd)
                     cj["node_num"] = cluster->node_num;
                     cj["bandwidth"] = cluster->bandwidth;
                     cj["partition_mode"] = cluster->partition_mode;
-                    cj["redundancy_level"] = cluster->redundancy_level;
-                    cj["redundancy_num"] = cluster->redundancy_num;
+                    cj["replication_level"] = cluster->replication_level;
+                    cj["replication_num"] = cluster->replication_num;
                     cj["is_distributed"] = cluster->is_distributed;
-                    cj["is_reduce"] = cluster->is_reduce;
+                    cj["is_shard"] = cluster->is_shard;
                     cj["layer_config"] = cluster->layer_config;
                     cj["layer_replicate_flags"] = cluster->layer_replicate_flags;
 
@@ -3444,7 +3444,7 @@ void Node<T>::add_vector(int vid, const std::vector<T> &vec)
     {
         // 确保 local_hnsw 已初始化（reduce模式下按需初始化）
         // 双重检查锁定：只保护指针创建，add_vector 内部已有线程安全保护
-        if (local_hnsw == nullptr && cluster->is_reduce)
+        if (local_hnsw == nullptr && cluster->is_shard)
         {
             std::lock_guard<std::mutex> lk(local_hnsw_mutex);
             if (local_hnsw == nullptr)

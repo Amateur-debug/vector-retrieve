@@ -27,7 +27,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [2],
+            "replication":   [2],
             "num_query_threads": [40],
         },
     },
@@ -42,7 +42,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [2],
+            "replication":   [2],
             "num_query_threads": [40],
         },
     },
@@ -54,7 +54,7 @@ DRAW_TASKS = [
             "x":            ["threads"],
             "y":            ["qps"],
             "node_num":     [5],
-            "redundancy":   [2],
+            "replication":   [2],
             "num_query_threads": [40],
             "recall":       [0.95, 0.9, 0.85],
         },
@@ -67,18 +67,18 @@ DRAW_TASKS = [
             "x":            ["threads"],
             "y":            ["qps"],
             "node_num":     [5],
-            "redundancy":   [2],
+            "replication":   [2],
             "num_query_threads": [40],
             "recall":       [0.95, 0.9, 0.85],
         },
     },
-    # --- compare 模式：redundancy vs redundancy_num 折线图 ---
+    # --- compare 模式：replication vs replication_num 折线图 ---
     {
         "chart": "bar",
         "mode": "compare",
         "grid": {
-            "x":            ["redundancy"],
-            "y":            ["redundancy_num"],
+            "x":            ["replication"],
+            "y":            ["replication_num"],
             "m":            [10],
             "ef_construction": [200],
             "ef_search":    [15],
@@ -88,12 +88,12 @@ DRAW_TASKS = [
             "num_query_threads": [40],
         },
     },
-    # --- compare 模式：redundancy vs avg_remote_transfer_cnt 柱状图 ---
+    # --- compare 模式：replication vs avg_remote_transfer_cnt 柱状图 ---
     {
         "chart": "bar",
         "mode": "compare",
         "grid": {
-            "x":            ["redundancy"],
+            "x":            ["replication"],
             "y":            ["avg_remote_transfer_cnt"],
             "m":            [10],
             "ef_construction": [200],
@@ -104,12 +104,12 @@ DRAW_TASKS = [
             "num_query_threads": [40],
         },
     },
-    # --- compare 模式：redundancy vs avg_remote_transfer_cnt 折线图 ---
+    # --- compare 模式：replication vs avg_remote_transfer_cnt 折线图 ---
     {
         "chart": "line",
         "mode": "compare",
         "grid": {
-            "x":            ["redundancy"],
+            "x":            ["replication"],
             "y":            ["avg_remote_transfer_cnt"],
             "m":            [10],
             "ef_construction": [200],
@@ -120,12 +120,12 @@ DRAW_TASKS = [
             "num_query_threads": [40],
         },
     },
-    # --- compare 模式：redundancy vs avg_remote_transfer_data_per_transfer 折线图 ---
+    # --- compare 模式：replication vs avg_remote_transfer_data_per_transfer 折线图 ---
     {
         "chart": "line",
         "mode": "compare",
         "grid": {
-            "x":            ["redundancy"],
+            "x":            ["replication"],
             "y":            ["avg_remote_transfer_data_per_transfer"],
             "m":            [10],
             "ef_construction": [200],
@@ -134,12 +134,12 @@ DRAW_TASKS = [
             "node_num":     [5],
         },
     },
-    # --- compare 模式：redundancy vs avg_remote_transfer_data_per_transfer 柱状图 ---
+    # --- compare 模式：replication vs avg_remote_transfer_data_per_transfer 柱状图 ---
     {
         "chart": "bar",
         "mode": "compare",
         "grid": {
-            "x":            ["redundancy"],
+            "x":            ["replication"],
             "y":            ["avg_remote_transfer_data_per_transfer"],
             "m":            [10],
             "ef_construction": [200],
@@ -148,12 +148,12 @@ DRAW_TASKS = [
             "node_num":     [5],
         },
     },
-    # --- compare 模式：redundancy vs avg_remote_transfer_data_per_query 折线图 ---
+    # --- compare 模式：replication vs avg_remote_transfer_data_per_query 折线图 ---
     {
         "chart": "line",
         "mode": "compare",
         "grid": {
-            "x":            ["redundancy"],
+            "x":            ["replication"],
             "y":            ["avg_remote_transfer_data_per_query"],
             "m":            [10],
             "ef_construction": [200],
@@ -162,12 +162,12 @@ DRAW_TASKS = [
             "node_num":     [5],
         },
     },
-    # --- compare 模式：redundancy vs avg_remote_transfer_data_per_query 柱状图 ---
+    # --- compare 模式：replication vs avg_remote_transfer_data_per_query 柱状图 ---
     {
         "chart": "bar",
         "mode": "compare",
         "grid": {
-            "x":            ["redundancy"],
+            "x":            ["replication"],
             "y":            ["avg_remote_transfer_data_per_query"],
             "m":            [10],
             "ef_construction": [200],
@@ -184,7 +184,7 @@ DRAW_TASKS = [
             "x":            ["avg_distance_cnt"],
             "y":            ["avg_recall@10"],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
             "threads":      [8],
             "num_query_threads": [40],
         },
@@ -200,7 +200,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
             "split":        [True],
@@ -217,7 +217,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
         },
@@ -233,7 +233,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
         },
@@ -249,7 +249,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
         },
@@ -265,7 +265,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
         },
@@ -281,7 +281,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
         },
@@ -297,7 +297,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
         },
     },
     # --- compare 模式：efs vs avg_remote_transfer_data_per_transfer 柱状图 ---
@@ -311,7 +311,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
         },
     },
     # --- compare 模式：efs vs avg_remote_transfer_data_per_query 折线图 ---
@@ -325,7 +325,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
         },
     },
     # --- compare 模式：efs vs avg_remote_transfer_data_per_query 柱状图 ---
@@ -339,7 +339,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
         },
     },
     # --- compare 模式：recall vs avg_remote_transfer_data_per_transfer 折线图 ---
@@ -350,7 +350,7 @@ DRAW_TASKS = [
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_data_per_transfer"],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
         },
     },
     # --- compare 模式：recall vs avg_remote_transfer_data_per_transfer 柱状图 ---
@@ -361,7 +361,7 @@ DRAW_TASKS = [
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_data_per_transfer"],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
         },
     },
     # --- compare 模式：recall vs avg_remote_transfer_data_per_query 折线图 ---
@@ -372,7 +372,7 @@ DRAW_TASKS = [
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_data_per_query"],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
         },
     },
     # --- compare 模式：recall vs avg_remote_transfer_data_per_query 柱状图 ---
@@ -383,7 +383,7 @@ DRAW_TASKS = [
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_data_per_query"],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
         },
     },
     # --- compare 模式：recall vs avg_distance_cnt 折线图 ---
@@ -394,7 +394,7 @@ DRAW_TASKS = [
             "x":            ["avg_recall@10"],
             "y":            ["avg_distance_cnt"],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
         },
     },
     # --- compare 模式：recall vs avg_distance_cnt 柱状图 ---
@@ -405,7 +405,7 @@ DRAW_TASKS = [
             "x":            ["avg_recall@10"],
             "y":            ["avg_distance_cnt"],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
         },
     },
     # --- compare 模式：recall vs avg_remote_transfer_cnt 折线图 ---
@@ -416,7 +416,7 @@ DRAW_TASKS = [
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_cnt"],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
         },
     },
     # --- compare 模式：recall vs avg_remote_transfer_cnt 柱状图 ---
@@ -427,7 +427,7 @@ DRAW_TASKS = [
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_cnt"],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
         },
     },
     # --- group 模式：x=ef_search, y=qps, 按 m 分组 ---
@@ -441,7 +441,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
             "layer":        [True, False],
@@ -458,20 +458,20 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
             "layer":        [True, False],
         },
     },
-    # --- group 模式：recall vs avg_remote_transfer_cnt，按 redundancy 分组 ---
+    # --- group 模式：recall vs avg_remote_transfer_cnt，按 replication 分组 ---
     {
         "chart": "line",
         "mode": "group",
         "grid": {
             "x":            ["avg_recall@10"],
             "y":            ["avg_remote_transfer_cnt"],
-            "group_by":     ["redundancy"],
+            "group_by":     ["replication"],
             "node_num":     [5],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
@@ -486,7 +486,7 @@ DRAW_TASKS = [
             "x":            ["avg_recall@10"],
             "y":            ["qps"],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
             "layer":        [True, False],
@@ -500,7 +500,7 @@ DRAW_TASKS = [
             "x":            ["avg_recall@10"],
             "y":            ["qps"],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
             "layer":        [True, False],
@@ -517,7 +517,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
         },
@@ -533,7 +533,7 @@ DRAW_TASKS = [
             "ef_construction": [200],
             "limited_level": [5],
             "node_num":     [5],
-            "redundancy":   [0, 1, 2],
+            "replication":   [0, 1, 2],
             "threads":      [8, 16, 32, 64],
             "num_query_threads": [40],
         },
@@ -559,10 +559,10 @@ DEFAULTS = {
     "partition_mode": "k-means",
     "layer": None,
     "no_layer": False,
-    "redundancy": None,
+    "replication": None,
     "threads": None,
     "num_query_threads": None,
-    "reduce": False,
+    "shard": False,
     "distributed": False,
     "recall": None,
     "group_by": None,

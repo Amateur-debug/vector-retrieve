@@ -38,7 +38,7 @@ DATASETS = [
 PARAM_GRID = {
     "node_num":           [5],
     "partition_mode":     ["k-means"],
-    "redundancy":         [2, 1, 0],
+    "replication":        [2, 1, 0],
     "m":                  [10, 15, 20, 25, 30, 35, 40],
     "ef_construction":    [200],
     "ef_search":          [15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
@@ -46,7 +46,7 @@ PARAM_GRID = {
     "k":                  [10],
     "num_query_threads":  [40],      # 客户端查询进程数
     "num_threads":        [8],       # 服务端每 node 搜索线程数
-    "reduce":             [False, True],
+    "shard":              [False, True],
     "distributed":        [True],
     "layer":              [True, False],
     "comm_mode":          ["tcp"],  # 通信模式："tcp" 或 "rdma"
@@ -111,11 +111,11 @@ def build_command(dataset, params, skip_prepare=False, no_cleanup=False):
         "--num_threads", str(params['num_threads']),
         "--node_num", str(params['node_num']),
         "--partition_mode", params['partition_mode'],
-        "--redundancy", str(params['redundancy']),
+        "--replication", str(params['replication']),
     ]
 
-    if params.get('reduce'):
-        cmd.append('--reduce')
+    if params.get('shard'):
+        cmd.append('--shard')
     if params.get('distributed'):
         cmd.append('--distributed')
     if params.get('layer'):
@@ -146,25 +146,23 @@ def get_result_path(dataset_name, params):
     cpu_suffix = f"-cpus{cpus}" if params.get('distributed') and cpus != 0 else ""
     qt_suffix = f"-query_threads{params['num_query_threads']}"
 
-    if params.get('reduce'):
-        # reduce 模式：无 partition_mode、redundancy、layer
+    if params.get('shard'):
         filename = (f"results-{dataset_name}-m{params['m']}-efc{params['ef_construction']}-"
                     f"efs{params['ef_search']}-ll{params['limited_level']}-"
                     f"node{params['node_num']}-"
-                    f"threads{params['num_threads']}{qt_suffix}{distributed_suffix}{cpu_suffix}-reduce.json")
+                    f"threads{params['num_threads']}{qt_suffix}{distributed_suffix}{cpu_suffix}-shard.json")
     else:
-        # 非 reduce 模式：包含 partition_mode、redundancy，可选 layer
         layer_suffix = "-layer" if params.get('layer') else ""
         filename = (f"results-{dataset_name}-m{params['m']}-efc{params['ef_construction']}-"
                     f"efs{params['ef_search']}-ll{params['limited_level']}-"
-                    f"node{params['node_num']}-{params['partition_mode']}-red{params['redundancy']}-"
+                    f"node{params['node_num']}-{params['partition_mode']}-rep{params['replication']}-"
                     f"threads{params['num_threads']}{qt_suffix}{distributed_suffix}{cpu_suffix}{layer_suffix}.json")
 
     return os.path.join(".", "results", "cpp", filename)
 
 
 def get_group_key(dataset_name, params):
-    """生成分组键：相同 (dataset, m, efc, ll, node_num, partition_mode, redundancy, layer, ...) 的任务共享服务端"""
+    """生成分组键：相同 (dataset, m, efc, ll, node_num, partition_mode, replication, layer, ...) 的任务共享服务端"""
     return (
         dataset_name,
         params['m'],
@@ -172,9 +170,9 @@ def get_group_key(dataset_name, params):
         params['limited_level'],
         params['node_num'],
         params['partition_mode'],
-        params.get('redundancy', 0),
+        params.get('replication', 0),
         params.get('layer', False),
-        params.get('reduce', False),
+        params.get('shard', False),
         params.get('distributed', False),
         params.get('comm_mode', 'tcp'),
         params.get('num_threads', 8),
@@ -256,13 +254,14 @@ def run_batch():
 
             efs = params['ef_search']
             layer_str = "layer" if params.get('layer') else "non-layer"
+            mode_str = "shard" if params.get('shard') else f"rep={params.get('replication',0)}"
             flags = []
             if not is_first:
                 flags.append("skip_prepare")
             if not is_last:
                 flags.append("no_cleanup")
             flag_str = f" [{','.join(flags)}]" if flags else ""
-            description = (f"m={params['m']} red={params.get('redundancy',0)} {layer_str} "
+            description = (f"m={params['m']} {mode_str} {layer_str} "
                            f"efs={efs}{flag_str}")
 
             run_worker(cmd, task_idx, total_runs, description)

@@ -28,8 +28,8 @@ class Cluster:
         self.partition_mode = None
         self.outer_ring_max_iterations = 0
 
-        self.redundancy_level = 0
-        self.redundancy_num = 0 
+        self.replication_level = 0
+        self.replication_num = 0 
 
         self.remote_transfer_cnt = {}
         self.remote_transfer_latency = {} # 记录每个查询的远程传输延迟, 单位为 ms
@@ -40,11 +40,11 @@ class Cluster:
         for node in self.nodes.values():
             node.reset()
 
-    def partition(self, mode, redundancy=1):
+    def partition(self, mode, replication=1):
 
         self.partition_mode = mode
-        self.redundancy_level = redundancy
-        self.redundancy_num = 0
+        self.replication_level = replication
+        self.replication_num = 0
 
         max_level = self.hnsw.max_level 
         vectors = self.hnsw.vectors
@@ -111,9 +111,9 @@ class Cluster:
                     removed_cnt_before = removed_cnt
 
         # 添加冗余
-        if redundancy > 0:
-            for r in range(redundancy):
-                print(f"Processing redundancy pass {r+1}/{redundancy}...")
+        if replication > 0:
+            for r in range(replication):
+                print(f"Processing replication pass {r+1}/{replication}...")
                 
                 # 记录本轮需要添加的数据，避免在遍历时修改字典导致的问题
                 updates = defaultdict(dict)
@@ -130,7 +130,7 @@ class Cluster:
                                         if neighbor_id not in updates[node_id]:
                                             if neighbor_id in vectors:
                                                 updates[node_id][neighbor_id] = vectors[neighbor_id]                                      
-                                                self.redundancy_num += 1
+                                                self.replication_num += 1
                 
                 # 应用本轮更新
                 for node_id, new_vectors in updates.items():

@@ -228,7 +228,7 @@ class VectorRetrieveRunner:
             except Exception as e:
                 print(f"Warning: failed to parse --layer_replicate_flags ({e}), fallback to default {self.layer_replicate_flags}")
 
-        self.redundancy = args.redundancy
+        self.replication = args.replication
 
         # 通信模式参数
         self.comm_mode = getattr(args, 'comm_mode', 'tcp')
@@ -324,7 +324,7 @@ class VectorRetrieveRunner:
                 log_file = f"{current_dir}/worker_{i}.log"
 
                 distributed_flag = "--distributed" if self.args.distributed else ""
-                reduce_flag = "--reduce" if self.args.reduce else ""
+                shard_flag = "--shard" if self.args.shard else ""
 
                 # Build local command
                 local_cmd = [
@@ -343,8 +343,8 @@ class VectorRetrieveRunner:
                     local_cmd = ["taskset", "-c", f"0-{self.num_cpu - 1}"] + local_cmd
                 if distributed_flag:
                     local_cmd.append(distributed_flag)
-                if reduce_flag:
-                    local_cmd.append(reduce_flag)
+                if shard_flag:
+                    local_cmd.append(shard_flag)
 
                 # Launch local worker in background
                 with open(log_file, 'w') as log_f:
@@ -356,7 +356,7 @@ class VectorRetrieveRunner:
                 log_file = f"{current_dir}/worker_{i}.log"
 
                 distributed_flag = "--distributed" if self.args.distributed else ""
-                reduce_flag = "--reduce" if self.args.reduce else ""
+                shard_flag = "--shard" if self.args.shard else ""
 
                 # Build remote command as a single string
                 cpu_prefix = f"taskset -c 0-{self.num_cpu - 1} " if self.num_cpu and self.num_cpu > 0 else ""
@@ -370,7 +370,7 @@ class VectorRetrieveRunner:
                     f"--ef_search {self.ef_search} --limited_level {self.args.limited_level} "
                     f"--comm_mode {self.comm_mode} "
                     f"--num_threads {self.num_threads} "
-                    f"{distributed_flag} {reduce_flag} "
+                    f"{distributed_flag} {shard_flag} "
                     f"> {log_file} 2>&1 &"
                 )
 
@@ -412,7 +412,7 @@ class VectorRetrieveRunner:
         self.worker_processes = worker_processes
 
     def build_index(self, data, num_elements):
-        mode_label = "reduce" if self.args.reduce else "normal"
+        mode_label = "shard" if self.args.shard else "normal"
         if self.num_construction_threads > 1:
             print(f"Building in {mode_label} with {self.num_construction_threads} threads via SDK...")
             start_time = time.time()
@@ -473,7 +473,7 @@ class VectorRetrieveRunner:
             print(f"Building Time: {build_time:.4f} seconds (using {self.num_construction_threads} threads via SDK).")
 
             # 分布式模式下打印各节点的向量数量
-            if self.args.distributed and self.args.reduce:
+            if self.args.distributed and self.args.shard:
                 self._print_node_vector_counts()
             return build_time
 
@@ -489,14 +489,14 @@ class VectorRetrieveRunner:
             print(f"Building Time: {build_time:.4f} seconds.")
 
             # 分布式模式下打印各节点的向量数量
-            if self.args.distributed and self.args.reduce:
+            if self.args.distributed and self.args.shard:
                 self._print_node_vector_counts()
             return build_time
         finally:
             thread_client.disconnect()
 
     def _print_node_vector_counts(self):
-        """打印各节点的向量数量（分布式reduce模式）"""
+        """打印各节点的向量数量（分布式shard模式）"""
         print("Node vector counts:")
         # 通过 SDK 获取每个节点的信息
         for i, ip in enumerate(self.node_ips):
@@ -549,8 +549,8 @@ class VectorRetrieveRunner:
                 'port': 19000 + self.host_id
             }
 
-            if self.graph_path is not None and os.path.exists(self.graph_path) and not self.args.reduce:
-                # reduce 模式需要每个节点独立建图，不能复用统一的 HNSW 图
+            if self.graph_path is not None and os.path.exists(self.graph_path) and not self.args.shard:
+                # shard 模式需要每个节点独立建图，不能复用统一的 HNSW 图
                 print(f"Loading HNSW graph via SDK from {self.graph_path}...")
                 sdk_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
                 if not sdk_client.connect():
@@ -572,7 +572,7 @@ class VectorRetrieveRunner:
 
                 self.build_index(data=data, num_elements=num_elements)
 
-            if not self.args.reduce:
+            if not self.args.shard:
                 # 通过 SDK 调用 partition
                 print("Partitioning data across cluster nodes via SDK...")
                 start_time = time.time()
@@ -582,20 +582,20 @@ class VectorRetrieveRunner:
                     raise RuntimeError("Failed to connect SDK to local node for partition")
                 try:
                     if self.use_layer:
-                        print(f"Partitioning in layer mode (redundancy={self.redundancy})...")
+                        print(f"Partitioning in layer mode (replication={self.replication})...")
                         partition_client.partition(
                             mode="layer",
-                            redundancy=self.redundancy,
+                            replication=self.replication,
                             layer_config=self.layer_config,
                             layer_partition_mode=self.partition_mode,
                             layer_replicate_flags=self.layer_replicate_flags,
                             num_threads=self.num_construction_threads,
                         )
                     else:
-                        print(f"Partitioning in {self.partition_mode} mode (redundancy={self.redundancy})...")
+                        print(f"Partitioning in {self.partition_mode} mode (replication={self.replication})...")
                         partition_client.partition(
                             mode=self.partition_mode,
-                            redundancy=self.redundancy,
+                            replication=self.replication,
                             num_threads=self.num_construction_threads,
                         )
                     partition_time = time.time() - start_time
@@ -609,8 +609,8 @@ class VectorRetrieveRunner:
             print("Loading cluster from disk...")
             self.cluster = Cluster.load(self.cluster_path)
             self.cluster.reset()
-        elif self.graph_path is not None and os.path.exists(self.graph_path) and not self.args.reduce:
-            # reduce 模式需要每个节点独立建图，不能复用统一的 HNSW 图
+        elif self.graph_path is not None and os.path.exists(self.graph_path) and not self.args.shard:
+            # shard 模式需要每个节点独立建图，不能复用统一的 HNSW 图
             print("Loading HNSW graph from disk...")
             self.hnsw = HNSWGraph.load(self.graph_path)
             self.hnsw.ef_search = self.ef_search
@@ -619,9 +619,9 @@ class VectorRetrieveRunner:
 
             start_time = time.time()
             if self.use_layer:
-                self.cluster.partition(mode="layer", redundancy=self.redundancy, layer_config=self.layer_config, layer_partition_mode=self.partition_mode, layer_replicate_flags=self.layer_replicate_flags, num_threads=self.num_construction_threads)
+                self.cluster.partition(mode="layer", replication=self.replication, layer_config=self.layer_config, layer_partition_mode=self.partition_mode, layer_replicate_flags=self.layer_replicate_flags, num_threads=self.num_construction_threads)
             else:
-                self.cluster.partition(mode=self.partition_mode, redundancy=self.redundancy, layer_config=self.layer_config, num_threads=self.num_construction_threads)
+                self.cluster.partition(mode=self.partition_mode, replication=self.replication, layer_config=self.layer_config, num_threads=self.num_construction_threads)
             partition_time = time.time() - start_time
             print(f"Partitioning Time: {partition_time:.4f} seconds.")
         else:
@@ -636,14 +636,14 @@ class VectorRetrieveRunner:
             self.hnsw = HNSWGraph(dim=dim, m=self.m, ef_construction=self.ef_construction, ef_search=self.ef_search, limited_level=self.limited_level, max_elements=num_elements)
             self.cluster = Cluster(self.hnsw, self.node_num, comm_mode=self.comm_mode, ib_dev=self.ib_dev, ib_port=self.ib_port, gid_index=self.gid_index)
 
-            if self.args.reduce:
+            if self.args.shard:
                 # Reduce模式：先创建cluster，轮询添加向量到各节点独立建图
-                self.cluster.is_reduce = True
+                self.cluster.is_shard = True
 
                 num_threads = self.num_construction_threads
 
                 if num_threads > 1:
-                    print(f"Building cluster in reduce mode with {num_threads} threads...")
+                    print(f"Building cluster in shard mode with {num_threads} threads...")
                     start_time = time.time()
 
                     # 准备数据（直接传numpy数组，避免需要GIL的类型转换）
@@ -712,7 +712,7 @@ class VectorRetrieveRunner:
                             count = node.local_hnsw.get_cur_element_count() if node.local_hnsw else 0
                             print(f"  Node {i}: {count} vectors")
                 else:
-                    print("Building cluster in reduce mode...")
+                    print("Building cluster in shard mode...")
                     start_time = time.time()
                     for idx, vector in tqdm(enumerate(data[:num_elements]), total=num_elements, desc="Building", unit="vec"):
                         self.cluster.add_vector(idx, vector)  # 轮询添加到各节点
@@ -807,14 +807,14 @@ class VectorRetrieveRunner:
                     build_time = time.time() - start_time
                     print(f"Building Machine Time: {build_time:.4f} seconds.")
 
-            # 传统模式需要分区，reduce模式不需要（因为每个节点已经有自己的图）
-            if not self.args.reduce:
+            # 传统模式需要分区，shard模式不需要（因为每个节点已经有自己的图）
+            if not self.args.shard:
                 print("Partitioning data across cluster nodes...")
                 start_time = time.time()
                 if self.use_layer:
-                    self.cluster.partition(mode="layer", redundancy=self.redundancy, layer_config=self.layer_config, layer_partition_mode=self.partition_mode, layer_replicate_flags=self.layer_replicate_flags, num_threads=self.num_construction_threads)
+                    self.cluster.partition(mode="layer", replication=self.replication, layer_config=self.layer_config, layer_partition_mode=self.partition_mode, layer_replicate_flags=self.layer_replicate_flags, num_threads=self.num_construction_threads)
                 else:
-                    self.cluster.partition(mode=self.partition_mode, redundancy=self.redundancy, layer_config=self.layer_config, num_threads=self.num_construction_threads)
+                    self.cluster.partition(mode=self.partition_mode, replication=self.replication, layer_config=self.layer_config, num_threads=self.num_construction_threads)
                 partition_time = time.time() - start_time
                 print(f"Partitioning Time: {partition_time:.4f} seconds.")
 
@@ -853,7 +853,7 @@ class VectorRetrieveRunner:
                     port=self.sdk_config['port'],
                     comm_mode=self.comm_mode
                 )
-                # 所有分布式模式都需要初始化路由（包括 reduce 模式）
+                # 所有分布式模式都需要初始化路由（包括 shard 模式）
                 if not thread_sdk_client.init_routes():
                     # init_routes 失败时回退到默认地址
                     print(f"[Worker {worker_id}] Warning: init_routes failed, using default endpoint")
@@ -906,7 +906,7 @@ class VectorRetrieveRunner:
                 else:
                     for idx, i in enumerate(query_indices):
                         payload = Payload()
-                        if self.args.reduce:
+                        if self.args.shard:
                             results = self.cluster.query(i + worker_id * self.num_queries, queries[i], payload, self.K)
                         else:
                             results = self.cluster.nodes[self.host_id].query(i + worker_id * self.num_queries, queries[i], payload, k=self.k)
@@ -972,7 +972,7 @@ class VectorRetrieveRunner:
             build_dir_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'build'))
 
             def query_worker_process(worker_id, num_queries, queries_np, groundtruth, k,
-                                     distributed, reduce, sdk_config, comm_mode,
+                                     distributed, shard, sdk_config, comm_mode,
                                      host_id, cluster_ref, progress_val, result_q,
                                      build_dir_for_subprocess):
                 """子进程入口：独立创建 SDK 客户端，执行查询，通过 Queue 返回结果"""
@@ -1084,7 +1084,7 @@ class VectorRetrieveRunner:
                 for i in range(self.num_query_threads):
                     p = mp.Process(target=query_worker_process, args=(
                         i, self.num_queries, queries, groundtruth, self.k,
-                        True, self.args.reduce,
+                        True, self.args.shard,
                         self.sdk_config, self.comm_mode,
                         self.host_id, None,
                         progress_counter_mp, result_queue,
@@ -1238,7 +1238,7 @@ class VectorRetrieveRunner:
                         port=self.sdk_config['port'],
                         comm_mode=self.comm_mode
                     )
-                    # 所有分布式模式都需要初始化路由（包括 reduce 模式）
+                    # 所有分布式模式都需要初始化路由（包括 shard 模式）
                     if not thread_sdk_client.init_routes():
                         print("[Query] Warning: init_routes failed, using default endpoint")
 
@@ -1266,7 +1266,7 @@ class VectorRetrieveRunner:
                             local_remote_transfer_data[i] = ret_payload.remote_transfer_data
                             local_distance_cnt[i] = ret_payload.distance_cnt
                         else:
-                            if self.args.reduce:
+                            if self.args.shard:
                                 results = self.cluster.query(i, query_vec, payload, self.k)
                                 results = set(results)
                                 local_remote_transfer_cnt[i] = 0
@@ -1420,11 +1420,11 @@ class VectorRetrieveRunner:
             cluster_params = {
                 "node_num": cluster_info.get("node_num") if cluster_info else self.node_num,
                 "partition_mode": cluster_info.get("partition_mode") if cluster_info else self.partition_mode,
-                "redundancy_level": cluster_info.get("redundancy_level") if cluster_info else self.redundancy,
-                "redundancy_num": cluster_info.get("redundancy_num") if cluster_info else 0,
+                "replication_level": cluster_info.get("replication_level") if cluster_info else self.replication,
+                "replication_num": cluster_info.get("replication_num") if cluster_info else 0,
                 "bandwidth": cluster_info.get("bandwidth") if cluster_info else 0,
                 "is_distributed": cluster_info.get("is_distributed") if cluster_info else True,
-                "is_reduce": cluster_info.get("is_reduce") if cluster_info else self.args.reduce,
+                "is_shard": cluster_info.get("is_shard") if cluster_info else self.args.shard,
             }
 
             if cluster_params["partition_mode"] == "layer":
@@ -1444,11 +1444,11 @@ class VectorRetrieveRunner:
             cluster_params = {
                 "node_num": self.cluster.node_num,
                 "partition_mode": self.cluster.partition_mode,
-                "redundancy_level": self.cluster.redundancy_level,
-                "redundancy_num": self.cluster.redundancy_num,
+                "replication_level": self.cluster.replication_level,
+                "replication_num": self.cluster.replication_num,
                 "bandwidth": self.cluster.bandwidth,
                 "is_distributed": self.cluster.is_distributed,
-                "is_reduce": self.cluster.is_reduce,
+                "is_shard": self.cluster.is_shard,
             }
 
             if self.cluster.partition_mode == "layer":
@@ -1482,19 +1482,19 @@ class VectorRetrieveRunner:
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         distributed_suffix = "-distributed" if self.args.distributed else ""
         cpu_suffix = f"-cpus{self.args.num_cpu}" if self.args.distributed and self.args.num_cpu != 0 else ""
-        reduce_suffix = "-reduce" if self.args.reduce else ""
+        shard_suffix = "-shard" if self.args.shard else ""
         layer_suffix = "-layer" if self.use_layer else ""
 
         qt_suffix = f"-query_threads{self.num_query_threads}"
-        if self.args.reduce:
+        if self.args.shard:
             results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
                             f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
                             f"node{self.node_num}-"
-                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{reduce_suffix}.json")
+                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{shard_suffix}.json")
         else:
             results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
                             f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
-                            f"node{self.node_num}-{self.partition_mode}-red{self.redundancy}-"
+                            f"node{self.node_num}-{self.partition_mode}-rep{self.replication}-"
                             f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{layer_suffix}.json")
 
         with open(results_path, 'w') as f:
@@ -1608,9 +1608,9 @@ if __name__ == "__main__":
     parser.add_argument("--layer", action='store_true', default=False, help="Enable layer-based partitioning")
     parser.add_argument("--layer_config", type=str, default="{}", help="Layer configuration in JSON format")
     parser.add_argument("--layer_replicate_flags", type=str, default="[]", help="Layer replicate flags in JSON list; default behavior is [false,false,true,...] based on limited_level")
-    parser.add_argument("--redundancy", type=int, default=2, help="Redundancy level for data replication across nodes")
+    parser.add_argument("--replication", type=int, default=2, help="Replication level for data replication across nodes")
     parser.add_argument("--distributed", default=False, action='store_true', help="Enable distributed mode")
-    parser.add_argument("--reduce", default=False, action='store_true', help="Enable reduce mode (independent graphs per node)")
+    parser.add_argument("--shard", default=False, action='store_true', help="Enable shard mode (independent graphs per node)")
     parser.add_argument("--num_construction_threads", type=int, default=64, help="Number of threads for parallel graph construction (0=auto detect)")
     parser.add_argument("--num_query_threads", type=int, default=40, help="Number of client query processes (each process does all queries)")
     parser.add_argument("--num_threads", type=int, default=8, help="Number of server-side search threads per node (msg_pool_size)")

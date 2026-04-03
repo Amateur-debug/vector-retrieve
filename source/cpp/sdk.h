@@ -107,12 +107,12 @@ public:
                 return false;
             }
 
-            const bool is_reduce = cluster.value("is_reduce", false);
+            const bool is_shard = cluster.value("is_shard", false);
             std::vector<std::string> ips;
             std::vector<int> ports;
 
-            if (is_reduce) {
-                // Reduce 模式：轮询所有节点，每个节点都能独立处理查询
+            if (is_shard) {
+                // Shard 模式：轮询所有节点，每个节点都能独立处理查询
                 for (const auto &kv : node_addr) {
                     ips.push_back(kv.second.first);
                     ports.push_back(kv.second.second);
