@@ -133,11 +133,12 @@ def find_matching_file(directory, target_params):
     return None
 
 
-def classify_mode(filepath, data=None, is_weaviate=False):
+def classify_mode(filepath, data=None, is_weaviate=False, is_global=False):
     """根据文件名判断实验模式，并生成包含分区方式的标签。
 
     返回 (mode_key, label):
-      - shard:   ('shard', 'Shard')
+      - shard:    ('shard', 'Shard')
+      - global:   ('global', 'Global')   — is_global=True 时 no-layer 数据归为 global
       - no-layer: ('no-layer', 'No-Layer (k-means)')
       - layer:    ('layer', 'Layer (k-means)')
       - weaviate: ('weaviate', 'Weaviate')
@@ -156,6 +157,8 @@ def classify_mode(filepath, data=None, is_weaviate=False):
     if basename.rstrip('.json').endswith('-layer'):
         return 'layer', f'Layer ({pm})'
     else:
+        if is_global:
+            return 'global', 'Global'
         return 'no-layer', f'No-Layer ({pm})'
 
 
@@ -196,8 +199,8 @@ def make_output_filename(prefix, args, extra_keys=None):
         parts.append(f"node{args.node_num}")
     if getattr(args, 'partition_mode', None) is not None:
         parts.append(args.partition_mode)
-    if getattr(args, 'layer', None) is True:
-        parts.append("layer")
+    if getattr(args, 'global', False):
+        parts.append("global")
     if args.replication is not None:
         parts.append(f"rep{args.replication}")
     _thread_independent = {"replication_num", "rep_per_node", "data_per_node",
@@ -267,17 +270,20 @@ def snap_to_recall_bucket(val):
     return round(round(val / RECALL_BUCKET_SIZE) * RECALL_BUCKET_SIZE, 2)
 
 
-def bucket_recall_points(points_list):
+def bucket_recall_points(points_list, min_recall=None):
     """将 [(raw_recall, y_val, filename), ...] 按 0.05 档位聚合。
 
     recall 在档位 ±0.025 范围内视为满足该档位要求。
     同一档位有多个点时，保留 y 值最大的那个（如 qps 取最高）。
+    min_recall: 过滤掉低于此值的档位。
     返回 ({bucketed_recall: y_val}, {bucketed_recall: (raw_recall, filename)})。
     """
     # 生成所有可能的档位
     all_buckets = set()
     for raw_x, _, _ in points_list:
-        all_buckets.add(snap_to_recall_bucket(raw_x))
+        b = snap_to_recall_bucket(raw_x)
+        if min_recall is None or b >= min_recall:
+            all_buckets.add(b)
 
     # 每个点分配到 ±0.025 范围内的所有档位
     buckets = defaultdict(list)
@@ -375,8 +381,14 @@ def collect_compare(args):
                 if file_params.get('replication') != args.replication:
                     continue
 
+            # --global 模式：排除 layer 文件，no-layer 数据归为 global
+            is_global = getattr(args, 'global', False)
+            if is_global and not is_weaviate and file_params.get('layer'):
+                continue
+
             data = load_json_summary(f)
-            mode_key, label = classify_mode(f, data, is_weaviate=is_weaviate)
+            mode_key, label = classify_mode(f, data, is_weaviate=is_weaviate,
+                                            is_global=is_global)
             mode_labels[mode_key] = label
 
             x_val = get_param_value(data, args.x)
@@ -436,7 +448,7 @@ def collect_compare(args):
         if mode_debug is None:
             mode_debug = defaultdict(dict)
         for mode_key, candidates in mode_recall_candidates.items():
-            bucketed, debug_info = bucket_recall_points(candidates)
+            bucketed, debug_info = bucket_recall_points(candidates, min_recall=getattr(args, 'min_recall', None))
             mode_points[mode_key] = bucketed
             mode_debug[mode_key].update(debug_info)
             label = mode_labels.get(mode_key, mode_key)
@@ -569,7 +581,7 @@ def collect_merge(args):
                   f"| recall={best[0]:.4f} (target={target_recall})")
 
     if recall_x and recall_candidates:
-        points, _ = bucket_recall_points(recall_candidates)
+        points, _ = bucket_recall_points(recall_candidates, min_recall=getattr(args, 'min_recall', None))
 
     if not points:
         print("No valid data points found.")
@@ -695,16 +707,18 @@ def save_figure(fig, args, prefix, extra_keys=None):
     print(f"Plot saved to {png_path}")
     plt.close(fig)
 
-MODE_ORDER = ['weaviate', 'shard', 'no-layer', 'layer', 'cotra']
+MODE_ORDER = ['shard', 'global', 'weaviate', 'cotra', 'no-layer', 'layer']
 LINE_STYLES = {
-    'shard':   {'marker': 'o', 'linestyle': '-',  'color': '#cae9ff'},
+    'shard':    {'marker': 'o', 'linestyle': '-',  'color': '#cae9ff'},
+    'global':   {'marker': 's', 'linestyle': '--', 'color': '#1a759f'},
     'no-layer': {'marker': 's', 'linestyle': '--', 'color': '#1a759f'},
     'layer':    {'marker': '^', 'linestyle': '-.', 'color': '#5fa8d3'},
     'weaviate': {'marker': 'D', 'linestyle': ':',  'color': '#a2d2ff'},
     'cotra':    {'marker': 'X', 'linestyle': '-',  'color': '#74c0fc'},
 }
 BAR_STYLES = {
-    'shard':   {'color': '#cae9ff', 'hatch': '\\\\'},
+    'shard':    {'color': '#cae9ff', 'hatch': '\\\\'},
+    'global':   {'color': '#1a759f', 'hatch': 'xx'},
     'no-layer': {'color': '#1a759f', 'hatch': 'xx'},
     'layer':    {'color': '#5fa8d3', 'hatch': '//'},
     'weaviate': {'color': '#a2d2ff', 'hatch': '--'},
@@ -1061,11 +1075,17 @@ if __name__ == "__main__":
     parser.add_argument("--num_query_threads", type=int, default=None,
                         help="Number of client query processes (num_query_threads)")
     parser.add_argument("--group_by", type=str, default=None, help="Parameter to group by (for group mode, e.g. 'm' or 'ef_search')")
-    parser.add_argument("--shard", action='store_true', help="Enable shard mode (for detail/merge)")
+    parser.add_argument("--shard", action='store_true', help="Enable shard mode")
+    parser.add_argument("--global", action='store_true', dest="global",
+                        help="Global mode: use no-layer data as 'Global', exclude layer")
+    parser.add_argument("--cotra", action='store_true', help="Enable CoTra mode")
+    parser.add_argument("--weaviate", action='store_true', help="Enable Weaviate mode")
 
     parser.add_argument("--distributed", action='store_true', help="Enable distributed mode (for detail/merge)")
 
-    # recall 约束：指定目标 recall，对每个 x 值找 recall 最接近的实验结果
+    # recall 约束
+    parser.add_argument("--min_recall", type=float, default=0.8,
+                        help="Minimum recall bucket when x-axis is recall (default: 0.8)")
     parser.add_argument("--recall", type=float, default=None,
                         help="Target recall (e.g. 0.9), pick experiments closest to this recall per x value")
     parser.add_argument("--debug", action='store_true',
@@ -1094,6 +1114,10 @@ if __name__ == "__main__":
 
 def run_draw(args):
     """核心绘图入口，可被外部直接调用"""
+    # 兼容 batch_draw：将 no_layer 合并到 layer
+    if getattr(args, 'no_layer', False) and getattr(args, 'layer', None) is None:
+        args.layer = False
+
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
@@ -1101,6 +1125,29 @@ def run_draw(args):
         mode_points, mode_labels, mode_debug = collect_compare(args)
         if mode_points is None:
             return
+
+        # 按模式开关过滤：只保留为 True 的模式；全部未设置时保留所有
+        _mode_flags = {
+            'shard':    getattr(args, 'shard', False),
+            'layer':    getattr(args, 'layer', None) is True,
+            'no-layer': getattr(args, 'no_layer', False),
+            'global':   getattr(args, 'global', False),
+            'cotra':    getattr(args, 'cotra', False),
+            'weaviate': getattr(args, 'weaviate', False),
+        }
+        _enabled = {k for k, v in _mode_flags.items() if v}
+        if _enabled:
+            for mk in list(mode_points.keys()):
+                if mk not in _enabled:
+                    del mode_points[mk]
+                    mode_labels.pop(mk, None)
+                    if mode_debug:
+                        mode_debug.pop(mk, None)
+
+        if not any(mode_points.values()):
+            print("No valid data points after mode filtering.")
+            return
+
         split = getattr(args, 'split', False)
         if args.chart == "line":
             (draw_line_compare_split if split else draw_line_compare)(mode_points, mode_labels, args, mode_debug)
