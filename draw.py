@@ -2,6 +2,7 @@ import os
 import argparse
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 from collections import defaultdict
 import json
 import re
@@ -10,6 +11,43 @@ import numpy as np
 matplotlib.rcParams['font.family'] = 'serif'
 matplotlib.rcParams['font.serif'] = ['Times New Roman']
 matplotlib.rcParams['mathtext.fontset'] = 'stix'
+
+# ============================================================
+# 全局绘图配置（字体、尺寸、线宽等）
+# ============================================================
+PLOT_CONFIG = {
+    # 字体大小
+    'font_axis_label': 14,      # 坐标轴标签 (xlabel / ylabel)
+    'font_tick_label': 12,      # 刻度标签
+    'font_legend': 14,          # 图例
+    'font_title': 16,           # 子图标题 (split 模式)
+
+    # 图尺寸 (inch)
+    'fig_height_ratio': 0.4,    # 图高度 = 宽度 × 此比例
+    'fig_height_min': 2,        # 最小高度 (inch)
+    'fig_width_single': 6,      # 单系列图 (detail/merge/group) 固定宽度
+    'fig_height_debug_extra': 1, # debug 模式额外高度
+
+    # calc_fig_width 参数
+    'fig_width_per_item': 0.5,  # 每个数据项宽度
+    'fig_width_min': 4,         # 最小宽度
+    'fig_width_max': 10,        # 最大宽度
+    'fig_width_base': 2.0,      # 基础宽度
+
+    # 柱状图
+    'bar_width_max': 0.25,      # 柱宽上限 (compare 模式)
+
+    # 折线图
+    'linewidth': 2,             # 线宽
+    'markersize': 6,            # 标记点大小
+
+    # 布局（固定边距，保证所有图绘图区域一致）
+    'margin_left': 0.14,        # 左边距（给 y 轴标签留空间）
+    'margin_right': 0.96,       # 右边距
+    'margin_bottom': 0.15,      # 下边距
+    'margin_top': 0.82,         # 上边距（给图例留空间）
+    'y_nbins': 6,               # y 轴刻度数量
+}
 
 
 # ============================================================
@@ -221,10 +259,15 @@ def make_output_filename(prefix, args, extra_keys=None):
 
 
 DISPLAY_NAMES = {
-    'avg_distance_cnt': 'distance_cnt',
-    'avg_remote_transfer_cnt': 'remote_transfer_cnt',
-    'avg_remote_transfer_data_per_transfer': 'data_per_transfer (bit)',
-    'avg_remote_transfer_data_per_query': 'data_per_query (bit)',
+    'avg_distance_cnt': 'Computation Count',
+    'avg_remote_transfer_cnt': 'Transfer Count',
+    'avg_remote_transfer_data_per_transfer': 'Data per Transfer (bit)',
+    'avg_remote_transfer_data_per_query': 'Data per Query (bit)',
+    'qps': 'QPS',
+    'threads': 'Threads',
+    'replication': 'Replication',
+    'replication_num': 'Replication Num',
+    'avg_recall@10': 'Recall@10',
 }
 
 # 文件名用短名，不带单位和特殊字符
@@ -233,28 +276,66 @@ FILENAME_NAMES = {
     'avg_remote_transfer_cnt': 'remote_transfer_cnt',
     'avg_remote_transfer_data_per_transfer': 'data_per_transfer',
     'avg_remote_transfer_data_per_query': 'data_per_query',
+    'avg_recall@10': 'recall@10',
 }
 
 
 def display_label(s):
     """将内部指标名映射为显示名（用于图标签）"""
-    return DISPLAY_NAMES.get(s, s).replace("avg_recall@", "recall@")
+    if s in DISPLAY_NAMES:
+        return DISPLAY_NAMES[s]
+    return s
 
 
 def filename_label(s):
     """将内部指标名映射为文件名用短名"""
-    return FILENAME_NAMES.get(s, s).replace("avg_recall@", "recall@")
+    if s in FILENAME_NAMES:
+        return FILENAME_NAMES[s]
+    return s
+
+
+def style_ax(ax, x_label, y_label, title=None, tick_axis='both', grid_axis='both'):
+    """统一设置坐标轴样式"""
+    C = PLOT_CONFIG
+    ax.set_xlabel(x_label, fontsize=C['font_axis_label'])
+    ax.set_ylabel(y_label, fontsize=C['font_axis_label'])
+    if title:
+        ax.set_title(title, fontsize=C['font_title'])
+    ax.tick_params(axis=tick_axis, labelsize=C['font_tick_label'])
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=C['y_nbins']))
+    ax.grid(True, linestyle='--', alpha=0.7, axis=grid_axis)
 
 
 def setup_legend(ax, n_labels):
     """图例统一放在图上方，水平排列"""
-    ax.legend(fontsize=18, loc='lower center', bbox_to_anchor=(0.5, 1.02),
-              ncol=n_labels, frameon=True, fancybox=True)
+    ax.legend(fontsize=PLOT_CONFIG['font_legend'], loc='lower center',
+              bbox_to_anchor=(0.5, 1.02), ncol=n_labels, frameon=True, fancybox=True)
 
 
-def calc_fig_width(n_items, per_item=0.9, min_width=3, max_width=10, base=1.5):
+def calc_fig_width(n_items, per_item=None, min_width=None, max_width=None, base=None):
     """根据数据项数量计算图宽度，带上下界"""
+    C = PLOT_CONFIG
+    per_item = per_item if per_item is not None else C['fig_width_per_item']
+    min_width = min_width if min_width is not None else C['fig_width_min']
+    max_width = max_width if max_width is not None else C['fig_width_max']
+    base = base if base is not None else C['fig_width_base']
     return max(min_width, min(max_width, n_items * per_item + base))
+
+
+def make_fig(width, debug=False):
+    """创建 figure，高度按宽度比例计算，不低于最小高度"""
+    C = PLOT_CONFIG
+    h = max(width * C['fig_height_ratio'], C['fig_height_min'])
+    if debug:
+        h += C['fig_height_debug_extra']
+    return plt.subplots(figsize=(width, h))
+
+
+def apply_layout(fig):
+    """应用固定边距布局，保证所有图绘图区域尺寸一致"""
+    C = PLOT_CONFIG
+    fig.subplots_adjust(left=C['margin_left'], right=C['margin_right'],
+                        bottom=C['margin_bottom'], top=C['margin_top'])
 
 
 RECALL_BUCKET_SIZE = 0.05
@@ -270,19 +351,20 @@ def snap_to_recall_bucket(val):
     return round(round(val / RECALL_BUCKET_SIZE) * RECALL_BUCKET_SIZE, 2)
 
 
-def bucket_recall_points(points_list, min_recall=None):
+def bucket_recall_points(points_list, min_recall=None, max_recall=0.95):
     """将 [(raw_recall, y_val, filename), ...] 按 0.05 档位聚合。
 
     recall 在档位 ±0.025 范围内视为满足该档位要求。
     同一档位有多个点时，保留 y 值最大的那个（如 qps 取最高）。
     min_recall: 过滤掉低于此值的档位。
+    max_recall: 过滤掉高于此值的档位（默认 0.99，排除 recall=1.0）。
     返回 ({bucketed_recall: y_val}, {bucketed_recall: (raw_recall, filename)})。
     """
     # 生成所有可能的档位
     all_buckets = set()
     for raw_x, _, _ in points_list:
         b = snap_to_recall_bucket(raw_x)
-        if min_recall is None or b >= min_recall:
+        if (min_recall is None or b >= min_recall) and b <= max_recall:
             all_buckets.add(b)
 
     # 每个点分配到 ±0.025 范围内的所有档位
@@ -702,7 +784,7 @@ def save_figure(fig, args, prefix, extra_keys=None):
     pdf_path = os.path.join(pdf_dir, basename)
     png_path = os.path.join(png_dir, basename[:-4] + '.png')
     fig.savefig(pdf_path, bbox_inches='tight')
-    fig.savefig(png_path, bbox_inches='tight', dpi=300)
+    fig.savefig(png_path, dpi=300, bbox_inches='tight')
     print(f"Plot saved to {pdf_path}")
     print(f"Plot saved to {png_path}")
     plt.close(fig)
@@ -728,11 +810,10 @@ BAR_STYLES = {
 
 def draw_line_compare(mode_points, mode_labels, args, mode_debug=None):
     """折线图 × compare 模式"""
+    C = PLOT_CONFIG
     debug = getattr(args, 'debug', False) and mode_debug is not None
     n_x = max(len(pts) for pts in mode_points.values())
-    fig_width = calc_fig_width(n_x, per_item=1.0)
-    fig_height = 6.5 if debug else 5
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    fig, ax = make_fig(calc_fig_width(n_x), debug)
 
     for mode_key in MODE_ORDER:
         points = mode_points.get(mode_key, {})
@@ -742,22 +823,20 @@ def draw_line_compare(mode_points, mode_labels, args, mode_debug=None):
         xs, ys = zip(*sorted_pts)
         style = LINE_STYLES[mode_key]
         ax.plot(xs, ys, marker=style['marker'], linestyle=style['linestyle'],
-                color=style['color'], label=mode_labels[mode_key], linewidth=2, markersize=8)
+                color=style['color'], label=mode_labels[mode_key],
+                linewidth=C['linewidth'], markersize=C['markersize'])
 
-    ax.set_xlabel(display_label(args.x), fontsize=22)
-    ax.set_ylabel(display_label(args.y), fontsize=22)
-    ax.tick_params(axis='both', labelsize=16)
-    ax.grid(True, linestyle='--', alpha=0.7)
+    style_ax(ax, display_label(args.x), display_label(args.y))
     n_labels = sum(1 for m in MODE_ORDER if mode_points.get(m) and any(v != 0 for v in mode_points[m].values()))
     setup_legend(ax, n_labels)
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.88)
+    apply_layout(fig)
 
     save_figure(fig, args, "line-compare")
 
 
 def draw_bar_compare(mode_points, mode_labels, args, mode_debug=None):
     """柱状图 × compare 模式"""
+    C = PLOT_CONFIG
     debug = getattr(args, 'debug', False) and mode_debug is not None
     all_x_vals = sorted(set().union(*[pts.keys() for pts in mode_points.values()]))
     x_labels = [str(v) for v in all_x_vals]
@@ -766,18 +845,13 @@ def draw_bar_compare(mode_points, mode_labels, args, mode_debug=None):
 
     n_groups = len(all_x_vals)
     max_bars_per_group = len(active_modes)
-    bar_width = min(0.8 / max(max_bars_per_group, 1), 0.25)
+    bar_width = min(0.8 / max(max_bars_per_group, 1), C['bar_width_max'])
     x_indices = np.arange(n_groups)
 
-    fig_width = calc_fig_width(n_groups * max_bars_per_group, per_item=0.55, min_width=5, max_width=14)
-    fig_height = 6.5 if debug else 5
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    fig, ax = make_fig(calc_fig_width(n_groups * max_bars_per_group), debug)
 
-    # 预先记录每个 mode 是否已添加 legend
     legend_added = set()
-
     for g, x_val in enumerate(all_x_vals):
-        # 该 x 值下有数据的模式
         present_modes = [m for m in active_modes if x_val in mode_points.get(m, {})]
         n_present = len(present_modes)
         for i, mode_key in enumerate(present_modes):
@@ -792,25 +866,20 @@ def draw_bar_compare(mode_points, mode_labels, args, mode_debug=None):
                    edgecolor='black', alpha=0.85)
 
     ax.set_xticks(x_indices)
-    ax.set_xticklabels(x_labels, fontsize=16)
-    ax.set_xlabel(display_label(args.x), fontsize=22)
-    ax.set_ylabel(display_label(args.y), fontsize=22)
-    ax.tick_params(axis='y', labelsize=16)
-    ax.grid(True, linestyle='--', alpha=0.5, axis='y')
+    ax.set_xticklabels(x_labels, fontsize=C['font_tick_label'])
+    style_ax(ax, display_label(args.x), display_label(args.y), tick_axis='y', grid_axis='y')
     setup_legend(ax, len(active_modes))
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.88)
+    apply_layout(fig)
 
     save_figure(fig, args, "bar-compare")
 
 
 def draw_scatter_compare(mode_points, mode_labels, args, mode_debug=None):
     """散点图 × compare 模式"""
+    C = PLOT_CONFIG
     debug = getattr(args, 'debug', False) and mode_debug is not None
     n_x = max(len(pts) for pts in mode_points.values())
-    fig_width = calc_fig_width(n_x, per_item=1.0)
-    fig_height = 6.5 if debug else 5
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    fig, ax = make_fig(calc_fig_width(n_x), debug)
 
     for mode_key in MODE_ORDER:
         points = mode_points.get(mode_key, {})
@@ -822,21 +891,17 @@ def draw_scatter_compare(mode_points, mode_labels, args, mode_debug=None):
                    label=mode_labels[mode_key], s=80, alpha=0.8,
                    marker=LINE_STYLES[mode_key]['marker'])
 
-    ax.set_xlabel(display_label(args.x), fontsize=22)
-    ax.set_ylabel(display_label(args.y), fontsize=22)
-    ax.tick_params(axis='both', labelsize=16)
-    ax.grid(True, linestyle='--', alpha=0.7)
+    style_ax(ax, display_label(args.x), display_label(args.y))
     n_labels = sum(1 for m in MODE_ORDER if mode_points.get(m) and any(v != 0 for v in mode_points[m].values()))
     setup_legend(ax, n_labels)
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.88)
+    apply_layout(fig)
 
     save_figure(fig, args, "scatter-compare")
 
 
 def draw_line_compare_split(mode_points, mode_labels, args, mode_debug=None):
     """折线图 × compare 模式 × split：每个 mode 一个子图"""
-    debug = getattr(args, 'debug', False) and mode_debug is not None
+    C = PLOT_CONFIG
     vertical = getattr(args, 'vertical', False)
     active_modes = [m for m in MODE_ORDER if mode_points.get(m) and any(v != 0 for v in mode_points[m].values())]
     n = len(active_modes)
@@ -844,8 +909,8 @@ def draw_line_compare_split(mode_points, mode_labels, args, mode_debug=None):
         return
 
     n_x = max(len(pts) for pts in mode_points.values())
-    sub_w = calc_fig_width(n_x, per_item=1.0)
-    sub_h = 6.5 if debug else 5
+    sub_w = calc_fig_width(n_x)
+    sub_h = max(sub_w * C['fig_height_ratio'], C['fig_height_min'])
 
     if vertical:
         fig, axes = plt.subplots(n, 1, figsize=(sub_w, sub_h * n))
@@ -860,20 +925,18 @@ def draw_line_compare_split(mode_points, mode_labels, args, mode_debug=None):
         xs, ys = zip(*sorted_pts)
         style = LINE_STYLES[mode_key]
         ax.plot(xs, ys, marker=style['marker'], linestyle=style['linestyle'],
-                color=style['color'], label=mode_labels[mode_key], linewidth=2, markersize=8)
-        ax.set_xlabel(display_label(args.x), fontsize=22)
-        ax.set_ylabel(display_label(args.y), fontsize=22)
-        ax.set_title(mode_labels[mode_key], fontsize=20)
-        ax.tick_params(axis='both', labelsize=16)
-        ax.grid(True, linestyle='--', alpha=0.7)
+                color=style['color'], label=mode_labels[mode_key],
+                linewidth=C['linewidth'], markersize=C['markersize'])
+        style_ax(ax, display_label(args.x), display_label(args.y),
+                 title=mode_labels[mode_key])
 
-    fig.tight_layout()
+    apply_layout(fig)
     save_figure(fig, args, "line-compare-split")
 
 
 def draw_bar_compare_split(mode_points, mode_labels, args, mode_debug=None):
     """柱状图 × compare 模式 × split：每个 mode 一个子图"""
-    debug = getattr(args, 'debug', False) and mode_debug is not None
+    C = PLOT_CONFIG
     vertical = getattr(args, 'vertical', False)
     active_modes = [m for m in MODE_ORDER if mode_points.get(m) and any(v != 0 for v in mode_points[m].values())]
     n = len(active_modes)
@@ -886,8 +949,8 @@ def draw_bar_compare_split(mode_points, mode_labels, args, mode_debug=None):
     x_indices = np.arange(n_groups)
     bar_width = min(0.6, max(0.2, 6.0 / max(n_groups, 1)))
 
-    sub_w = calc_fig_width(n_groups, per_item=0.8, min_width=4, max_width=12)
-    sub_h = 6.5 if debug else 5
+    sub_w = calc_fig_width(n_groups)
+    sub_h = max(sub_w * C['fig_height_ratio'], C['fig_height_min'])
 
     if vertical:
         fig, axes = plt.subplots(n, 1, figsize=(sub_w, sub_h * n))
@@ -904,20 +967,17 @@ def draw_bar_compare_split(mode_points, mode_labels, args, mode_debug=None):
                color=bstyle['color'], hatch=bstyle['hatch'],
                edgecolor='black', alpha=0.85)
         ax.set_xticks(x_indices)
-        ax.set_xticklabels(x_labels, fontsize=16)
-        ax.set_xlabel(display_label(args.x), fontsize=22)
-        ax.set_ylabel(display_label(args.y), fontsize=22)
-        ax.set_title(mode_labels[mode_key], fontsize=20)
-        ax.tick_params(axis='y', labelsize=16)
-        ax.grid(True, linestyle='--', alpha=0.5, axis='y')
+        ax.set_xticklabels(x_labels, fontsize=C['font_tick_label'])
+        style_ax(ax, display_label(args.x), display_label(args.y),
+                 title=mode_labels[mode_key], tick_axis='y', grid_axis='y')
 
-    fig.tight_layout()
+    apply_layout(fig)
     save_figure(fig, args, "bar-compare-split")
 
 
 def draw_scatter_compare_split(mode_points, mode_labels, args, mode_debug=None):
     """散点图 × compare 模式 × split：每个 mode 一个子图"""
-    debug = getattr(args, 'debug', False) and mode_debug is not None
+    C = PLOT_CONFIG
     vertical = getattr(args, 'vertical', False)
     active_modes = [m for m in MODE_ORDER if mode_points.get(m) and any(v != 0 for v in mode_points[m].values())]
     n = len(active_modes)
@@ -925,8 +985,8 @@ def draw_scatter_compare_split(mode_points, mode_labels, args, mode_debug=None):
         return
 
     n_x = max(len(pts) for pts in mode_points.values())
-    sub_w = calc_fig_width(n_x, per_item=1.0)
-    sub_h = 6.5 if debug else 5
+    sub_w = calc_fig_width(n_x)
+    sub_h = max(sub_w * C['fig_height_ratio'], C['fig_height_min'])
 
     if vertical:
         fig, axes = plt.subplots(n, 1, figsize=(sub_w, sub_h * n))
@@ -941,13 +1001,10 @@ def draw_scatter_compare_split(mode_points, mode_labels, args, mode_debug=None):
         xs, ys = zip(*sorted_pts)
         ax.scatter(xs, ys, color=LINE_STYLES[mode_key]['color'],
                    s=80, alpha=0.8, marker=LINE_STYLES[mode_key]['marker'])
-        ax.set_xlabel(display_label(args.x), fontsize=22)
-        ax.set_ylabel(display_label(args.y), fontsize=22)
-        ax.set_title(mode_labels[mode_key], fontsize=20)
-        ax.tick_params(axis='both', labelsize=16)
-        ax.grid(True, linestyle='--', alpha=0.7)
+        style_ax(ax, display_label(args.x), display_label(args.y),
+                 title=mode_labels[mode_key])
 
-    fig.tight_layout()
+    apply_layout(fig)
     save_figure(fig, args, "scatter-compare-split")
 
 
@@ -956,8 +1013,8 @@ _MARKERS = ['o', 's', '^', 'D', 'v', 'P', 'X', '*', 'h', '<', '>']
 
 def draw_line_single(series_data, args, prefix="line"):
     """折线图 × 单系列模式（detail / merge）"""
-    n_points = max(len(pts) for pts in series_data.values())
-    fig, ax = plt.subplots(figsize=(12, 5))
+    C = PLOT_CONFIG
+    fig, ax = make_fig(C['fig_width_single'])
 
     all_xs = []
     multi = len(series_data) > 1
@@ -965,29 +1022,26 @@ def draw_line_single(series_data, args, prefix="line"):
         xs, ys = zip(*pts)
         all_xs.extend(xs)
         marker = _MARKERS[i % len(_MARKERS)] if multi else None
-        lw = 1.5 if multi else 0.5
+        lw = C['linewidth'] if multi else 1.5
         ax.plot(xs, ys, linestyle='-', linewidth=lw, marker=marker,
-                markersize=7, label=label)
+                markersize=C['markersize'], label=label)
 
     if all_xs:
         ax.set_xlim(min(all_xs), max(all_xs))
 
     x_label = "Query Index" if args.mode == "detail" else display_label(args.x)
-    ax.set_xlabel(x_label, fontsize=22)
-    ax.set_ylabel(display_label(args.y), fontsize=22)
-    ax.tick_params(axis='both', labelsize=16)
-    ax.grid(True, linestyle='--', alpha=0.7)
+    style_ax(ax, x_label, display_label(args.y))
     setup_legend(ax, len(series_data))
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.88)
+    apply_layout(fig)
 
     save_figure(fig, args, prefix)
 
 
 def draw_scatter_single(series_data, args, prefix="scatter"):
     """散点图 × 单系列模式（detail / merge）"""
+    C = PLOT_CONFIG
     n_points = max(len(pts) for pts in series_data.values())
-    fig, ax = plt.subplots(figsize=(12, 5))
+    fig, ax = make_fig(C['fig_width_single'])
 
     all_xs = []
     for label, pts in series_data.items():
@@ -1001,22 +1055,18 @@ def draw_scatter_single(series_data, args, prefix="scatter"):
         ax.set_xlim(min(all_xs), max(all_xs))
 
     x_label = "Query Index" if args.mode == "detail" else display_label(args.x)
-    ax.set_xlabel(x_label, fontsize=22)
-    ax.set_ylabel(display_label(args.y), fontsize=22)
-    ax.tick_params(axis='both', labelsize=16)
-    ax.grid(True, linestyle='--', alpha=0.7)
+    style_ax(ax, x_label, display_label(args.y))
     setup_legend(ax, len(series_data))
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.88)
+    apply_layout(fig)
 
     save_figure(fig, args, prefix)
 
 
 def draw_bar_single(series_data, args, prefix="bar"):
     """柱状图 × 单系列模式（detail / merge）"""
-    n_points = max(len(pts) for pts in series_data.values())
-    fig_width = calc_fig_width(n_points)
-    fig, ax = plt.subplots(figsize=(fig_width, 5))
+    C = PLOT_CONFIG
+    fig_width = calc_fig_width(max(len(pts) for pts in series_data.values()))
+    fig, ax = make_fig(fig_width)
 
     for label, pts in series_data.items():
         xs, ys = zip(*pts)
@@ -1025,16 +1075,13 @@ def draw_bar_single(series_data, args, prefix="bar"):
         bar_width = min(0.6, max(0.2, 6.0 / max(len(xs), 1)))
         ax.bar(x_indices, ys, width=bar_width, color='#1f77b4', alpha=0.85, label=label)
         ax.set_xticks(x_indices)
-        ax.set_xticklabels(x_labels, fontsize=16, rotation=45 if len(xs) > 20 else 0)
+        ax.set_xticklabels(x_labels, fontsize=C['font_tick_label'],
+                           rotation=45 if len(xs) > 20 else 0)
 
     x_label = "Query Index" if args.mode == "detail" else display_label(args.x)
-    ax.set_xlabel(x_label, fontsize=22)
-    ax.set_ylabel(display_label(args.y), fontsize=22)
-    ax.tick_params(axis='y', labelsize=16)
-    ax.grid(True, linestyle='--', alpha=0.5, axis='y')
+    style_ax(ax, x_label, display_label(args.y), tick_axis='y', grid_axis='y')
     setup_legend(ax, len(series_data))
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.88)
+    apply_layout(fig)
 
     save_figure(fig, args, prefix)
 
