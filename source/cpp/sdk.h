@@ -10,6 +10,8 @@
 template <typename T>
 class ClusterSDKClient
 {
+public:
+    using DistT = DistTOf<T>;
 private:
     struct QueryEndpoint
     {
@@ -281,7 +283,7 @@ public:
     }
 
     // 发送查询，不等待结果（流水线模式）
-    void query_send(int query_id, const std::vector<T> &query_vector, Payload<T> &payload, int k = 10)
+    void query_send(int query_id, const std::vector<T> &query_vector, Payload<DistT> &payload, int k = 10)
     {
         ensure_connected();
 
@@ -304,7 +306,7 @@ public:
 
     // 接收一个已完成的查询结果（阻塞直到有结果）
     // 返回 (query_id, results, payload)
-    std::tuple<int, std::vector<int>, Payload<T>> query_recv()
+    std::tuple<int, std::vector<int>, Payload<DistT>> query_recv()
     {
         try {
             uint64_t resp_size = 0;
@@ -323,7 +325,7 @@ public:
                 resp_buf.read_val<T>(); // dist
                 results.push_back(resp_buf.read_val<int>());
             }
-            Payload<T> payload;
+            Payload<DistT> payload;
             deserialize_payload(resp_buf, payload);
 
             return {query_id, std::move(results), std::move(payload)};
@@ -334,10 +336,10 @@ public:
     }
 
     // 便捷批量接口：发送一批查询，全部接收后返回
-    std::vector<std::tuple<int, std::vector<int>, Payload<T>>>
+    std::vector<std::tuple<int, std::vector<int>, Payload<DistT>>>
     query_batch(const std::vector<int> &query_ids,
                 const std::vector<std::vector<T>> &query_vectors,
-                std::vector<Payload<T>> &payloads, int k = 10)
+                std::vector<Payload<DistT>> &payloads, int k = 10)
     {
         if (query_ids.size() != query_vectors.size() || query_ids.size() != payloads.size())
             throw std::runtime_error("query_batch: size mismatch");
@@ -345,7 +347,7 @@ public:
         for (size_t i = 0; i < query_ids.size(); i++)
             query_send(query_ids[i], query_vectors[i], payloads[i], k);
 
-        std::vector<std::tuple<int, std::vector<int>, Payload<T>>> results;
+        std::vector<std::tuple<int, std::vector<int>, Payload<DistT>>> results;
         results.reserve(query_ids.size());
         for (size_t i = 0; i < query_ids.size(); i++)
             results.push_back(query_recv());

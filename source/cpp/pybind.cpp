@@ -30,6 +30,8 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("origin_node_id", &Payload<float>::origin_node_id)
         .def_readwrite("remote_transfer_cnt", &Payload<float>::remote_transfer_cnt)
         .def_readwrite("remote_transfer_data", &Payload<float>::remote_transfer_data)
+        .def_readwrite("pull_cnt", &Payload<float>::pull_cnt)
+        .def_readwrite("pull_data", &Payload<float>::pull_data)
         .def_readwrite("send_timestamp", &Payload<float>::send_timestamp)
         .def_readwrite("distance_cnt", &Payload<float>::distance_cnt)
         .def_readwrite("results", &Payload<float>::results)
@@ -44,6 +46,8 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("origin_node_id", &Payload<double>::origin_node_id)
         .def_readwrite("remote_transfer_cnt", &Payload<double>::remote_transfer_cnt)
         .def_readwrite("remote_transfer_data", &Payload<double>::remote_transfer_data)
+        .def_readwrite("pull_cnt", &Payload<double>::pull_cnt)
+        .def_readwrite("pull_data", &Payload<double>::pull_data)
         .def_readwrite("send_timestamp", &Payload<double>::send_timestamp)
         .def_readwrite("distance_cnt", &Payload<double>::distance_cnt)
         .def_readwrite("results", &Payload<double>::results)
@@ -58,6 +62,8 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("origin_node_id", &Payload<int32_t>::origin_node_id)
         .def_readwrite("remote_transfer_cnt", &Payload<int32_t>::remote_transfer_cnt)
         .def_readwrite("remote_transfer_data", &Payload<int32_t>::remote_transfer_data)
+        .def_readwrite("pull_cnt", &Payload<int32_t>::pull_cnt)
+        .def_readwrite("pull_data", &Payload<int32_t>::pull_data)
         .def_readwrite("send_timestamp", &Payload<int32_t>::send_timestamp)
         .def_readwrite("distance_cnt", &Payload<int32_t>::distance_cnt)
         .def_readwrite("results", &Payload<int32_t>::results)
@@ -72,6 +78,8 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("origin_node_id", &Payload<uint32_t>::origin_node_id)
         .def_readwrite("remote_transfer_cnt", &Payload<uint32_t>::remote_transfer_cnt)
         .def_readwrite("remote_transfer_data", &Payload<uint32_t>::remote_transfer_data)
+        .def_readwrite("pull_cnt", &Payload<uint32_t>::pull_cnt)
+        .def_readwrite("pull_data", &Payload<uint32_t>::pull_data)
         .def_readwrite("send_timestamp", &Payload<uint32_t>::send_timestamp)
         .def_readwrite("distance_cnt", &Payload<uint32_t>::distance_cnt)
         .def_readwrite("results", &Payload<uint32_t>::results)
@@ -314,6 +322,7 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("replication_num", &Cluster<float>::replication_num)
         .def_readwrite("is_distributed", &Cluster<float>::is_distributed)
         .def_readwrite("is_shard", &Cluster<float>::is_shard)
+        .def_readwrite("is_global_pull", &Cluster<float>::is_global_pull)
         .def("reset", &Cluster<float>::reset)
         .def("add_vector", &Cluster<float>::add_vector,
              py::arg("vid"), py::arg("vec"),
@@ -371,6 +380,7 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("replication_num", &Cluster<double>::replication_num)
         .def_readwrite("is_distributed", &Cluster<double>::is_distributed)
         .def_readwrite("is_shard", &Cluster<double>::is_shard)
+        .def_readwrite("is_global_pull", &Cluster<double>::is_global_pull)
         .def("reset", &Cluster<double>::reset)
         .def("add_vector", &Cluster<double>::add_vector,
              py::arg("vid"), py::arg("vec"),
@@ -428,6 +438,7 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("replication_num", &Cluster<int32_t>::replication_num)
         .def_readwrite("is_distributed", &Cluster<int32_t>::is_distributed)
         .def_readwrite("is_shard", &Cluster<int32_t>::is_shard)
+        .def_readwrite("is_global_pull", &Cluster<int32_t>::is_global_pull)
         .def("reset", &Cluster<int32_t>::reset)
         .def("add_vector", &Cluster<int32_t>::add_vector,
              py::arg("vid"), py::arg("vec"),
@@ -485,6 +496,7 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("replication_num", &Cluster<uint32_t>::replication_num)
         .def_readwrite("is_distributed", &Cluster<uint32_t>::is_distributed)
         .def_readwrite("is_shard", &Cluster<uint32_t>::is_shard)
+        .def_readwrite("is_global_pull", &Cluster<uint32_t>::is_global_pull)
         .def("reset", &Cluster<uint32_t>::reset)
         .def("add_vector", &Cluster<uint32_t>::add_vector,
              py::arg("vid"), py::arg("vec"),
@@ -714,6 +726,167 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("filepath"),
              py::call_guard<py::gil_scoped_release>())
         .def("get_information", [](ClusterSDKClient<uint32_t> &client) {
+            py::module_ json = py::module_::import("json");
+            return json.attr("loads")(client.get_information());
+        });
+
+    // ============================================================
+    // uint8_t 存储 + int32_t 距离绑定
+    // 内存按 1 byte/dim 存放向量，距离计算复用 PayloadInt32（无需新增 PayloadUInt8）
+    // ============================================================
+
+    py::class_<HNSWGraph<uint8_t>>(m, "HNSWGraphUInt8")
+        .def(py::init<int, int, int, int, int, size_t, unsigned int>(),
+             py::arg("dim"), py::arg("m"), py::arg("ef_construction"), py::arg("ef_search"), py::arg("limited_level"), py::arg("max_elements") = 100000, py::arg("seed") = 123)
+        .def_readwrite("dim", &HNSWGraph<uint8_t>::dim)
+        .def_readwrite("m", &HNSWGraph<uint8_t>::m)
+        .def_readwrite("ef_construction", &HNSWGraph<uint8_t>::ef_construction)
+        .def_readwrite("ef_search", &HNSWGraph<uint8_t>::ef_search)
+        .def_readwrite("limited_level", &HNSWGraph<uint8_t>::limited_level)
+        .def_readwrite("max_level", &HNSWGraph<uint8_t>::max_level)
+        .def_readwrite("seed", &HNSWGraph<uint8_t>::seed)
+        .def_readwrite("entry_point_id", &HNSWGraph<uint8_t>::entry_point_id)
+        .def("get_vector", &HNSWGraph<uint8_t>::get_vector, py::arg("vid"))
+        .def("get_neighbors", &HNSWGraph<uint8_t>::get_neighbors, py::arg("vid"), py::arg("level") = 0)
+        .def("get_all_vectors", &HNSWGraph<uint8_t>::get_all_vectors)
+        .def("get_all_neighbors", &HNSWGraph<uint8_t>::get_all_neighbors)
+        .def("get_cur_element_count", &HNSWGraph<uint8_t>::get_cur_element_count)
+        .def("add_vector", &HNSWGraph<uint8_t>::add_vector, py::arg("vid"), py::arg("vec"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("query", &HNSWGraph<uint8_t>::query, py::call_guard<py::gil_scoped_release>())
+        .def("save", &HNSWGraph<uint8_t>::save, py::arg("filepath"))
+        .def_static("load", &HNSWGraph<uint8_t>::load, py::arg("filepath"), py::return_value_policy::take_ownership);
+
+    py::class_<Node<uint8_t>>(m, "NodeUInt8")
+        .def(py::init<int, Cluster<uint8_t> *, HNSWGraph<uint8_t> *, bool, int>(),
+             py::arg("node_id"), py::arg("cluster"), py::arg("local_hnsw"), py::arg("is_remote_node") = false, py::arg("msg_pool_size") = 32)
+        .def_readwrite("node_id", &Node<uint8_t>::node_id)
+        .def_readwrite("num_queries", &Node<uint8_t>::num_queries)
+        .def_readwrite("is_remote_node", &Node<uint8_t>::is_remote_node)
+        .def_readwrite("ip_addr", &Node<uint8_t>::ip_addr)
+        .def_readwrite("port", &Node<uint8_t>::port)
+        .def_readwrite("local_hnsw", &Node<uint8_t>::local_hnsw)
+        .def_readwrite("msg_pool_size", &Node<uint8_t>::msg_pool_size_)
+        .def("start_server", &Node<uint8_t>::start_server)
+        .def("reset", &Node<uint8_t>::reset)
+        .def("query", &Node<uint8_t>::query,
+             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k") = 10,
+             py::call_guard<py::gil_scoped_release>())
+        .def("add_vector", &Node<uint8_t>::add_vector,
+             py::arg("vid"), py::arg("vec"),
+             py::call_guard<py::gil_scoped_release>());
+
+    py::class_<ShardQuerySession<uint8_t>>(m, "ShardQuerySessionUInt8")
+        .def(py::init<Cluster<uint8_t> *>(), py::arg("cluster"))
+        .def("query", &ShardQuerySession<uint8_t>::query,
+             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k") = 10,
+             py::call_guard<py::gil_scoped_release>())
+        .def("close", &ShardQuerySession<uint8_t>::close);
+
+    py::class_<Cluster<uint8_t>, std::unique_ptr<Cluster<uint8_t>>>(m, "ClusterUInt8")
+        .def(py::init([](HNSWGraph<uint8_t> *hnsw, int node_num, const std::string &comm_mode,
+                         const std::string &ib_dev, int ib_port, int gid_index) {
+                TransportConfig config;
+                config.comm_mode = comm_mode;
+                config.ib_dev = ib_dev;
+                config.ib_port = ib_port;
+                config.gid_index = gid_index;
+                return new Cluster<uint8_t>(hnsw, node_num, config);
+             }),
+             py::arg("hnsw"), py::arg("node_num") = 4,
+             py::arg("comm_mode") = "tcp",
+             py::arg("ib_dev") = "",
+             py::arg("ib_port") = 1,
+             py::arg("gid_index") = -1)
+        .def_property_readonly("nodes", [](Cluster<uint8_t> &c)
+                               {
+            std::vector<Node<uint8_t> *> ptrs;
+            ptrs.reserve(c.nodes.size());
+            for (auto &n : c.nodes)
+                ptrs.push_back(&n);
+            return ptrs; })
+        .def_readwrite("node_num", &Cluster<uint8_t>::node_num)
+        .def_readwrite("bandwidth", &Cluster<uint8_t>::bandwidth)
+        .def_readwrite("partition_mode", &Cluster<uint8_t>::partition_mode)
+        .def_readwrite("layer_config", &Cluster<uint8_t>::layer_config)
+        .def_readwrite("outer_ring_max_iterations", &Cluster<uint8_t>::outer_ring_max_iterations)
+        .def_readwrite("replication_level", &Cluster<uint8_t>::replication_level)
+        .def_readwrite("replication_num", &Cluster<uint8_t>::replication_num)
+        .def_readwrite("is_distributed", &Cluster<uint8_t>::is_distributed)
+        .def_readwrite("is_shard", &Cluster<uint8_t>::is_shard)
+        .def_readwrite("is_global_pull", &Cluster<uint8_t>::is_global_pull)
+        .def("reset", &Cluster<uint8_t>::reset)
+        .def("add_vector", &Cluster<uint8_t>::add_vector,
+             py::arg("vid"), py::arg("vec"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("query", &Cluster<uint8_t>::query,
+             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k"),
+             py::call_guard<py::gil_scoped_release>())
+        .def_static("kmeans", &Cluster<uint8_t>::kmeans,
+                    py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123, py::arg("num_threads") = 0)
+        .def("outer_ring", &Cluster<uint8_t>::outer_ring)
+        .def("partition", &Cluster<uint8_t>::partition,
+             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
+        .def("set_node_info", &Cluster<uint8_t>::set_node_info,
+             py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
+        .def("start_node_server", &Cluster<uint8_t>::start_node_server,
+             py::arg("node_id"), py::arg("msg_pool_size") = 32)
+        .def("join_node_server", &Cluster<uint8_t>::join_node_server,
+             py::arg("node_id"))
+        .def("transfer_to_remote", &Cluster<uint8_t>::transfer_to_remote,
+             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k"))
+        .def("save", &Cluster<uint8_t>::save, py::arg("filepath"))
+        .def_static("load", [](const std::string &filepath) {
+            return std::unique_ptr<Cluster<uint8_t>>(Cluster<uint8_t>::load(filepath));
+        }, py::arg("filepath"));
+
+    py::class_<ClusterSDKClient<uint8_t>>(m, "ClusterSDKClientUInt8")
+        .def(py::init<const std::string &, int, const std::string &>(),
+             py::arg("ip") = "127.0.0.1", py::arg("port") = 19000,
+             py::arg("comm_mode") = "tcp")
+        .def("connect", &ClusterSDKClient<uint8_t>::connect,
+             py::arg("ip") = "", py::arg("port") = -1)
+        .def("init_routes", &ClusterSDKClient<uint8_t>::init_routes)
+        .def("disconnect", &ClusterSDKClient<uint8_t>::disconnect)
+        .def("is_connected", &ClusterSDKClient<uint8_t>::is_connected)
+        .def("set_query_endpoints", &ClusterSDKClient<uint8_t>::set_query_endpoints,
+             py::arg("ips"), py::arg("ports"))
+        .def("add_vector", &ClusterSDKClient<uint8_t>::add_vector,
+             py::arg("vid"), py::arg("vec"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("query_send", &ClusterSDKClient<uint8_t>::query_send,
+             py::arg("query_id"), py::arg("query_vector"), py::arg("payload"), py::arg("k") = 10,
+             py::call_guard<py::gil_scoped_release>())
+        .def("query_recv", &ClusterSDKClient<uint8_t>::query_recv,
+             py::call_guard<py::gil_scoped_release>())
+        .def("query_batch", &ClusterSDKClient<uint8_t>::query_batch,
+             py::arg("query_ids"), py::arg("query_vectors"), py::arg("payloads"), py::arg("k") = 10,
+             py::call_guard<py::gil_scoped_release>())
+        .def("partition", &ClusterSDKClient<uint8_t>::partition,
+             py::arg("mode"), py::arg("replication") = 1,
+             py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
+             py::arg("layer_partition_mode") = "round_robin",
+             py::arg("layer_replicate_flags") = std::vector<bool>{},
+             py::arg("num_threads") = 0,
+             py::call_guard<py::gil_scoped_release>())
+        .def("set_hnsw_params", &ClusterSDKClient<uint8_t>::set_hnsw_params,
+             py::arg("ef_search") = -1,
+             py::arg("ef_construction") = -1,
+             py::arg("limited_level") = -2,
+             py::call_guard<py::gil_scoped_release>())
+        .def("load_cluster", &ClusterSDKClient<uint8_t>::load_cluster,
+             py::arg("filepath"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("save_cluster", &ClusterSDKClient<uint8_t>::save_cluster,
+             py::arg("filepath"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("load_hnsw", &ClusterSDKClient<uint8_t>::load_hnsw,
+             py::arg("filepath"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("save_hnsw", &ClusterSDKClient<uint8_t>::save_hnsw,
+             py::arg("filepath"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("get_information", [](ClusterSDKClient<uint8_t> &client) {
             py::module_ json = py::module_::import("json");
             return json.attr("loads")(client.get_information());
         });

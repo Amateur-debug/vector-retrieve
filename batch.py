@@ -47,6 +47,7 @@ PARAM_GRID = {
     "num_query_threads":  [40],      # 客户端查询进程数
     "num_threads":        [8],       # 服务端每 node 搜索线程数
     "shard":              [False, True],
+    "global_pull":        [False, True],
     "distributed":        [True],
     "layer":              [True, False],
     "comm_mode":          ["tcp"],  # 通信模式："tcp" 或 "rdma"
@@ -116,6 +117,8 @@ def build_command(dataset, params, skip_prepare=False, no_cleanup=False):
 
     if params.get('shard'):
         cmd.append('--shard')
+    if params.get('global_pull'):
+        cmd.append('--global-pull')
     if params.get('distributed'):
         cmd.append('--distributed')
     if params.get('layer'):
@@ -151,6 +154,11 @@ def get_result_path(dataset_name, params):
                     f"efs{params['ef_search']}-ll{params['limited_level']}-"
                     f"node{params['node_num']}-"
                     f"threads{params['num_threads']}{qt_suffix}{distributed_suffix}{cpu_suffix}-shard.json")
+    elif params.get('global_pull'):
+        filename = (f"results-{dataset_name}-m{params['m']}-efc{params['ef_construction']}-"
+                    f"efs{params['ef_search']}-ll{params['limited_level']}-"
+                    f"node{params['node_num']}-{params['partition_mode']}-rep{params['replication']}-"
+                    f"threads{params['num_threads']}{qt_suffix}{distributed_suffix}{cpu_suffix}-global_pull.json")
     else:
         layer_suffix = "-layer" if params.get('layer') else ""
         filename = (f"results-{dataset_name}-m{params['m']}-efc{params['ef_construction']}-"
@@ -173,6 +181,7 @@ def get_group_key(dataset_name, params):
         params.get('replication', 0),
         params.get('layer', False),
         params.get('shard', False),
+        params.get('global_pull', False),
         params.get('distributed', False),
         params.get('comm_mode', 'tcp'),
         params.get('num_threads', 8),
@@ -205,6 +214,13 @@ def run_batch():
 
         for combo in combinations:
             params = dict(zip(keys, combo))
+
+            # shard 与 global_pull 互斥
+            if params.get('shard') and params.get('global_pull'):
+                continue
+            # global_pull 模式下 replication 和 layer 无意义（图骨架完整，无需冗余/分层），仅保留 replication=0、layer=False 的组合
+            if params.get('global_pull') and (params.get('replication', 0) != 0 or params.get('layer')):
+                continue
 
             if batch_args.skip and os.path.exists(get_result_path(dataset['name'], params)):
                 skipped += 1
@@ -254,7 +270,12 @@ def run_batch():
 
             efs = params['ef_search']
             layer_str = "layer" if params.get('layer') else "non-layer"
-            mode_str = "shard" if params.get('shard') else f"rep={params.get('replication',0)}"
+            if params.get('shard'):
+                mode_str = "shard"
+            elif params.get('global_pull'):
+                mode_str = "global_pull"
+            else:
+                mode_str = f"rep={params.get('replication',0)}"
             flags = []
             if not is_first:
                 flags.append("skip_prepare")

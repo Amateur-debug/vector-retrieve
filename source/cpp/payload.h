@@ -20,6 +20,8 @@ struct PayloadHeader {
     uint64_t remote_transfer_data;
     double send_timestamp;
     int distance_cnt;
+    int pull_cnt;
+    uint64_t pull_data;
 };
 
 // 通用 PQHack：直接访问 priority_queue 的底层 vector 容器（protected 成员 c）。
@@ -46,6 +48,12 @@ struct Payload {
     double send_timestamp = 0.0;    // 最近一次发送消息的时间戳（单位：毫秒，用于计算单跳延迟）
     int distance_cnt = 0;           // 本次搜索过程中计算距离的总次数
 
+    // global-pull 模式：按 vid 远程拉取向量的次数与累计数据量（单位：比特）。
+    // 与 remote_transfer_cnt/remote_transfer_data 区分：后者统计 forward 模式下的 payload 转发，
+    // pull 仅用于拉取单个向量数据（dim * sizeof(T) 字节/次）。两种模式在 JSON 中分开呈现。
+    int pull_cnt = 0;
+    uint64_t pull_data = 0;
+
     // 跨节点序列化传输使用的已访问向量 vid 列表（外部 ID）。
     // 在分布式搜索中，各节点通过该列表同步已访问状态，避免重复计算距离。
     // 注意：节点内部的 visited 判重由 VisitedListPool（基于 internal_id）独立管理，
@@ -71,7 +79,7 @@ struct Payload {
     PayloadHeader to_header() const {
         return {continue_search, origin_node_id, require_id, start_level,
                 entry_point_id, remote_transfer_cnt, remote_transfer_data,
-                send_timestamp, distance_cnt};
+                send_timestamp, distance_cnt, pull_cnt, pull_data};
     }
 
     // 从 PayloadHeader 恢复标量字段
@@ -85,6 +93,8 @@ struct Payload {
         remote_transfer_data = h.remote_transfer_data;
         send_timestamp = h.send_timestamp;
         distance_cnt = h.distance_cnt;
+        pull_cnt = h.pull_cnt;
+        pull_data = h.pull_data;
     }
 
     void clear() {

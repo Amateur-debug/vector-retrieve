@@ -25,7 +25,7 @@ PLOT_CONFIG = {
     # 图尺寸 (inch)
     'fig_height_ratio': 0.4,    # 图高度 = 宽度 × 此比例
     'fig_height_min': 2,        # 最小高度 (inch)
-    'fig_width_single': 6,      # 单系列图 (detail/merge/group) 固定宽度
+    'fig_width_single': 9,      # 单系列图 (detail/merge/group) 固定宽度
     'fig_height_debug_extra': 1, # debug 模式额外高度
 
     # calc_fig_width 参数

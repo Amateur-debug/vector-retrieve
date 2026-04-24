@@ -47,6 +47,12 @@ DATASET_PRESETS = {
         "groundtruth_path": os.path.join(_dataset_root, "sift100m/gt_100.bin"),
         "dtype":            "float",
     },
+    "deep100m": {
+        "data_path":        os.path.join(_dataset_root, "deep100m/base.fbin"),
+        "query_path":       os.path.join(_dataset_root, "deep100m/queries.fbin"),
+        "groundtruth_path": os.path.join(_dataset_root, "deep100m/gt_100.bin"),
+        "dtype":            "float",
+    },
 }
 
 _DTYPE_CLASS_MAP = {
@@ -54,6 +60,8 @@ _DTYPE_CLASS_MAP = {
     "double": ("PayloadDouble", "HNSWGraphDouble", "ClusterDouble", "ClusterSDKClientDouble"),
     "int32":  ("PayloadInt32",  "HNSWGraphInt32",  "ClusterInt32",  "ClusterSDKClientInt32"),
     "uint32": ("PayloadUInt32", "HNSWGraphUInt32", "ClusterUInt32", "ClusterSDKClientUInt32"),
+    # uint8 存储 + int32 距离：复用 PayloadInt32（HNSW/Cluster/SDK 内部 DistT=int32_t）
+    "uint8":  ("PayloadInt32",  "HNSWGraphUInt8",  "ClusterUInt8",  "ClusterSDKClientUInt8"),
 }
 
 # 从命令行提前解析 --dtype 和 --data_name 以确定数据类型
@@ -110,15 +118,22 @@ def read_ivecs(filename, c_contiguous=True):
     return vectors
 
 def read_u8bin(filename, c_contiguous=True, target_dtype=None):
-    """读取 BigANN .u8bin 格式：8字节头(nrows, ncols) + uint8数据
-    target_dtype: 目标类型，默认根据 _active_dtype 决定（int32/uint32/float32）"""
+    """读取 BigANN .u8bin 格式：8字节头(nrows, ncols) + uint8数据。
+    根据 _active_dtype 决定返回数组的 dtype：
+      - dtype=='uint8'  → 原样保留 uint8（零拷贝路径，节省内存带宽）
+      - dtype=='float'  → 转为 float
+      - dtype=='double' → 转为 double
+      - dtype=='int32'/'uint32' → 整数再扩展
+    显式传 target_dtype 可覆盖 _active_dtype。"""
     with open(filename, 'rb') as f:
         nrows, ncols = np.frombuffer(f.read(8), dtype=np.uint32)
         data = np.frombuffer(f.read(), dtype=np.uint8).reshape(nrows, ncols)
     if target_dtype is None:
-        dtype_map = {"int32": np.int32, "uint32": np.uint32, "float": np.float32, "double": np.float64}
+        dtype_map = {"int32": np.int32, "uint32": np.uint32, "float": np.float32, "double": np.float64, "uint8": np.uint8}
         target_dtype = dtype_map.get(_active_dtype, np.float32)
-    vectors = data.astype(target_dtype)
+    # uint8 → uint8：astype 在 dtype 一致时返回视图/副本，但 numpy 通常会 copy；
+    # 下面的 ascontiguousarray 也会拷贝一次，足够保证连续布局。
+    vectors = data.astype(target_dtype, copy=False) if target_dtype == np.uint8 else data.astype(target_dtype)
     if c_contiguous:
         return np.ascontiguousarray(vectors)
     return vectors
@@ -325,6 +340,7 @@ class VectorRetrieveRunner:
 
                 distributed_flag = "--distributed" if self.args.distributed else ""
                 shard_flag = "--shard" if self.args.shard else ""
+                global_pull_flag = "--global-pull" if self.args.is_global_pull else ""
 
                 # Build local command
                 local_cmd = [
@@ -345,6 +361,8 @@ class VectorRetrieveRunner:
                     local_cmd.append(distributed_flag)
                 if shard_flag:
                     local_cmd.append(shard_flag)
+                if global_pull_flag:
+                    local_cmd.append(global_pull_flag)
 
                 # Launch local worker in background
                 with open(log_file, 'w') as log_f:
@@ -357,6 +375,7 @@ class VectorRetrieveRunner:
 
                 distributed_flag = "--distributed" if self.args.distributed else ""
                 shard_flag = "--shard" if self.args.shard else ""
+                global_pull_flag = "--global-pull" if self.args.is_global_pull else ""
 
                 # Build remote command as a single string
                 cpu_prefix = f"taskset -c 0-{self.num_cpu - 1} " if self.num_cpu and self.num_cpu > 0 else ""
@@ -370,7 +389,7 @@ class VectorRetrieveRunner:
                     f"--ef_search {self.ef_search} --limited_level {self.args.limited_level} "
                     f"--comm_mode {self.comm_mode} "
                     f"--num_threads {self.num_threads} "
-                    f"{distributed_flag} {shard_flag} "
+                    f"{distributed_flag} {shard_flag} {global_pull_flag} "
                     f"> {log_file} 2>&1 &"
                 )
 
@@ -609,6 +628,8 @@ class VectorRetrieveRunner:
             print("Loading cluster from disk...")
             self.cluster = Cluster.load(self.cluster_path)
             self.cluster.reset()
+            if self.args.is_global_pull:
+                self.cluster.is_global_pull = True
         elif self.graph_path is not None and os.path.exists(self.graph_path) and not self.args.shard:
             # shard 模式需要每个节点独立建图，不能复用统一的 HNSW 图
             print("Loading HNSW graph from disk...")
@@ -616,6 +637,8 @@ class VectorRetrieveRunner:
             self.hnsw.ef_search = self.ef_search
             print("Partitioning data across cluster nodes...")
             self.cluster = Cluster(self.hnsw, self.node_num, comm_mode=self.comm_mode, ib_dev=self.ib_dev, ib_port=self.ib_port, gid_index=self.gid_index)
+            if self.args.is_global_pull:
+                self.cluster.is_global_pull = True
 
             start_time = time.time()
             if self.use_layer:
@@ -635,6 +658,8 @@ class VectorRetrieveRunner:
 
             self.hnsw = HNSWGraph(dim=dim, m=self.m, ef_construction=self.ef_construction, ef_search=self.ef_search, limited_level=self.limited_level, max_elements=num_elements)
             self.cluster = Cluster(self.hnsw, self.node_num, comm_mode=self.comm_mode, ib_dev=self.ib_dev, ib_port=self.ib_port, gid_index=self.gid_index)
+            if self.args.is_global_pull:
+                self.cluster.is_global_pull = True
 
             if self.args.shard:
                 # Reduce模式：先创建cluster，轮询添加向量到各节点独立建图
@@ -843,7 +868,7 @@ class VectorRetrieveRunner:
         def query(worker_id, stats_list, progress_counter=None):
             # 查询结果暂存，召回率等 Python 密集计算推迟到查询循环外，减少 GIL 竞争
             local_results = {}          # i -> list[int]
-            local_payloads = {}         # i -> (remote_transfer_cnt, remote_transfer_data, distance_cnt)
+            local_payloads = {}         # i -> (remote_transfer_cnt, remote_transfer_data, distance_cnt, pull_cnt, pull_data)
 
             # 每个进程创建独立的 SDK 客户端实例。
             thread_sdk_client = None
@@ -885,7 +910,7 @@ class VectorRetrieveRunner:
                             ret_qid, results, ret_payload = thread_sdk_client.query_recv()
                             orig_idx, _ = pending.pop(ret_qid)
                             local_results[orig_idx] = results
-                            local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt)
+                            local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data)
                             received += 1
                             local_count += 1
                             if progress_counter is not None and local_count % 10 == 0:
@@ -912,7 +937,7 @@ class VectorRetrieveRunner:
                             results = self.cluster.nodes[self.host_id].query(i + worker_id * self.num_queries, queries[i], payload, k=self.k)
 
                         local_results[i] = results
-                        local_payloads[i] = (payload.remote_transfer_cnt, payload.remote_transfer_data, payload.distance_cnt)
+                        local_payloads[i] = (payload.remote_transfer_cnt, payload.remote_transfer_data, payload.distance_cnt, payload.pull_cnt, payload.pull_data)
 
                         local_count += 1
                         if progress_counter is not None:
@@ -938,6 +963,8 @@ class VectorRetrieveRunner:
             local_remote_transfer_cnt = {}
             local_remote_transfer_data = {}
             local_distance_cnt = {}
+            local_pull_cnt = {}
+            local_pull_data = {}
 
             for i, results in local_results.items():
                 results_set = set(results)
@@ -945,16 +972,20 @@ class VectorRetrieveRunner:
                 correct = len(results_set.intersection(true_ids))
                 local_recall[i] = correct / self.k
 
-                rtc, rtl, dc = local_payloads[i]
+                rtc, rtl, dc, pc, pd = local_payloads[i]
                 local_remote_transfer_cnt[i] = rtc
                 local_remote_transfer_data[i] = rtl
                 local_distance_cnt[i] = dc
+                local_pull_cnt[i] = pc
+                local_pull_data[i] = pd
 
             stats_list[worker_id] = {
                 "recall": local_recall,
                 "remote_transfer_cnt": local_remote_transfer_cnt,
                 "remote_transfer_data": local_remote_transfer_data,
                 "distance_cnt": local_distance_cnt,
+                "pull_cnt": local_pull_cnt,
+                "pull_data": local_pull_data,
             }
 
         total_query_start_time = time.time()
@@ -1019,7 +1050,7 @@ class VectorRetrieveRunner:
                                 ret_qid, results, ret_payload = thread_sdk_client.query_recv()
                                 orig_idx = pending.pop(ret_qid)
                                 local_results[orig_idx] = results
-                                local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt)
+                                local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data)
                                 received += 1
                                 local_count += 1
                                 if local_count % 10 == 0:
@@ -1031,7 +1062,7 @@ class VectorRetrieveRunner:
                             ret_qid, results, ret_payload = thread_sdk_client.query_recv()
                             orig_idx = pending.pop(ret_qid)
                             local_results[orig_idx] = results
-                            local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt)
+                            local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data)
                             received += 1
                             local_count += 1
                             if local_count % 10 == 0:
@@ -1059,6 +1090,8 @@ class VectorRetrieveRunner:
                 local_remote_transfer_cnt = {}
                 local_remote_transfer_data = {}
                 local_distance_cnt = {}
+                local_pull_cnt = {}
+                local_pull_data = {}
 
                 for i, results in local_results.items():
                     results_set = set(results)
@@ -1066,16 +1099,20 @@ class VectorRetrieveRunner:
                     correct = len(results_set.intersection(true_ids))
                     local_recall[i] = correct / k
 
-                    rtc, rtl, dc = local_payloads[i]
+                    rtc, rtl, dc, pc, pd = local_payloads[i]
                     local_remote_transfer_cnt[i] = rtc
                     local_remote_transfer_data[i] = rtl
                     local_distance_cnt[i] = dc
+                    local_pull_cnt[i] = pc
+                    local_pull_data[i] = pd
 
                 result_q.put((worker_id, query_end_time, {
                     "recall": local_recall,
                     "remote_transfer_cnt": local_remote_transfer_cnt,
                     "remote_transfer_data": local_remote_transfer_data,
                     "distance_cnt": local_distance_cnt,
+                    "pull_cnt": local_pull_cnt,
+                    "pull_data": local_pull_data,
                 }))
 
             if self.args.distributed:
@@ -1364,6 +1401,8 @@ class VectorRetrieveRunner:
         remote_transfer_cnt = {}
         remote_transfer_data = {}
         distance_cnt = {}
+        pull_cnt = {}
+        pull_data = {}
         for s in thread_stats:
             if not s:
                 continue
@@ -1371,6 +1410,8 @@ class VectorRetrieveRunner:
             remote_transfer_cnt.update(s["remote_transfer_cnt"])
             remote_transfer_data.update(s["remote_transfer_data"])
             distance_cnt.update(s["distance_cnt"])
+            pull_cnt.update(s.get("pull_cnt", {}))
+            pull_data.update(s.get("pull_data", {}))
 
         avg_recall = sum(recall.values()) / self.num_queries
         all_remote_transfer_cnt = sum(remote_transfer_cnt.values())
@@ -1379,6 +1420,13 @@ class VectorRetrieveRunner:
         avg_remote_transfer_data_per_query = sum(remote_transfer_data.values()) / self.num_queries
         all_distance_cnt = sum(distance_cnt.values())
         avg_distance_cnt = all_distance_cnt / self.num_queries
+
+        # global-pull 模式拉取统计
+        all_pull_cnt = sum(pull_cnt.values()) if pull_cnt else 0
+        avg_pull_cnt = all_pull_cnt / self.num_queries if self.num_queries else 0.0
+        all_pull_data = sum(pull_data.values()) if pull_data else 0
+        avg_pull_data_per_pull = all_pull_data / all_pull_cnt if all_pull_cnt > 0 else 0.0
+        avg_pull_data_per_query = all_pull_data / self.num_queries if self.num_queries else 0.0
 
         print("-" * 30)
         print("Evaluation Results:")
@@ -1389,6 +1437,10 @@ class VectorRetrieveRunner:
         print(f"Average Remote Transfer Data per Transfer: {avg_remote_transfer_data_per_transfer:.0f} bits ({avg_remote_transfer_data_per_transfer/8:.0f} bytes)")
         print(f"Average Remote Transfer Data per Query: {avg_remote_transfer_data_per_query:.0f} bits ({avg_remote_transfer_data_per_query/8:.0f} bytes)")
         print(f"Average Distance Computations per Query: {avg_distance_cnt:.4f}")
+        if self.args.is_global_pull:
+            print(f"Average Pull Count per Query: {avg_pull_cnt:.4f}")
+            print(f"Average Pull Data per Pull: {avg_pull_data_per_pull:.0f} bits ({avg_pull_data_per_pull/8:.0f} bytes)")
+            print(f"Average Pull Data per Query: {avg_pull_data_per_query:.0f} bits ({avg_pull_data_per_query/8:.0f} bytes)")
         print("-" * 30)
 
         # --- 保存所有结果 ---
@@ -1425,6 +1477,7 @@ class VectorRetrieveRunner:
                 "bandwidth": cluster_info.get("bandwidth") if cluster_info else 0,
                 "is_distributed": cluster_info.get("is_distributed") if cluster_info else True,
                 "is_shard": cluster_info.get("is_shard") if cluster_info else self.args.shard,
+                "is_global_pull": cluster_info.get("is_global_pull") if cluster_info else self.args.is_global_pull,
             }
 
             if cluster_params["partition_mode"] == "layer":
@@ -1449,6 +1502,7 @@ class VectorRetrieveRunner:
                 "bandwidth": self.cluster.bandwidth,
                 "is_distributed": self.cluster.is_distributed,
                 "is_shard": self.cluster.is_shard,
+                "is_global_pull": self.cluster.is_global_pull,
             }
 
             if self.cluster.partition_mode == "layer":
@@ -1469,10 +1523,15 @@ class VectorRetrieveRunner:
             "avg_remote_transfer_data_per_transfer": avg_remote_transfer_data_per_transfer,
             "avg_remote_transfer_data_per_query": avg_remote_transfer_data_per_query,
             "avg_distance_cnt": avg_distance_cnt,
+            "avg_pull_cnt": avg_pull_cnt,
+            "avg_pull_data_per_pull": avg_pull_data_per_pull,
+            "avg_pull_data_per_query": avg_pull_data_per_query,
             "recall": recall,
             "remote_transfer_cnt": remote_transfer_cnt,
             "remote_transfer_data": remote_transfer_data,
             "distance_cnt": distance_cnt,
+            "pull_cnt": pull_cnt,
+            "pull_data": pull_data,
         }
         if self.use_cpp:
             results_dir = "./results/cpp"
@@ -1483,6 +1542,7 @@ class VectorRetrieveRunner:
         distributed_suffix = "-distributed" if self.args.distributed else ""
         cpu_suffix = f"-cpus{self.args.num_cpu}" if self.args.distributed and self.args.num_cpu != 0 else ""
         shard_suffix = "-shard" if self.args.shard else ""
+        global_pull_suffix = "-global_pull" if self.args.is_global_pull else ""
         layer_suffix = "-layer" if self.use_layer else ""
 
         qt_suffix = f"-query_threads{self.num_query_threads}"
@@ -1491,6 +1551,11 @@ class VectorRetrieveRunner:
                             f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
                             f"node{self.node_num}-"
                             f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{shard_suffix}.json")
+        elif self.args.is_global_pull:
+            results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
+                            f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
+                            f"node{self.node_num}-{self.partition_mode}-rep{self.replication}-"
+                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{global_pull_suffix}.json")
         else:
             results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
                             f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
@@ -1611,6 +1676,7 @@ if __name__ == "__main__":
     parser.add_argument("--replication", type=int, default=2, help="Replication level for data replication across nodes")
     parser.add_argument("--distributed", default=False, action='store_true', help="Enable distributed mode")
     parser.add_argument("--shard", default=False, action='store_true', help="Enable shard mode (independent graphs per node)")
+    parser.add_argument("--global-pull", dest="is_global_pull", default=False, action='store_true', help="Enable global-pull mode: every node holds the full graph skeleton, only vector data is partitioned; remote vectors are pulled on demand during search")
     parser.add_argument("--num_construction_threads", type=int, default=64, help="Number of threads for parallel graph construction (0=auto detect)")
     parser.add_argument("--num_query_threads", type=int, default=40, help="Number of client query processes (each process does all queries)")
     parser.add_argument("--num_threads", type=int, default=8, help="Number of server-side search threads per node (msg_pool_size)")
@@ -1641,6 +1707,9 @@ if __name__ == "__main__":
         if missing:
             parser.error(f"--data_name '{args.data_name}' is not a preset ({list(DATASET_PRESETS.keys())}). "
                          f"Please provide: {missing}")
+
+    if args.shard and args.is_global_pull:
+        parser.error("--shard and --global-pull are mutually exclusive")
 
     runner = VectorRetrieveRunner(args, use_cpp)
     try:

@@ -137,10 +137,11 @@ class Cluster; // 前向声明
 // 异步 SDK 查询完成队列：每个 SDK 连接一个，支持 reader/writer 双线程模型
 template <typename T>
 struct SDKCompletionQueue {
+    using DistT = DistTOf<T>;
     struct Result {
         int query_id;
         std::vector<int> results;
-        Payload<T> payload;
+        Payload<DistT> payload;
     };
     std::queue<Result> completed;
     std::mutex mu;
@@ -177,17 +178,18 @@ struct SDKCompletionQueue {
 // 收集所有节点的查询结果，全部到齐后合并取 top-k 并推入完成队列。
 template <typename T>
 struct ReduceQueryAccumulator {
+    using DistT = DistTOf<T>;
     int query_id;
     int k;
     int total_nodes;                    // 期望收到的结果数（所有节点）
     std::atomic<int> received_count{0};
     std::mutex mu;
-    std::vector<std::pair<T, int>> all_results;
-    Payload<T> merged_payload;
+    std::vector<std::pair<DistT, int>> all_results;
+    Payload<DistT> merged_payload;
     std::shared_ptr<SDKCompletionQueue<T>> completion_queue;
     std::function<void()> cleanup_fn;   // 完成后从 map 中移除自己
 
-    void add_node_results(const std::vector<std::pair<T, int>>& results, const Payload<T>& payload) {
+    void add_node_results(const std::vector<std::pair<DistT, int>>& results, const Payload<DistT>& payload) {
         int count;
         {
             std::lock_guard<std::mutex> lk(mu);
@@ -228,7 +230,8 @@ enum MessageType
     MSG_ADD_VECTOR_LOCAL = 12,  // Shard模式下直接添加到本地（避免递归路由）
     MSG_SET_HNSW_PARAMS = 13,   // 运行时更新 HNSW 参数（如 ef_search）
     MSG_QUERY_SHARD = 14,      // 异步 shard 查询请求（远程节点执行本地查询后通过 MSG_SHARD_RESULT 回传）
-    MSG_SHARD_RESULT = 15      // shard 查询结果异步回传（携带 distance+vid 对，用于合并排序）
+    MSG_SHARD_RESULT = 15,     // shard 查询结果异步回传（携带 distance+vid 对，用于合并排序）
+    MSG_FETCH_VECTOR = 16      // global-pull 模式：按 vid 同步拉取远程节点的向量数据
 };
 
 // 序列化/反序列化辅助缓冲区（用于 HNSW 图的网络传输、分布式同步和持久化存储）
@@ -314,8 +317,8 @@ public:
 
     // --- 序列化/反序列化辅助工具函数 ---
 
-template <typename T>
-void serialize_payload(Buffer &buf, Payload<T> &payload)
+template <typename P>
+void serialize_payload(Buffer &buf, Payload<P> &payload)
 {
     // 标量字段打包：一次 memcpy 写入所有标量（替代 9 次 write_val）
     PayloadHeader header = payload.to_header();
@@ -330,7 +333,7 @@ void serialize_payload(Buffer &buf, Payload<T> &payload)
     int cand_size = (int)cand_vec.size();
     buf.write_val(cand_size);
     if (cand_size > 0)
-        buf.write(cand_vec.data(), cand_size * sizeof(pair<T, int>));
+        buf.write(cand_vec.data(), cand_size * sizeof(pair<P, int>));
 
     // 结果堆：同上
     using ResPQ = decltype(payload.results);
@@ -338,11 +341,11 @@ void serialize_payload(Buffer &buf, Payload<T> &payload)
     int res_size = (int)res_vec.size();
     buf.write_val(res_size);
     if (res_size > 0)
-        buf.write(res_vec.data(), res_size * sizeof(pair<T, int>));
+        buf.write(res_vec.data(), res_size * sizeof(pair<P, int>));
 }
 
-template <typename T>
-void deserialize_payload(Buffer &buf, Payload<T> &payload)
+template <typename P>
+void deserialize_payload(Buffer &buf, Payload<P> &payload)
 {
     // 标量字段打包：一次 memcpy 读出所有标量
     PayloadHeader header = buf.read_val<PayloadHeader>();
@@ -358,8 +361,8 @@ void deserialize_payload(Buffer &buf, Payload<T> &payload)
     cand_vec.resize(cand_size);
     if (cand_size > 0)
     {
-        buf.read(cand_vec.data(), cand_size * sizeof(pair<T, int>));
-        std::make_heap(cand_vec.begin(), cand_vec.end(), std::greater<pair<T, int>>());
+        buf.read(cand_vec.data(), cand_size * sizeof(pair<P, int>));
+        std::make_heap(cand_vec.begin(), cand_vec.end(), std::greater<pair<P, int>>());
     }
 
     // 结果堆：同上
@@ -369,8 +372,8 @@ void deserialize_payload(Buffer &buf, Payload<T> &payload)
     res_vec.resize(res_size);
     if (res_size > 0)
     {
-        buf.read(res_vec.data(), res_size * sizeof(pair<T, int>));
-        std::make_heap(res_vec.begin(), res_vec.end(), std::less<pair<T, int>>());
+        buf.read(res_vec.data(), res_size * sizeof(pair<P, int>));
+        std::make_heap(res_vec.begin(), res_vec.end(), std::less<pair<P, int>>());
     }
 }
 
@@ -537,8 +540,11 @@ void serialize_hnsw_subset(Buffer &buf, const HNSWGraph<T> *hnsw, const std::uno
 }
 
 // 反序列化 HNSW 子集：读取图结构骨架和稀疏分布的本地向量数据
+// do_compact=true（默认）：紧凑重排，邻居列表中远程 vid 以负数编码（forward/shard 模式）
+// do_compact=false：保留完整图骨架，所有 vid 保持原始 internal_id；本地持有的向量数据
+//                   由 local_vids_ 标记（global-pull 模式用，搜索时按需远程拉取）
 template <typename T>
-HNSWGraph<T> *deserialize_hnsw_subset(Buffer &buf)
+HNSWGraph<T> *deserialize_hnsw_subset(Buffer &buf, bool do_compact = true)
 {
     int dim = buf.read_val<int>();
     int m = buf.read_val<int>();
@@ -609,9 +615,19 @@ HNSWGraph<T> *deserialize_hnsw_subset(Buffer &buf)
 
     LOG_DEBUG_STREAM("Deserialized HNSW subset: " << cur_count << " elements, " << hnsw->local_vids_.size() << " local vids.");
 
-    // 紧凑重排：仅保留本地持有的向量，远程邻居以负数编码 -(vid+1) 表示
-    hnsw->compact();
-    LOG_DEBUG_STREAM("Compacted HNSW subset: " << hnsw->get_cur_element_count() << " local elements, max_elements=" << hnsw->max_elements_);
+    if (do_compact)
+    {
+        // 紧凑重排：仅保留本地持有的向量，远程邻居以负数编码 -(vid+1) 表示
+        hnsw->compact();
+        LOG_DEBUG_STREAM("Compacted HNSW subset: " << hnsw->get_cur_element_count() << " local elements, max_elements=" << hnsw->max_elements_);
+    }
+    else
+    {
+        // global-pull 模式：保留完整图骨架，不做 compact；label_lookup_ 已在上方循环中建立，
+        // local_vids_ 标记本地持有的 vid 集合，搜索时通过 pull_fetcher_ 按需拉取远程向量。
+        hnsw->is_global_pull_mode_ = true;
+        LOG_DEBUG_STREAM("Skipped compact (global-pull mode): " << cur_count << " graph elements, " << hnsw->local_vids_.size() << " locally held vectors.");
+    }
 
     return hnsw;
 }
@@ -729,6 +745,7 @@ template <typename T>
 class Node
 {
 public:
+    using DistT = DistTOf<T>;
     int node_id;
     Cluster<T> *cluster;
     HNSWGraph<T> *local_hnsw;
@@ -769,7 +786,7 @@ public:
     std::unordered_map<int, std::shared_ptr<ReduceQueryAccumulator<T>>> reduce_accum_map_;
 
     // 异步查询辅助方法：将结果推入 origin 节点的完成队列
-    void send_result_to_origin(int query_id, const std::vector<int>& results, Payload<T>& payload);
+    void send_result_to_origin(int query_id, const std::vector<int>& results, Payload<DistT>& payload);
 
     Node(int node_id, Cluster<T> *cluster, HNSWGraph<T> *local_hnsw = nullptr, bool is_remote_node = false, int msg_pool_size = 32)
         : node_id(node_id), cluster(cluster), local_hnsw(local_hnsw), is_remote_node(is_remote_node), msg_pool_size_(msg_pool_size)
@@ -813,7 +830,7 @@ public:
     void handle_node_client(int conn_id);   // 处理节点间消息（transport 收发）
     void handle_sdk_client(int client_fd);  // 处理 SDK 消息（裸 TCP 收发）
 
-    std::vector<int> query(int query_id, const vector<T> &query_vector, Payload<T> &payload, int k = 10);
+    std::vector<int> query(int query_id, const vector<T> &query_vector, Payload<DistT> &payload, int k = 10);
 
     void add_vector(int vid, const std::vector<T> &vec);
 };
@@ -822,6 +839,7 @@ template <typename T>
 class Cluster
 {
 public:
+    using DistT = DistTOf<T>;
     HNSWGraph<T> *hnsw;
 
     int node_num = 4;
@@ -847,6 +865,7 @@ public:
 
     bool is_distributed = false;
     bool is_shard = false;
+    bool is_global_pull = false;  // global-pull 模式：每节点保留完整图骨架，仅向量数据按节点分布，查询时按需远程拉取
 
     std::atomic<int> add_round_robin_counter{0};
 
@@ -1063,12 +1082,12 @@ public:
                     threads.emplace_back([&, start, end]() {
                         for (int i = start; i < end; i++)
                         {
-                            T best_dist = numeric_limits<T>::max();
+                            DistT best_dist = numeric_limits<DistT>::max();
                             int best_center = 0;
                             const T* vec = ptrs[i];
                             for (int j = 0; j < k; j++)
                             {
-                                T dist = dist_func(vec, centers_t[j].data(), dist_param);
+                                DistT dist = dist_func(vec, centers_t[j].data(), dist_param);
                                 if (dist < best_dist)
                                 {
                                     best_dist = dist;
@@ -1651,6 +1670,7 @@ public:
 
                 Buffer buf;
                 buf.write_val((int)MSG_INIT_GRAPH);
+                buf.write_val(is_global_pull);  // 通知远程节点是否为 global-pull 模式（跳过 compact）
                 serialize_routing(buf, vector_node_map);
                 serialize_hnsw_subset(buf, hnsw, node_local_vids[i]);
 
@@ -1694,22 +1714,31 @@ public:
                 serialize_hnsw_subset(buf, hnsw, node_local_vids[i]);
                 deserialize_routing(buf, vector_node_map);
 
-                target_node.local_hnsw = deserialize_hnsw_subset<T>(buf);
+                target_node.local_hnsw = deserialize_hnsw_subset<T>(buf, /*do_compact=*/!is_global_pull);
+
+                // global-pull 模式下注入远程向量拉取回调
+                if (is_global_pull && target_node.local_hnsw)
+                {
+                    Cluster<T> *cl = this;
+                    target_node.local_hnsw->pull_fetcher_ = [cl](int vid) -> std::vector<T> {
+                        return cl->fetch_remote_vector(vid);
+                    };
+                }
             }
         }
     }
 
-    std::vector<int> query(int query_id, const vector<T> &query_vector, Payload<T> &payload, int k)
+    std::vector<int> query(int query_id, const vector<T> &query_vector, Payload<DistT> &payload, int k)
     {
         if (is_shard)
         {
-            std::vector<pair<T, int>> all_results;
+            std::vector<pair<DistT, int>> all_results;
 
     // Shard 模式查询：并行向所有节点发送查询请求并合并结果
             struct NodeQueryOutput
             {
-                std::vector<pair<T, int>> results;
-                Payload<T> payload;
+                std::vector<pair<DistT, int>> results;
+                Payload<DistT> payload;
             };
 
             std::vector<std::future<NodeQueryOutput>> futs;
@@ -1722,7 +1751,7 @@ public:
                     Node<T> &node = nodes[i];
 
                     // 每个节点使用独立payload，避免并发写同一个payload
-                    Payload<T> node_payload;
+                    Payload<DistT> node_payload;
 
                     if (is_distributed && node.is_remote_node)
                     {
@@ -1767,7 +1796,7 @@ public:
                             out.results.reserve(result_cnt);
                             for (int j = 0; j < result_cnt; j++)
                             {
-                                T dist = resp_buf.read_val<T>();
+                                DistT dist = resp_buf.read_val<DistT>();
                                 int id = resp_buf.read_val<int>();
                                 out.results.push_back({dist, id});
                             }
@@ -1835,9 +1864,90 @@ public:
         return std::vector<int>();
     }
 
+    // global-pull 模式：按 vid 从拥有该向量数据的节点同步拉取原始向量数据。
+    // 路由依据 vector_node_map[0]（底层分区）。若拥有者是本地节点，直接从 local_hnsw->get_vector 读取；
+    // 否则通过 MSG_FETCH_VECTOR 发送同步 RPC，阻塞等待响应。
+    // 注意：此函数不更新 payload 统计；调用方（HNSW 搜索层）负责记账 remote_transfer_cnt / remote_transfer_data。
+    std::vector<T> fetch_remote_vector(int vid)
+    {
+        if (vector_node_map.empty())
+            return {};
+
+        int owner_node_id = 0;
+        auto it = vector_node_map[0].find(vid);
+        if (it == vector_node_map[0].end() || it->second.empty())
+        {
+            LOG_DEBUG_STREAM("[Cluster] fetch_remote_vector: vid " << vid << " not in routing map");
+            return {};
+        }
+
+        // 冗余分区时随机选择一个副本节点
+        const auto &candidates = it->second;
+        if (candidates.size() == 1)
+        {
+            owner_node_id = candidates[0];
+        }
+        else
+        {
+            static thread_local std::mt19937 gen(std::random_device{}());
+            std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+            owner_node_id = candidates[dist(gen)];
+        }
+
+        if (owner_node_id < 0 || owner_node_id >= node_num)
+            return {};
+
+        Node<T> &owner = nodes[owner_node_id];
+
+        // 拥有者是本地节点：直接读取，不走网络
+        if (!is_distributed || !owner.is_remote_node)
+        {
+            if (owner.local_hnsw)
+                return owner.local_hnsw->get_vector(vid);
+            return {};
+        }
+
+        // 远程节点：通过 MSG_FETCH_VECTOR 同步拉取
+        int sock = transport->acquire_connection(owner_node_id);
+        if (sock < 0)
+        {
+            LOG_DEBUG_STREAM("[Cluster] fetch_remote_vector: failed to get connection to node " << owner_node_id);
+            return {};
+        }
+
+        try
+        {
+            Buffer buf;
+            buf.write_val((int)MSG_FETCH_VECTOR);
+            buf.write_val(vid);
+
+            uint64_t msg_size = buf.data.size();
+            transport->send_raw(sock, &msg_size, sizeof(uint64_t));
+            transport->send_raw(sock, buf.data.data(), msg_size);
+
+            uint64_t resp_size = 0;
+            transport->recv_raw(sock, &resp_size, sizeof(uint64_t));
+
+            std::vector<char> resp_data(resp_size);
+            if (resp_size > 0)
+                transport->recv_raw(sock, resp_data.data(), resp_size);
+
+            transport->release_connection(owner_node_id, sock, true);
+
+            Buffer resp_buf;
+            resp_buf.data = std::move(resp_data);
+            return resp_buf.read_vec<T>();
+        }
+        catch (...)
+        {
+            transport->release_connection(owner_node_id, sock, false);
+            return {};
+        }
+    }
+
     // 跨节点传输：统计并将查询转发到目标节点
     // 跨节点传输：统计并将查询转发到目标节点
-    std::vector<int> transfer_to_remote(int query_id, const vector<T> &query_vector, Payload<T> &payload, int k)
+    std::vector<int> transfer_to_remote(int query_id, const vector<T> &query_vector, Payload<DistT> &payload, int k)
     {
         payload.remote_transfer_cnt += 1;
 
@@ -1946,6 +2056,7 @@ public:
             j["replication_num"] = replication_num;
             j["is_distributed"] = is_distributed;
             j["is_shard"] = is_shard;
+            j["is_global_pull"] = is_global_pull;
             j["add_round_robin_counter"] = add_round_robin_counter.load();
 
             if (partition_mode == "layer")
@@ -2084,6 +2195,7 @@ public:
         cluster->replication_num = j.value("replication_num", (uint64_t)0);
         cluster->is_distributed = j.value("is_distributed", false);
         cluster->is_shard = j.value("is_shard", false);
+        cluster->is_global_pull = j.value("is_global_pull", false);
         cluster->add_round_robin_counter = j.value("add_round_robin_counter", 0);
 
         if (cluster->partition_mode == "layer")
@@ -2190,6 +2302,7 @@ template <typename T>
 class ShardQuerySession
 {
 public:
+    using DistT = DistTOf<T>;
     Cluster<T> *cluster_;
     std::vector<int> node_conns_; // node_conns_[i] = 到节点 i 的持久连接，本地节点为 -1
     bool valid_ = false;
@@ -2256,7 +2369,7 @@ public:
         valid_ = false;
     }
 
-    std::vector<int> query(int query_id, const vector<T> &query_vector, Payload<T> &payload, int k)
+    std::vector<int> query(int query_id, const vector<T> &query_vector, Payload<DistT> &payload, int k)
     {
         // Phase 1: 向所有远程节点发送查询（流水线，不等回复）
         for (int i = 0; i < cluster_->node_num; i++)
@@ -2268,7 +2381,7 @@ public:
                 buf.write_val(query_id);
                 buf.write_val(k);
                 buf.write_vec(query_vector);
-                Payload<T> empty_payload;
+                Payload<DistT> empty_payload;
                 serialize_payload(buf, empty_payload);
 
                 uint64_t msg_size = buf.data.size();
@@ -2278,7 +2391,7 @@ public:
         }
 
         // Phase 2: 本地节点直接查询（与网络传输重叠）
-        std::vector<pair<T, int>> all_results;
+        std::vector<pair<DistT, int>> all_results;
         for (int i = 0; i < cluster_->node_num; i++)
         {
             if (node_conns_[i] < 0)
@@ -2287,7 +2400,7 @@ public:
                 Node<T> &node = cluster_->nodes[i];
                 if (node.local_hnsw)
                 {
-                    Payload<T> local_payload;
+                    Payload<DistT> local_payload;
                     node.local_hnsw->query(query_vector, local_payload, k);
                     auto pq = local_payload.results;
                     while (!pq.empty())
@@ -2319,12 +2432,12 @@ public:
                     int result_cnt = resp_buf.read_val<int>();
                     for (int j = 0; j < result_cnt; j++)
                     {
-                        T dist = resp_buf.read_val<T>();
+                        DistT dist = resp_buf.read_val<DistT>();
                         int id = resp_buf.read_val<int>();
                         all_results.push_back({dist, id});
                     }
 
-                    Payload<T> node_payload;
+                    Payload<DistT> node_payload;
                     deserialize_payload(resp_buf, node_payload);
                     payload.distance_cnt += node_payload.distance_cnt;
                     payload.remote_transfer_cnt += node_payload.remote_transfer_cnt;
@@ -2549,11 +2662,22 @@ void Node<T>::handle_node_client(int conn_id)
             if (msg_type == MSG_INIT_GRAPH)
             {
                 LOG_DEBUG_STREAM("Node " << node_id << " receiving graph partition...");
+                bool remote_is_global_pull = buf->read_val<bool>();
+                cluster->is_global_pull = remote_is_global_pull;  // 远程节点同步模式标志
                 deserialize_routing(*buf, cluster->vector_node_map);
 
                 if (local_hnsw)
                     delete local_hnsw;
-                local_hnsw = deserialize_hnsw_subset<T>(*buf);
+                local_hnsw = deserialize_hnsw_subset<T>(*buf, /*do_compact=*/!remote_is_global_pull);
+
+                // global-pull 模式下注入远程向量拉取回调
+                if (remote_is_global_pull && local_hnsw)
+                {
+                    Cluster<T> *cl = cluster;
+                    local_hnsw->pull_fetcher_ = [cl](int vid) -> std::vector<T> {
+                        return cl->fetch_remote_vector(vid);
+                    };
+                }
 
                 LOG_DEBUG_STREAM("Node " << node_id << " initialized with " << local_hnsw->get_cur_element_count() << " vectors.");
 
@@ -2569,7 +2693,7 @@ void Node<T>::handle_node_client(int conn_id)
                     int query_id = buf->read_val<int>();
                     std::vector<int> results = buf->read_vec<int>();
 
-                    Payload<T> payload;
+                    Payload<DistT> payload;
                     deserialize_payload(*buf, payload);
 
                     std::shared_ptr<SDKCompletionQueue<T>> cq;
@@ -2596,14 +2720,14 @@ void Node<T>::handle_node_client(int conn_id)
                 msg_pool_->submit_urgent([this, buf]() {
                     int query_id = buf->read_val<int>();
                     int result_cnt = buf->read_val<int>();
-                    std::vector<std::pair<T, int>> results;
+                    std::vector<std::pair<DistT, int>> results;
                     results.reserve(result_cnt);
                     for (int j = 0; j < result_cnt; j++) {
-                        T dist = buf->read_val<T>();
+                        DistT dist = buf->read_val<DistT>();
                         int id = buf->read_val<int>();
                         results.push_back({dist, id});
                     }
-                    Payload<T> payload;
+                    Payload<DistT> payload;
                     deserialize_payload(*buf, payload);
 
                     std::shared_ptr<ReduceQueryAccumulator<T>> accum;
@@ -2622,6 +2746,26 @@ void Node<T>::handle_node_client(int conn_id)
                 continue;
             }
 
+            // MSG_FETCH_VECTOR：global-pull 模式下的向量拉取请求，内联处理避免线程池死锁。
+            // 原因：查询处理线程在 pool 中阻塞等待拉取响应；若拉取请求也排队到 pool，
+            // 当所有 pool 线程都阻塞在查询（等待拉取结果）时，新到的拉取请求无法被处理，形成死锁。
+            // 由于操作极轻量（hash 查找 + memcpy + 一次 send），内联处理不会影响 recv 吞吐。
+            if (msg_type == MSG_FETCH_VECTOR)
+            {
+                int vid = buf->read_val<int>();
+                std::vector<T> vec;
+                if (local_hnsw)
+                    vec = local_hnsw->get_vector(vid);
+
+                Buffer resp_buf;
+                resp_buf.write_vec(vec);
+
+                uint64_t resp_size = resp_buf.data.size();
+                cluster->transport->send_raw(conn_id, &resp_size, sizeof(uint64_t));
+                cluster->transport->send_raw(conn_id, resp_buf.data.data(), resp_size);
+                continue;
+            }
+
             // 其他消息类型：提交到线程池队列处理
             msg_pool_->submit([this, buf, msg_type, conn_id]() {
                 try
@@ -2632,7 +2776,7 @@ void Node<T>::handle_node_client(int conn_id)
                         int k = buf->read_val<int>();
                         std::vector<T> query_vector = buf->read_vec<T>();
 
-                        Payload<T> payload;
+                        Payload<DistT> payload;
                         deserialize_payload(*buf, payload);
 
                         LOG_DEBUG_STREAM("[Node " << node_id << "] Received MSG_SEARCH for query " << query_id << ", transfer_cnt=" << payload.remote_transfer_cnt << ", origin=" << payload.origin_node_id);
@@ -2671,10 +2815,10 @@ void Node<T>::handle_node_client(int conn_id)
                         int k = buf->read_val<int>();
                         std::vector<T> query_vector = buf->read_vec<T>();
 
-                        Payload<T> payload;
+                        Payload<DistT> payload;
                         deserialize_payload(*buf, payload);
 
-                        std::vector<pair<T, int>> results;
+                        std::vector<pair<DistT, int>> results;
                         if (local_hnsw)
                         {
                             local_hnsw->query(query_vector, payload, k);
@@ -2707,8 +2851,8 @@ void Node<T>::handle_node_client(int conn_id)
                         std::vector<T> query_vector = buf->read_vec<T>();
                         int origin_node_id = buf->read_val<int>();
 
-                        std::vector<std::pair<T, int>> results;
-                        Payload<T> payload;
+                        std::vector<std::pair<DistT, int>> results;
+                        Payload<DistT> payload;
                         if (local_hnsw)
                         {
                             local_hnsw->query(query_vector, payload, k);
@@ -2820,7 +2964,7 @@ void Node<T>::handle_sdk_client(int client_fd)
                 resp_buf.write_val((int)result.results.size());
                 for (const auto &id : result.results)
                 {
-                    resp_buf.write_val((T)0.0);
+                    resp_buf.write_val((DistT)0.0);
                     resp_buf.write_val(id);
                 }
                 serialize_payload(resp_buf, result.payload);
@@ -2884,12 +3028,12 @@ void Node<T>::handle_sdk_client(int client_fd)
                 int k = buf.read_val<int>();
                 std::vector<T> query_vector = buf.read_vec<T>();
 
-                Payload<T> payload;
+                Payload<DistT> payload;
                 deserialize_payload(buf, payload);
 
                 // 查询执行提交到 msg_pool_，reader 线程只负责接收
                 auto qv = std::make_shared<std::vector<T>>(std::move(query_vector));
-                auto pl = std::make_shared<Payload<T>>(std::move(payload));
+                auto pl = std::make_shared<Payload<DistT>>(std::move(payload));
 
                 msg_pool_->submit([this, query_id, k, qv, pl, completion_queue, &inflight_count]() {
                     if (cluster && cluster->is_shard)
@@ -2933,11 +3077,11 @@ void Node<T>::handle_sdk_client(int client_fd)
                                         cluster->transport->release_connection(i, sock, true);
                                     } catch (...) {
                                         cluster->transport->release_connection(i, sock, false);
-                                        Payload<T> empty_payload;
+                                        Payload<DistT> empty_payload;
                                         accum->add_node_results({}, empty_payload);
                                     }
                                 } else {
-                                    Payload<T> empty_payload;
+                                    Payload<DistT> empty_payload;
                                     accum->add_node_results({}, empty_payload);
                                 }
                             }
@@ -2950,9 +3094,9 @@ void Node<T>::handle_sdk_client(int client_fd)
                             {
                                 Node<T> &nd = cluster->nodes[i];
                                 if (nd.local_hnsw) {
-                                    Payload<T> local_payload;
+                                    Payload<DistT> local_payload;
                                     nd.local_hnsw->query(*qv, local_payload, k);
-                                    std::vector<std::pair<T, int>> local_results;
+                                    std::vector<std::pair<DistT, int>> local_results;
                                     auto pq = local_payload.results;
                                     while (!pq.empty()) {
                                         local_results.push_back(pq.top());
@@ -2960,7 +3104,7 @@ void Node<T>::handle_sdk_client(int client_fd)
                                     }
                                     accum->add_node_results(local_results, local_payload);
                                 } else {
-                                    Payload<T> empty_payload;
+                                    Payload<DistT> empty_payload;
                                     accum->add_node_results({}, empty_payload);
                                 }
                             }
@@ -3159,6 +3303,7 @@ void Node<T>::handle_sdk_client(int client_fd)
                     cj["replication_num"] = cluster->replication_num;
                     cj["is_distributed"] = cluster->is_distributed;
                     cj["is_shard"] = cluster->is_shard;
+                    cj["is_global_pull"] = cluster->is_global_pull;
                     cj["layer_config"] = cluster->layer_config;
                     cj["layer_replicate_flags"] = cluster->layer_replicate_flags;
 
@@ -3278,7 +3423,7 @@ void Node<T>::handle_sdk_client(int client_fd)
 }
 
 template <typename T>
-void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& results, Payload<T>& payload)
+void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& results, Payload<DistT>& payload)
 {
     if (payload.origin_node_id < 0 || payload.origin_node_id >= cluster->node_num)
     {
@@ -3348,7 +3493,7 @@ void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& result
 // 2. Python 直接调用（非分布式或本地模式）
 // 注意：SDK 流水线模式不再走此函数，而是由 handle_sdk_client 内联处理。
 template <typename T>
-std::vector<int> Node<T>::query(int query_id, const vector<T> &query_vector, Payload<T> &payload, int k)
+std::vector<int> Node<T>::query(int query_id, const vector<T> &query_vector, Payload<DistT> &payload, int k)
 {
     // 如果 origin_node_id 未设置，说明是 Python 直接调用
     if (payload.origin_node_id < 0)

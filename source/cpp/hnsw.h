@@ -30,6 +30,7 @@
 #include <random>
 #include <string>
 #include <type_traits>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -47,6 +48,9 @@ template <typename T>
 class HNSWGraph
 {
 public:
+    // 距离值类型：多数情况下 DistT = T；uint8 存储时 DistT = int32（避免 L2 累加溢出）
+    using DistT = DistTOf<T>;
+
     // === 基本参数 ===
     int dim;                        // 向量维度
     int m;                          // 每层最大邻居数（高层上限 = m，第 0 层上限 = 2*m）
@@ -80,9 +84,9 @@ public:
     std::unordered_map<int, int> label_lookup_;  // vid → internal_id 的哈希映射
 
     // === 距离计算函数（运行时动态选择最优 SIMD 实现） ===
-    DISTFUNC<T> dist_func_;                      // 距离计算函数指针
+    DISTFUNC<DistT> dist_func_;                      // 距离计算函数指针
     void *dist_func_param_;                      // 距离函数辅助参数（指向维度值 dim 的指针）
-    std::unique_ptr<SpaceInterface<T>> space_;   // 距离空间对象（持有函数指针和参数的生命周期）
+    std::unique_ptr<SpaceInterface<DistT>> space_;   // 距离空间对象（持有函数指针和参数的生命周期）
 
     // === 访问标记列表对象池 ===
     std::unique_ptr<VisitedListPool> visited_pool_;
@@ -92,6 +96,12 @@ public:
 
     // === 本地向量子集标记（分布式模式下使用） ===
     std::unordered_set<int> local_vids_;  // 本地持有向量数据的 vid 集合（空集合表示持有全部向量）
+
+    // === global-pull 模式：完整图骨架 + 按需远程拉取向量 ===
+    // 开启后跳过 compact()，label_lookup_ 保留所有 vid；邻居列表全部为正数 internal_id。
+    // 搜索时若目标 vid 不在 local_vids_ 中，通过 pull_fetcher_ 同步拉取向量数据计算距离。
+    bool is_global_pull_mode_ = false;
+    std::function<std::vector<T>(int vid)> pull_fetcher_;
 
     // === 随机数生成器（用于节点层级生成） ===
     std::mt19937 rng;
@@ -451,14 +461,14 @@ public:
     // 距离较远的候选者，以保证邻居集的多样性和覆盖范围。
     // ========================================================
     void select_neighbors_heuristic(
-        std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>, std::greater<std::pair<T, int>>> &top_candidates,
+        std::priority_queue<std::pair<DistT, int>, std::vector<std::pair<DistT, int>>, std::greater<std::pair<DistT, int>>> &top_candidates,
         int M)
     {
         if ((int)top_candidates.size() <= M)
             return;  // 早退优化
 
         // 直接 dump 到 vector 排序，省去中间 max-heap 转换开销
-        std::vector<std::pair<T, int>> sorted_candidates;
+        std::vector<std::pair<DistT, int>> sorted_candidates;
         sorted_candidates.reserve(top_candidates.size());
         while (!top_candidates.empty())
         {
@@ -468,7 +478,7 @@ public:
         // 按距离升序排序（距离最近的优先）
         std::sort(sorted_candidates.begin(), sorted_candidates.end());
 
-        std::vector<std::pair<T, int>> return_list;
+        std::vector<std::pair<DistT, int>> return_list;
         return_list.reserve(M);
 
         for (auto &cur : sorted_candidates)
@@ -476,7 +486,7 @@ public:
             if ((int)return_list.size() >= M)
                 break;
 
-            T dist_to_query = cur.first;
+            DistT dist_to_query = cur.first;
 
             bool good = true;
             for (auto &ret : return_list)
@@ -512,7 +522,7 @@ public:
     // ========================================================
     void connect_new_element(
         int cur_c,  // 新节点的 internal_id
-        std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>, std::greater<std::pair<T, int>>> &top_candidates,
+        std::priority_queue<std::pair<DistT, int>, std::vector<std::pair<DistT, int>>, std::greater<std::pair<DistT, int>>> &top_candidates,
         int level)
     {
         int Mcurmax = (level == 0) ? max_m0_ : max_m_;
@@ -574,15 +584,15 @@ public:
                                      dist_func_param_);
 
                 // 构建候选集 = 现有邻居 + 新节点
-                std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>,
-                                    std::greater<std::pair<T, int>>>
+                std::priority_queue<std::pair<DistT, int>, std::vector<std::pair<DistT, int>>,
+                                    std::greater<std::pair<DistT, int>>>
                     candidates;
                 candidates.push({d_max, cur_c});
 
                 int *data = ll_other + 1;
                 for (int j = 0; j < sz_other; j++)
                 {
-                    T dist_j = dist_func_(get_data_by_id(data[j]),
+                    DistT dist_j = dist_func_(get_data_by_id(data[j]),
                                           get_data_by_id(selected_id),
                                           dist_func_param_);
                     candidates.push({dist_j, data[j]});
@@ -609,7 +619,7 @@ public:
     // 建图期间使用节点级锁保护邻居列表的并发读写。
     // 调用方（add_vector）已持有 resize_mutex_ 的共享锁，此处无需再获取。
     // ========================================================
-    std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>, std::greater<std::pair<T, int>>>
+    std::priority_queue<std::pair<DistT, int>, std::vector<std::pair<DistT, int>>, std::greater<std::pair<DistT, int>>>
     search_layer_build(const void *query_data, int ep_id, int ef, int level)
     {
         // 注意：调用方（add_vector）已持有 resize_mutex_ 的共享锁，此处无需再获取
@@ -618,18 +628,18 @@ public:
         unsigned short visited_tag = vl->cur_tag;
 
         // 结果集（最大堆）：堆顶为距离最远的结果，方便弹出最远者保持堆大小 <= ef
-        std::priority_queue<std::pair<T, int>> top_candidates;
+        std::priority_queue<std::pair<DistT, int>> top_candidates;
         // 候选集（最小堆）：堆顶为距离最近的候选，优先展开最近的节点
-        std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>,
-                            std::greater<std::pair<T, int>>>
+        std::priority_queue<std::pair<DistT, int>, std::vector<std::pair<DistT, int>>,
+                            std::greater<std::pair<DistT, int>>>
             candidate_set;
 
-        T dist = dist_func_(query_data, get_data_by_id(ep_id), dist_func_param_);
+        DistT dist = dist_func_(query_data, get_data_by_id(ep_id), dist_func_param_);
         top_candidates.push({dist, ep_id});
         candidate_set.push({dist, ep_id});
         visited_array[ep_id] = visited_tag;
 
-        T lower_bound = dist;
+        DistT lower_bound = dist;
 
         while (!candidate_set.empty())
         {
@@ -669,7 +679,7 @@ public:
                     continue;
                 visited_array[candidate_id] = visited_tag;
 
-                T dist_cand = dist_func_(query_data, get_data_by_id(candidate_id), dist_func_param_);
+                DistT dist_cand = dist_func_(query_data, get_data_by_id(candidate_id), dist_func_param_);
 
                 if ((int)top_candidates.size() < ef || dist_cand < lower_bound)
                 {
@@ -688,8 +698,8 @@ public:
         visited_pool_->release_list(vl);
 
         // 转换为 min-heap 返回
-        std::priority_queue<std::pair<T, int>, std::vector<std::pair<T, int>>,
-                            std::greater<std::pair<T, int>>>
+        std::priority_queue<std::pair<DistT, int>, std::vector<std::pair<DistT, int>>,
+                            std::greater<std::pair<DistT, int>>>
             results;
         while (!top_candidates.empty())
         {
@@ -828,7 +838,7 @@ public:
                     for (int i = 0; i < size; i++)
                     {
                         int cand = data[i];
-                        T d = dist_func_(query_data, get_data_by_id(cand), dist_func_param_);
+                        DistT d = dist_func_(query_data, get_data_by_id(cand), dist_func_param_);
                         if (d < cur_dist)
                         {
                             cur_dist = d;
@@ -870,15 +880,47 @@ public:
     // 像在一张完整图上搜索：遇到远程 candidate 触发 transfer，
     // 遇到远程邻居则跳过（无法计算距离），不中断本地搜索流程。
     // ========================================================
-    void search_layer_query(const std::vector<T> &query_vector, int level, int ef, Payload<T> &payload)
+    void search_layer_query(const std::vector<T> &query_vector, int level, int ef, Payload<DistT> &payload)
     {
         // query 与 add_vector 不会并发执行（架构约束），无需加锁保护内存访问
         VisitedList *vl = visited_pool_->get_free_list();
         unsigned short *visited_array = vl->visited_array;
         unsigned short visited_tag = vl->cur_tag;
 
-        // 判断 compact 状态：若 local_vids_ 非空，说明已执行 compact，邻居列表中 < 0 为远程编码
-        bool is_compacted = !local_vids_.empty();
+        // 判断 compact 状态：forward/shard 模式下 local_vids_ 非空 => 已 compact，邻居负数 = 远程 vid。
+        // global-pull 模式下 local_vids_ 也非空，但未 compact，邻居全部为正数 internal_id => is_compacted=false。
+        bool is_compacted = !local_vids_.empty() && !is_global_pull_mode_;
+
+        // global-pull 模式：单次查询内的向量拉取缓存（vid -> vector data）。
+        // 多层搜索中同一 vid 可能被多次访问；缓存避免重复 RPC。
+        std::unordered_map<int, std::vector<T>> pull_cache;
+        uint64_t pull_cnt = 0;
+        uint64_t pull_bytes = 0;
+
+        // 统一距离计算入口：global-pull 模式下若目标 vid 数据非本地则通过 pull_fetcher_ 拉取。
+        // 返回 (distance, ok)；ok=false 表示拉取失败（视为不可达）。
+        auto compute_dist = [&](int internal_id) -> std::pair<DistT, bool> {
+            int ext_vid = get_external_label(internal_id);
+            if (is_global_pull_mode_ && !local_vids_.count(ext_vid))
+            {
+                auto it = pull_cache.find(ext_vid);
+                if (it == pull_cache.end())
+                {
+                    if (!pull_fetcher_)
+                        return {std::numeric_limits<DistT>::max(), false};
+                    std::vector<T> pulled = pull_fetcher_(ext_vid);
+                    if ((int)pulled.size() != dim)
+                        return {std::numeric_limits<DistT>::max(), false};
+                    pull_cnt += 1;
+                    pull_bytes += (uint64_t)dim * sizeof(T) * 8;
+                    it = pull_cache.emplace(ext_vid, std::move(pulled)).first;
+                }
+                DistT d = dist_func_(query_vector.data(), (const void *)it->second.data(), dist_func_param_);
+                return {d, true};
+            }
+            DistT d = dist_func_(query_vector.data(), get_data_by_id(internal_id), dist_func_param_);
+            return {d, true};
+        };
 
         // 远程 vid 的访问判重集合（compact 模式下使用，因为远程 vid 无法标记到 visited_array 中）
         std::unordered_set<int> remote_visited_set;
@@ -921,10 +963,12 @@ public:
             visited_array[riid] = visited_tag;
             payload.visited_vids.push_back(rvid);
 
-            T dist = dist_func_(query_vector.data(), get_data_by_id(riid), dist_func_param_);
+            auto [dist, ok] = compute_dist(riid);
+            if (!ok)
+                continue;
             payload.distance_cnt++;
 
-            if ((int)payload.results.size() < ef || dist < (payload.results.empty() ? std::numeric_limits<T>::max() : payload.results.top().first))
+            if ((int)payload.results.size() < ef || dist < (payload.results.empty() ? std::numeric_limits<DistT>::max() : payload.results.top().first))
             {
                 payload.candidates.push({dist, rvid});
                 payload.results.push({dist, rvid});
@@ -966,17 +1010,20 @@ public:
 
             if (visited_array[ep_iid] != visited_tag)
             {
-                T dist = dist_func_(query_vector.data(), get_data_by_id(ep_iid), dist_func_param_);
-                payload.distance_cnt++;
-                visited_array[ep_iid] = visited_tag;
-                payload.visited_vids.push_back(ep_vid);
-                payload.candidates.push({dist, ep_vid});
-                payload.results.push({dist, ep_vid});
+                auto [dist, ok] = compute_dist(ep_iid);
+                if (ok)
+                {
+                    payload.distance_cnt++;
+                    visited_array[ep_iid] = visited_tag;
+                    payload.visited_vids.push_back(ep_vid);
+                    payload.candidates.push({dist, ep_vid});
+                    payload.results.push({dist, ep_vid});
+                }
             }
         }
 
         // ---- 搜索主循环：全程以 (dist, vid) 为单位，像在一张完整图上搜索 ----
-        T lower_bound = payload.results.empty() ? std::numeric_limits<T>::max() : payload.results.top().first;
+        DistT lower_bound = payload.results.empty() ? std::numeric_limits<DistT>::max() : payload.results.top().first;
 
         while (!payload.candidates.empty())
         {
@@ -1060,7 +1107,9 @@ public:
                 int neighbor_vid = get_external_label(neighbor_id);
                 payload.visited_vids.push_back(neighbor_vid);
 
-                T neighbor_dist = dist_func_(query_vector.data(), get_data_by_id(neighbor_id), dist_func_param_);
+                auto [neighbor_dist, nd_ok] = compute_dist(neighbor_id);
+                if (!nd_ok)
+                    continue;
                 payload.distance_cnt++;
 
                 if ((int)payload.results.size() < ef || neighbor_dist < lower_bound)
@@ -1092,6 +1141,14 @@ public:
         payload.visited_vids.clear();
         payload.pending_vids.clear();
         payload.continue_search = false;
+
+        // global-pull 模式：累计本层远程拉取统计到 payload（与 remote_transfer_cnt 区分）
+        if (pull_cnt > 0)
+        {
+            payload.pull_cnt += (int)pull_cnt;
+            payload.pull_data += pull_bytes;
+        }
+
         visited_pool_->release_list(vl);
     }
 
@@ -1099,7 +1156,7 @@ public:
     // K 近邻查询入口（参考 hnswlib searchKnn）
     // 从最高层开始逐层搜索，支持分布式续搜和跨节点 transfer 机制。
     // ========================================================
-    std::vector<int> query(const std::vector<T> &query_vector, Payload<T> &payload, int k)
+    std::vector<int> query(const std::vector<T> &query_vector, Payload<DistT> &payload, int k)
     {
         if (cur_element_count_.load() == 0)
             return {};

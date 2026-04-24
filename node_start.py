@@ -23,6 +23,8 @@ _DTYPE_CLASS_MAP = {
     "double": ("PayloadDouble", "HNSWGraphDouble", "ClusterDouble"),
     "int32":  ("PayloadInt32",  "HNSWGraphInt32",  "ClusterInt32"),
     "uint32": ("PayloadUInt32", "HNSWGraphUInt32", "ClusterUInt32"),
+    # uint8 存储 + int32 距离：复用 PayloadInt32
+    "uint8":  ("PayloadInt32",  "HNSWGraphUInt8",  "ClusterUInt8"),
 }
 
 # 提前解析 --dtype 参数
@@ -56,6 +58,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--distributed", default=False, action='store_true', help="Enable distributed mode")
     parser.add_argument("--shard", default=False, action='store_true', help="Enable shard mode (independent graphs per node)")
+    parser.add_argument("--global-pull", dest="is_global_pull", default=False, action='store_true', help="Enable global-pull mode (full graph skeleton per node, remote vector fetch on demand)")
     # 通信模式和 RDMA 参数
     parser.add_argument("--comm_mode", type=str, default="tcp", choices=["tcp", "rdma"], help="Communication mode: tcp or rdma")
     parser.add_argument("--ib_dev", type=str, default="", help="RDMA IB device name (auto-detect if empty)")
@@ -92,6 +95,7 @@ if __name__ == "__main__":
     cluster = Cluster(hnsw, node_num, comm_mode=args.comm_mode, ib_dev=args.ib_dev, ib_port=args.ib_port, gid_index=args.gid_index)
     cluster.is_distributed = args.distributed
     cluster.is_shard = args.shard
+    cluster.is_global_pull = args.is_global_pull
 
     # Configure all nodes
     # 关键逻辑：每个机器上的 Cluster 对象都必须包含所有节点的信息
