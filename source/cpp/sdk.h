@@ -293,7 +293,8 @@ public:
             buf.write_val(query_id);
             buf.write_val(k);
             buf.write_vec(query_vector);
-            serialize_payload(buf, payload);
+            // 客户端无本地 HNSWGraph，传 nullptr（堆本就为空，serialize 跳过转换）
+            serialize_payload(buf, payload, (const HNSWGraph<T>*)nullptr);
 
             uint64_t msg_size = buf.data.size();
             transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
@@ -322,11 +323,12 @@ public:
             int result_cnt = resp_buf.read_val<int>();
             std::vector<int> results;
             for (int i = 0; i < result_cnt; i++) {
-                resp_buf.read_val<T>(); // dist
+                resp_buf.read_val<DistT>(); // dist (服务端按 DistT 写入，uint8 存储下为 int32)
                 results.push_back(resp_buf.read_val<int>());
             }
             Payload<DistT> payload;
-            deserialize_payload(resp_buf, payload);
+            // 客户端收回的堆项被置为 -(vid+1) 编码；客户端不再搜索，仅保留统计信息
+            deserialize_payload(resp_buf, payload, (const HNSWGraph<T>*)nullptr);
 
             return {query_id, std::move(results), std::move(payload)};
         } catch (...) {

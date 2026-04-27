@@ -2,6 +2,7 @@ import os
 import time
 import argparse
 import sys
+import json
 import signal
 
 sys.setrecursionlimit(5000)
@@ -12,6 +13,13 @@ sys.stderr.reconfigure(line_buffering=True) if hasattr(sys.stderr, 'reconfigure'
 
 project_root = os.path.abspath(os.path.dirname(__file__))
 build_dir = os.path.join(project_root, 'build')
+
+# 从 config.json 读取部署参数（与 main.py 共用同一文件）
+_CONFIG_PATH = os.path.join(project_root, "config.json")
+with open(_CONFIG_PATH, "r") as _f:
+    _CLUSTER_CONFIG = json.load(_f)
+# IP -> port 映射（任一参与过集群的节点都必须在 config.json 的 nodes 列表里）
+_IP_TO_PORT = {nd["ip"]: int(nd["port"]) for nd in _CLUSTER_CONFIG["nodes"]}
 
 if os.path.isdir(build_dir):
     os.environ['PYTHONPATH'] = f"{build_dir}:{os.environ.get('PYTHONPATH','')}"
@@ -64,6 +72,7 @@ if __name__ == "__main__":
     parser.add_argument("--ib_dev", type=str, default="", help="RDMA IB device name (auto-detect if empty)")
     parser.add_argument("--ib_port", type=int, default=1, help="RDMA IB port number")
     parser.add_argument("--gid_index", type=int, default=-1, help="RDMA GID index (-1 for auto-detect)")
+    parser.add_argument("--max_track_num", type=int, default=10, help="Sliding window size for backtrack detection (0 disables)")
     parser.add_argument("--num_threads", type=int, default=32, help="Message thread pool size (should match query threads)")
 
 
@@ -92,7 +101,7 @@ if __name__ == "__main__":
     hnsw = HNSWGraph(dim=128, m=args.m, ef_construction=args.ef_construction, 
                      ef_search=args.ef_search, limited_level=args.limited_level)
 
-    cluster = Cluster(hnsw, node_num, comm_mode=args.comm_mode, ib_dev=args.ib_dev, ib_port=args.ib_port, gid_index=args.gid_index)
+    cluster = Cluster(hnsw, node_num, comm_mode=args.comm_mode, ib_dev=args.ib_dev, ib_port=args.ib_port, gid_index=args.gid_index, max_track_num=args.max_track_num)
     cluster.is_distributed = args.distributed
     cluster.is_shard = args.shard
     cluster.is_global_pull = args.is_global_pull
@@ -103,7 +112,9 @@ if __name__ == "__main__":
     # 其他节点都被标记为远程节点 (is_remote=True)，用于跨节点通信
     for i, ip in enumerate(node_ips):
         is_remote = (i != node_id)
-        port = 19000 + i
+        if ip not in _IP_TO_PORT:
+            raise ValueError(f"[Node {node_id}] IP {ip} 未在 config.json 的 nodes 中登记")
+        port = _IP_TO_PORT[ip]
         cluster.set_node_info(i, ip, port, is_remote)
         print(f"[Node {node_id}] Configured Node {i}: IP={ip}, Port={port}, Remote={is_remote}")
 

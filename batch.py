@@ -52,7 +52,11 @@ PARAM_GRID = {
     "layer":              [True, False],
     "comm_mode":          ["tcp"],  # 通信模式："tcp" 或 "rdma"
     "num_cpu":            [0],       # CPU 核心数
+    "dtype":              ["float", "uint8"],  # 向量元素类型；uint8 仅适用于 .u8bin 数据集
 }
+
+# uint8 模式下 data_name 追加的后缀，保证 graph/results 文件名与 float 不冲突
+DTYPE_NAME_SUFFIX = {"uint8": "-u8"}
 
 # 等待 graph 文件的最长秒数 (0 = 无限等待)
 GRAPH_WAIT_TIMEOUT = 0
@@ -90,9 +94,15 @@ def run_worker(cmd, task_id, total_tasks, description):
     print(f"[{task_id}/{total_tasks}] FINISHED in {time.time() - start_time:.2f}s")
 
 
+def effective_data_name(dataset, params):
+    """根据 dtype 给 data_name 加后缀，避免 float/uint8 结果互相覆盖。
+    main.py 用 --data_name 决定 graph 与 results 文件名，所以后缀加在这里即可。"""
+    return dataset['name'] + DTYPE_NAME_SUFFIX.get(params.get('dtype'), "")
+
+
 def build_command(dataset, params, skip_prepare=False, no_cleanup=False):
     """构建命令行参数"""
-    data_name = dataset['name']
+    data_name = effective_data_name(dataset, params)
     data_path = os.path.join(DATASET_ROOT, dataset['base'])
     query_path = os.path.join(DATASET_ROOT, dataset['query'])
     groundtruth_path = os.path.join(DATASET_ROOT, dataset['groundtruth'])
@@ -127,6 +137,8 @@ def build_command(dataset, params, skip_prepare=False, no_cleanup=False):
         cmd += ['--comm_mode', str(params['comm_mode'])]
     if params.get('num_cpu'):
         cmd += ['--num_cpu', str(params['num_cpu'])]
+    if params.get('dtype'):
+        cmd += ['--dtype', str(params['dtype'])]
     cmd += ['--num_runs', str(NUM_RUNS)]
     if skip_prepare:
         cmd.append('--skip_prepare')
@@ -136,32 +148,34 @@ def build_command(dataset, params, skip_prepare=False, no_cleanup=False):
     return cmd
 
 
-def get_graph_path(data_name, params):
-    """生成图文件路径"""
+def get_graph_path(dataset, params):
+    """生成图文件路径（与 main.py save_graph 对齐）"""
+    data_name = effective_data_name(dataset, params)
     filename = f"hnsw-{data_name}-m{params['m']}-efc{params['ef_construction']}-ll{params['limited_level']}.json"
     return os.path.join(".", "save", filename)
 
 
-def get_result_path(dataset_name, params):
+def get_result_path(dataset, params):
     """生成结果文件路径（与 main.py 的 save_results 对齐）"""
+    data_name = effective_data_name(dataset, params)
     distributed_suffix = "-distributed" if params.get('distributed') else ""
     cpus = params.get('num_cpu', 0)
     cpu_suffix = f"-cpus{cpus}" if params.get('distributed') and cpus != 0 else ""
     qt_suffix = f"-query_threads{params['num_query_threads']}"
 
     if params.get('shard'):
-        filename = (f"results-{dataset_name}-m{params['m']}-efc{params['ef_construction']}-"
+        filename = (f"results-{data_name}-m{params['m']}-efc{params['ef_construction']}-"
                     f"efs{params['ef_search']}-ll{params['limited_level']}-"
                     f"node{params['node_num']}-"
                     f"threads{params['num_threads']}{qt_suffix}{distributed_suffix}{cpu_suffix}-shard.json")
     elif params.get('global_pull'):
-        filename = (f"results-{dataset_name}-m{params['m']}-efc{params['ef_construction']}-"
+        filename = (f"results-{data_name}-m{params['m']}-efc{params['ef_construction']}-"
                     f"efs{params['ef_search']}-ll{params['limited_level']}-"
                     f"node{params['node_num']}-{params['partition_mode']}-rep{params['replication']}-"
                     f"threads{params['num_threads']}{qt_suffix}{distributed_suffix}{cpu_suffix}-global_pull.json")
     else:
         layer_suffix = "-layer" if params.get('layer') else ""
-        filename = (f"results-{dataset_name}-m{params['m']}-efc{params['ef_construction']}-"
+        filename = (f"results-{data_name}-m{params['m']}-efc{params['ef_construction']}-"
                     f"efs{params['ef_search']}-ll{params['limited_level']}-"
                     f"node{params['node_num']}-{params['partition_mode']}-rep{params['replication']}-"
                     f"threads{params['num_threads']}{qt_suffix}{distributed_suffix}{cpu_suffix}{layer_suffix}.json")
@@ -170,7 +184,8 @@ def get_result_path(dataset_name, params):
 
 
 def get_group_key(dataset_name, params):
-    """生成分组键：相同 (dataset, m, efc, ll, node_num, partition_mode, replication, layer, ...) 的任务共享服务端"""
+    """生成分组键：相同 (dataset, m, efc, ll, node_num, partition_mode, replication, layer, dtype, ...) 的任务共享服务端。
+    dtype 必须进入分组键：不同 dtype 的 HNSW 类不同，graph 不可复用。"""
     return (
         dataset_name,
         params['m'],
@@ -187,6 +202,7 @@ def get_group_key(dataset_name, params):
         params.get('num_threads', 8),
         params.get('num_query_threads', 40),
         params.get('num_cpu', 0),
+        params.get('dtype', 'float'),
     )
 
 
@@ -222,7 +238,7 @@ def run_batch():
             if params.get('global_pull') and (params.get('replication', 0) != 0 or params.get('layer')):
                 continue
 
-            if batch_args.skip and os.path.exists(get_result_path(dataset['name'], params)):
+            if batch_args.skip and os.path.exists(get_result_path(dataset, params)):
                 skipped += 1
                 continue
 
@@ -260,8 +276,9 @@ def run_batch():
 
             # 组内首个实际运行的任务处理 graph 加载/构建
             if is_first:
-                graph_path = get_graph_path(dataset['name'], params)
-                graph_key = (dataset['name'], params['m'], params['ef_construction'], params['limited_level'])
+                graph_path = get_graph_path(dataset, params)
+                graph_key = (dataset['name'], params.get('dtype', 'float'),
+                             params['m'], params['ef_construction'], params['limited_level'])
                 if os.path.exists(graph_path) or graph_key in built_graphs:
                     cmd += ["--graph_path", graph_path]
                 else:
@@ -282,7 +299,7 @@ def run_batch():
             if not is_last:
                 flags.append("no_cleanup")
             flag_str = f" [{','.join(flags)}]" if flags else ""
-            description = (f"m={params['m']} {mode_str} {layer_str} "
+            description = (f"dtype={params.get('dtype', 'float')} m={params['m']} {mode_str} {layer_str} "
                            f"efs={efs}{flag_str}")
 
             run_worker(cmd, task_idx, total_runs, description)
@@ -295,7 +312,7 @@ def run_batch():
     all_missing = []
     for gk, items in groups.items():
         for dataset, params in items:
-            result_path = get_result_path(dataset['name'], params)
+            result_path = get_result_path(dataset, params)
             if not os.path.exists(result_path):
                 print(f"MISSING: {result_path}")
                 all_missing.append(result_path)

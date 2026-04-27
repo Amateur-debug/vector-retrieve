@@ -10,7 +10,12 @@ import multiprocessing as mp
 from collections import defaultdict
 
 import sys
-sys.setrecursionlimit(5000) 
+sys.setrecursionlimit(5000)
+
+# 集群部署参数统一从 config.json 读取；新环境只需编辑 config.json（ALL_IPS、HOST_IP、BASE_PORT、USER_NAME）
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+with open(_CONFIG_PATH, "r") as _f:
+    _CLUSTER_CONFIG = json.load(_f)
 
 class QueryStallError(Exception):
     """查询进度停滞异常：当进度条超过指定时间没有变化时抛出"""
@@ -52,6 +57,12 @@ DATASET_PRESETS = {
         "query_path":       os.path.join(_dataset_root, "deep100m/queries.fbin"),
         "groundtruth_path": os.path.join(_dataset_root, "deep100m/gt_100.bin"),
         "dtype":            "float",
+    },
+    "uint8_test": {
+        "data_path":        os.path.join(_dataset_root, "uint8_test/base.u8bin"),
+        "query_path":       os.path.join(_dataset_root, "uint8_test/queries.u8bin"),
+        "groundtruth_path": os.path.join(_dataset_root, "uint8_test/gt_100.bin"),
+        "dtype":            "uint8",
     },
 }
 
@@ -197,12 +208,77 @@ class VectorRetrieveRunner:
         self.num_threads = args.num_threads  # 服务端每 node 搜索线程数（msg_pool_size）
         self.num_cpu = args.num_cpu
 
-        self.user_name = r"CONNECT\xchen740"
-        self.default_ips = "192.168.200.204,192.168.200.205,192.168.200.206,192.168.200.207,192.168.200.208"
-        self.host_ip = "192.168.200.206"
-        self.host_id = 2
-        self.node_ips = self.default_ips.split(',')
-        self.node_num = len(self.node_ips) if self.args.distributed else self.args.node_num
+        # 集群部署参数统一从 config.json 读取；新环境只需编辑 config.json。
+        # 约定：host 大括号描述本机（运行 main.py 的机器）；nodes 为集群节点有序列表，
+        # 节点按任意顺序排列均可。若 host 也参与集群，其信息须同时出现在 nodes 中
+        # （位置任意，子集选取逻辑会保证包含 host）；若 host 不在 nodes 中，则 main.py
+        # 仅作协调器，无本地 worker。
+        self.host_info = _CLUSTER_CONFIG["host"]
+        self.all_nodes = list(_CLUSTER_CONFIG["nodes"])
+        for key in ("ip", "port", "user_name"):
+            if key not in self.host_info:
+                raise ValueError(f"config.json: host 缺少字段 '{key}'")
+        for idx, nd in enumerate(self.all_nodes):
+            for key in ("ip", "port", "user_name"):
+                if key not in nd:
+                    raise ValueError(f"config.json: nodes[{idx}] 缺少字段 '{key}'")
+
+        self.host_ip = self.host_info["ip"]
+        self.host_port = int(self.host_info["port"])
+        self.host_user_name = self.host_info["user_name"]
+
+        # 定位 host 在 nodes 列表中的位置（未找到则 -1，代表协调器模式）
+        self._host_index_in_nodes = -1
+        for idx, nd in enumerate(self.all_nodes):
+            if nd["ip"] == self.host_ip and int(nd["port"]) == self.host_port:
+                self._host_index_in_nodes = idx
+                break
+        self.host_is_node = (self._host_index_in_nodes >= 0)
+
+        # 兼容旧字段
+        self.user_name = self.host_user_name
+
+        # 选择实际使用的节点子集：按 nodes 顺序取前 node_num 个；
+        # 若 host 在 nodes 中，子集必须包含 host（host 不在前 node_num 时，替换末位为 host）。
+        if self.args.distributed:
+            requested = self.args.node_num if self.args.node_num and self.args.node_num > 0 else len(self.all_nodes)
+            requested = min(requested, len(self.all_nodes))
+            if requested <= 0:
+                raise ValueError("config.json: nodes 为空，分布式模式无法启动")
+
+            if self.host_is_node:
+                host_entry = self.all_nodes[self._host_index_in_nodes]
+                if requested <= 1:
+                    selected = [host_entry]
+                elif self._host_index_in_nodes < requested:
+                    # host 已在前 requested 个，直接取前缀
+                    selected = list(self.all_nodes[:requested])
+                else:
+                    # host 在后段，用前 requested-1 个 + host 占最后一个槽
+                    selected = list(self.all_nodes[:requested - 1]) + [host_entry]
+            else:
+                # 协调器模式：host 不在集群中，按前缀选取
+                selected = list(self.all_nodes[:requested])
+
+            self.node_ips = [nd["ip"] for nd in selected]
+            self.node_ports = [int(nd["port"]) for nd in selected]
+            self.node_user_names = [nd["user_name"] for nd in selected]
+            self.node_num = len(self.node_ips)
+            if self.host_is_node:
+                # host_id 为 host 在子集中的实际位置（不一定是 0）
+                self.host_id = next(
+                    i for i, nd in enumerate(selected)
+                    if nd["ip"] == self.host_ip and int(nd["port"]) == self.host_port
+                )
+            else:
+                self.host_id = -1  # 协调器模式：无本地 worker
+        else:
+            # 单机多进程模拟：不使用真实 IP 列表，保持原行为
+            self.node_ips = [self.host_ip]
+            self.node_ports = [self.host_port]
+            self.node_user_names = [self.host_user_name]
+            self.node_num = self.args.node_num
+            self.host_id = 0
 
         self.data_name = args.data_name
         self.data_path = args.data_path
@@ -251,6 +327,9 @@ class VectorRetrieveRunner:
         self.ib_port = getattr(args, 'ib_port', 1)
         self.gid_index = getattr(args, 'gid_index', -1)
 
+        # 折返检测窗口大小（0 关闭）
+        self.max_track_num = getattr(args, 'max_track_num', 10)
+
         self.cluster = None
         self.hnsw = None
         self.sdk_config = None
@@ -294,7 +373,6 @@ class VectorRetrieveRunner:
         for i in range(len(self.node_ips)):
             ip = self.node_ips[i]
             if ip == self.host_ip:
-                self.host_id = i
                 print(f"Host machine identified as node {self.host_id} with IP {self.host_ip}.")
                 # We already attempted local cleanup; continue to next
                 continue
@@ -305,8 +383,8 @@ class VectorRetrieveRunner:
                 f"pids2=$(pgrep -f node_start.py || true); if [ -n \"$pids2\" ]; then echo \"Force killing PIDs: $pids2 on {ip}\"; kill -KILL $pids2 2>/dev/null || true; fi; fi"
             )
             cmd = [
-                "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                f"{self.user_name}@{ip}",
+                "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30",
+                f"{self.node_user_names[i]}@{ip}",
                 remote_cmd
             ]
             print(f"  Cleaning node {i} on {ip}...")
@@ -315,7 +393,7 @@ class VectorRetrieveRunner:
         # Wait for cleanup commands to finish (with timeout) and ensure remote processes are killed
         for proc, ip in cleanup_procs:
             try:
-                stdout, stderr = proc.communicate(timeout=30)
+                stdout, stderr = proc.communicate(timeout=120)
                 if stdout:
                     print(f"  [{ip}] {stdout.decode().strip()}")
                 if stderr:
@@ -329,10 +407,10 @@ class VectorRetrieveRunner:
         # Launch all workers (including local host machine)
         current_dir = os.getcwd()
         worker_processes = []
+        node_ips_str = ','.join(self.node_ips)
         for i in range(len(self.node_ips)):
             ip = self.node_ips[i]
             if ip == self.host_ip:
-                self.host_id = i
                 print(f"Host machine identified as node {self.host_id} with IP {self.host_ip}.")
                 # Launch local worker
                 print(f"Launching worker node {i} on localhost...")
@@ -346,7 +424,7 @@ class VectorRetrieveRunner:
                 local_cmd = [
                     "python", "-u", "node_start.py",
                     "--node_id", str(i),
-                    "--node_ips", self.default_ips,
+                    "--node_ips", node_ips_str,
                     "--dtype", _active_dtype,
                     "--m", str(self.args.m),
                     "--ef_construction", str(self.args.ef_construction),
@@ -354,6 +432,7 @@ class VectorRetrieveRunner:
                     "--limited_level", str(self.args.limited_level),
                     "--comm_mode", self.comm_mode,
                     "--num_threads", str(self.num_threads),
+                    "--max_track_num", str(self.max_track_num),
                 ]
                 if self.num_cpu and self.num_cpu > 0:
                     local_cmd = ["taskset", "-c", f"0-{self.num_cpu - 1}"] + local_cmd
@@ -370,7 +449,7 @@ class VectorRetrieveRunner:
                 worker_processes.append(proc)
             else:
                 # Launch remote worker
-                print(f"Launching worker node {i} on {self.user_name}@{ip}...")
+                print(f"Launching worker node {i} on {self.node_user_names[i]}@{ip}...")
                 log_file = f"{current_dir}/worker_{i}.log"
 
                 distributed_flag = "--distributed" if self.args.distributed else ""
@@ -383,17 +462,18 @@ class VectorRetrieveRunner:
                     f"cd {current_dir} && "
                     f"conda activate vector-retrieve && "
                     f"nohup {cpu_prefix}python -u node_start.py "
-                    f"--node_id {i} --node_ips {self.default_ips} "
+                    f"--node_id {i} --node_ips {node_ips_str} "
                     f"--dtype {_active_dtype} "
                     f"--m {self.args.m} --ef_construction {self.args.ef_construction} "
                     f"--ef_search {self.ef_search} --limited_level {self.args.limited_level} "
                     f"--comm_mode {self.comm_mode} "
                     f"--num_threads {self.num_threads} "
+                    f"--max_track_num {self.max_track_num} "
                     f"{distributed_flag} {shard_flag} {global_pull_flag} "
                     f"> {log_file} 2>&1 &"
                 )
 
-                cmd = ["ssh", f"{self.user_name}@{ip}", remote_cmd]
+                cmd = ["ssh", f"{self.node_user_names[i]}@{ip}", remote_cmd]
                 print(f"  CMD: {' '.join(cmd)}")
 
                 # Launch worker process in background (no output redirection needed, handled by nohup)
@@ -402,7 +482,7 @@ class VectorRetrieveRunner:
 
         # 等待所有 worker 节点真正启动并可连接
         print(f"Waiting for {len(worker_processes)} worker nodes to start (including local node {self.host_id})...")
-        max_wait = 60  # 最长等待 60 秒
+        max_wait = 300  # 最长等待 300 秒
         check_interval = 2
         waited = 0
         all_ready = False
@@ -411,7 +491,7 @@ class VectorRetrieveRunner:
             waited += check_interval
             all_ready = True
             for i in range(len(self.node_ips)):
-                port = 19000 + i
+                port = self.node_ports[i]
                 connect_ip = "127.0.0.1" if i == self.host_id else self.node_ips[i]
                 try:
                     import socket
@@ -520,7 +600,7 @@ class VectorRetrieveRunner:
         # 通过 SDK 获取每个节点的信息
         for i, ip in enumerate(self.node_ips):
             try:
-                port = 19000 + i
+                port = self.node_ports[i]
                 # 对于本地节点使用 127.0.0.1
                 connect_ip = "127.0.0.1" if i == self.host_id else ip
                 client = ClusterSDKClient(ip=connect_ip, port=port, comm_mode=self.comm_mode)
@@ -550,7 +630,7 @@ class VectorRetrieveRunner:
                 self.hnsw = None
                 self.sdk_config = {
                     'ip': '127.0.0.1',
-                    'port': 19000 + self.host_id
+                    'port': self.node_ports[self.host_id]
                 }
             return
 
@@ -562,10 +642,10 @@ class VectorRetrieveRunner:
             self.hnsw = None
 
             # 分布式模式：如有 graph_path 则直接通过 SDK 加载
-            print(f"Configuring SDK for local node {self.host_id} ({self.node_ips[self.host_id]}:{19000 + self.host_id}) for building...")
+            print(f"Configuring SDK for local node {self.host_id} ({self.node_ips[self.host_id]}:{self.node_ports[self.host_id]}) for building...")
             self.sdk_config = {
                 'ip': '127.0.0.1',
-                'port': 19000 + self.host_id
+                'port': self.node_ports[self.host_id]
             }
 
             if self.graph_path is not None and os.path.exists(self.graph_path) and not self.args.shard:
@@ -636,7 +716,7 @@ class VectorRetrieveRunner:
             self.hnsw = HNSWGraph.load(self.graph_path)
             self.hnsw.ef_search = self.ef_search
             print("Partitioning data across cluster nodes...")
-            self.cluster = Cluster(self.hnsw, self.node_num, comm_mode=self.comm_mode, ib_dev=self.ib_dev, ib_port=self.ib_port, gid_index=self.gid_index)
+            self.cluster = Cluster(self.hnsw, self.node_num, comm_mode=self.comm_mode, ib_dev=self.ib_dev, ib_port=self.ib_port, gid_index=self.gid_index, max_track_num=self.max_track_num)
             if self.args.is_global_pull:
                 self.cluster.is_global_pull = True
 
@@ -657,7 +737,7 @@ class VectorRetrieveRunner:
             num_elements = max_num_elements
 
             self.hnsw = HNSWGraph(dim=dim, m=self.m, ef_construction=self.ef_construction, ef_search=self.ef_search, limited_level=self.limited_level, max_elements=num_elements)
-            self.cluster = Cluster(self.hnsw, self.node_num, comm_mode=self.comm_mode, ib_dev=self.ib_dev, ib_port=self.ib_port, gid_index=self.gid_index)
+            self.cluster = Cluster(self.hnsw, self.node_num, comm_mode=self.comm_mode, ib_dev=self.ib_dev, ib_port=self.ib_port, gid_index=self.gid_index, max_track_num=self.max_track_num)
             if self.args.is_global_pull:
                 self.cluster.is_global_pull = True
 
@@ -858,7 +938,7 @@ class VectorRetrieveRunner:
             if self.sdk_config is None:
                 self.sdk_config = {
                     'ip': "127.0.0.1",
-                    'port': 19000 + self.host_id
+                    'port': self.node_ports[self.host_id]
                 }
             print("Distributed query entry nodes are initialized by SDK from cluster info.")
 
@@ -868,7 +948,7 @@ class VectorRetrieveRunner:
         def query(worker_id, stats_list, progress_counter=None):
             # 查询结果暂存，召回率等 Python 密集计算推迟到查询循环外，减少 GIL 竞争
             local_results = {}          # i -> list[int]
-            local_payloads = {}         # i -> (remote_transfer_cnt, remote_transfer_data, distance_cnt, pull_cnt, pull_data)
+            local_payloads = {}         # i -> (remote_transfer_cnt, remote_transfer_data, distance_cnt, pull_cnt, pull_data, backtrack_cnt)
 
             # 每个进程创建独立的 SDK 客户端实例。
             thread_sdk_client = None
@@ -910,7 +990,7 @@ class VectorRetrieveRunner:
                             ret_qid, results, ret_payload = thread_sdk_client.query_recv()
                             orig_idx, _ = pending.pop(ret_qid)
                             local_results[orig_idx] = results
-                            local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data)
+                            local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data, ret_payload.backtrack_cnt)
                             received += 1
                             local_count += 1
                             if progress_counter is not None and local_count % 10 == 0:
@@ -922,7 +1002,7 @@ class VectorRetrieveRunner:
                         ret_qid, results, ret_payload = thread_sdk_client.query_recv()
                         orig_idx, _ = pending.pop(ret_qid)
                         local_results[orig_idx] = results
-                        local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt)
+                        local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data, ret_payload.backtrack_cnt)
                         received += 1
                         local_count += 1
                         if progress_counter is not None and local_count % 10 == 0:
@@ -937,7 +1017,7 @@ class VectorRetrieveRunner:
                             results = self.cluster.nodes[self.host_id].query(i + worker_id * self.num_queries, queries[i], payload, k=self.k)
 
                         local_results[i] = results
-                        local_payloads[i] = (payload.remote_transfer_cnt, payload.remote_transfer_data, payload.distance_cnt, payload.pull_cnt, payload.pull_data)
+                        local_payloads[i] = (payload.remote_transfer_cnt, payload.remote_transfer_data, payload.distance_cnt, payload.pull_cnt, payload.pull_data, payload.backtrack_cnt)
 
                         local_count += 1
                         if progress_counter is not None:
@@ -965,6 +1045,7 @@ class VectorRetrieveRunner:
             local_distance_cnt = {}
             local_pull_cnt = {}
             local_pull_data = {}
+            local_backtrack_cnt = {}
 
             for i, results in local_results.items():
                 results_set = set(results)
@@ -972,12 +1053,13 @@ class VectorRetrieveRunner:
                 correct = len(results_set.intersection(true_ids))
                 local_recall[i] = correct / self.k
 
-                rtc, rtl, dc, pc, pd = local_payloads[i]
+                rtc, rtl, dc, pc, pd, bt = local_payloads[i]
                 local_remote_transfer_cnt[i] = rtc
                 local_remote_transfer_data[i] = rtl
                 local_distance_cnt[i] = dc
                 local_pull_cnt[i] = pc
                 local_pull_data[i] = pd
+                local_backtrack_cnt[i] = bt
 
             stats_list[worker_id] = {
                 "recall": local_recall,
@@ -986,6 +1068,7 @@ class VectorRetrieveRunner:
                 "distance_cnt": local_distance_cnt,
                 "pull_cnt": local_pull_cnt,
                 "pull_data": local_pull_data,
+                "backtrack_cnt": local_backtrack_cnt,
             }
 
         total_query_start_time = time.time()
@@ -1005,7 +1088,8 @@ class VectorRetrieveRunner:
             def query_worker_process(worker_id, num_queries, queries_np, groundtruth, k,
                                      distributed, shard, sdk_config, comm_mode,
                                      host_id, cluster_ref, progress_val, result_q,
-                                     build_dir_for_subprocess):
+                                     build_dir_for_subprocess,
+                                     sdk_cls_name, payload_cls_name):
                 """子进程入口：独立创建 SDK 客户端，执行查询，通过 Queue 返回结果"""
                 import random
                 import sys
@@ -1017,8 +1101,9 @@ class VectorRetrieveRunner:
 
                 thread_sdk_client = None
                 if distributed:
-                    from vector_retrieve import ClusterSDKClientFloat as ClusterSDKClient
-                    from vector_retrieve import PayloadFloat as Payload
+                    import vector_retrieve as _vr_sub
+                    ClusterSDKClient = getattr(_vr_sub, sdk_cls_name)
+                    Payload = getattr(_vr_sub, payload_cls_name)
                     thread_sdk_client = ClusterSDKClient(
                         ip=sdk_config['ip'],
                         port=sdk_config['port'],
@@ -1050,7 +1135,7 @@ class VectorRetrieveRunner:
                                 ret_qid, results, ret_payload = thread_sdk_client.query_recv()
                                 orig_idx = pending.pop(ret_qid)
                                 local_results[orig_idx] = results
-                                local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data)
+                                local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data, ret_payload.backtrack_cnt)
                                 received += 1
                                 local_count += 1
                                 if local_count % 10 == 0:
@@ -1062,7 +1147,7 @@ class VectorRetrieveRunner:
                             ret_qid, results, ret_payload = thread_sdk_client.query_recv()
                             orig_idx = pending.pop(ret_qid)
                             local_results[orig_idx] = results
-                            local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data)
+                            local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data, ret_payload.backtrack_cnt)
                             received += 1
                             local_count += 1
                             if local_count % 10 == 0:
@@ -1092,6 +1177,7 @@ class VectorRetrieveRunner:
                 local_distance_cnt = {}
                 local_pull_cnt = {}
                 local_pull_data = {}
+                local_backtrack_cnt = {}
 
                 for i, results in local_results.items():
                     results_set = set(results)
@@ -1099,12 +1185,13 @@ class VectorRetrieveRunner:
                     correct = len(results_set.intersection(true_ids))
                     local_recall[i] = correct / k
 
-                    rtc, rtl, dc, pc, pd = local_payloads[i]
+                    rtc, rtl, dc, pc, pd, bt = local_payloads[i]
                     local_remote_transfer_cnt[i] = rtc
                     local_remote_transfer_data[i] = rtl
                     local_distance_cnt[i] = dc
                     local_pull_cnt[i] = pc
                     local_pull_data[i] = pd
+                    local_backtrack_cnt[i] = bt
 
                 result_q.put((worker_id, query_end_time, {
                     "recall": local_recall,
@@ -1113,6 +1200,7 @@ class VectorRetrieveRunner:
                     "distance_cnt": local_distance_cnt,
                     "pull_cnt": local_pull_cnt,
                     "pull_data": local_pull_data,
+                    "backtrack_cnt": local_backtrack_cnt,
                 }))
 
             if self.args.distributed:
@@ -1125,7 +1213,8 @@ class VectorRetrieveRunner:
                         self.sdk_config, self.comm_mode,
                         self.host_id, None,
                         progress_counter_mp, result_queue,
-                        build_dir_path
+                        build_dir_path,
+                        _sdk_cls, _payload_cls
                     ))
                     p.start()
                     processes.append(p)
@@ -1283,13 +1372,14 @@ class VectorRetrieveRunner:
                 local_remote_transfer_cnt = {}
                 local_remote_transfer_data = {}
                 local_distance_cnt = {}
+                local_backtrack_cnt = {}
 
                 try:
                     import random
                     query_indices = list(range(self.num_queries))
                     random.seed(0)
                     random.shuffle(query_indices)
-                    
+
                     for idx, i in enumerate(query_indices):
                         query_vec = queries[i]
                         start_time = time.time()
@@ -1302,6 +1392,7 @@ class VectorRetrieveRunner:
                             local_remote_transfer_cnt[i] = ret_payload.remote_transfer_cnt
                             local_remote_transfer_data[i] = ret_payload.remote_transfer_data
                             local_distance_cnt[i] = ret_payload.distance_cnt
+                            local_backtrack_cnt[i] = ret_payload.backtrack_cnt
                         else:
                             if self.args.shard:
                                 results = self.cluster.query(i, query_vec, payload, self.k)
@@ -1314,6 +1405,7 @@ class VectorRetrieveRunner:
                                 local_remote_transfer_cnt[i] = payload.remote_transfer_cnt
                                 local_remote_transfer_data[i] = payload.remote_transfer_data
                             local_distance_cnt[i] = payload.distance_cnt
+                            local_backtrack_cnt[i] = payload.backtrack_cnt
                         true_ids = set(groundtruth[i][:self.k])
                         correct = len(results.intersection(true_ids))
                         local_recall[i] = correct / self.k
@@ -1336,6 +1428,7 @@ class VectorRetrieveRunner:
                     "remote_transfer_cnt": local_remote_transfer_cnt,
                     "remote_transfer_data": local_remote_transfer_data,
                     "distance_cnt": local_distance_cnt,
+                    "backtrack_cnt": local_backtrack_cnt,
                 }
             
             # 查询正常完成，停止看门狗线程
@@ -1403,6 +1496,7 @@ class VectorRetrieveRunner:
         distance_cnt = {}
         pull_cnt = {}
         pull_data = {}
+        backtrack_cnt = {}
         for s in thread_stats:
             if not s:
                 continue
@@ -1412,6 +1506,7 @@ class VectorRetrieveRunner:
             distance_cnt.update(s["distance_cnt"])
             pull_cnt.update(s.get("pull_cnt", {}))
             pull_data.update(s.get("pull_data", {}))
+            backtrack_cnt.update(s.get("backtrack_cnt", {}))
 
         avg_recall = sum(recall.values()) / self.num_queries
         all_remote_transfer_cnt = sum(remote_transfer_cnt.values())
@@ -1420,6 +1515,12 @@ class VectorRetrieveRunner:
         avg_remote_transfer_data_per_query = sum(remote_transfer_data.values()) / self.num_queries
         all_distance_cnt = sum(distance_cnt.values())
         avg_distance_cnt = all_distance_cnt / self.num_queries
+
+        # 折返统计：backtrack_cnt 为 transfer 命中最近 max_track_num 窗口的次数，
+        # backtrack_ratio 以 remote_transfer_cnt 为分母，反映整体折返占比。
+        all_backtrack_cnt = sum(backtrack_cnt.values()) if backtrack_cnt else 0
+        avg_backtrack_cnt = all_backtrack_cnt / self.num_queries if self.num_queries else 0.0
+        backtrack_ratio = all_backtrack_cnt / all_remote_transfer_cnt if all_remote_transfer_cnt > 0 else 0.0
 
         # global-pull 模式拉取统计
         all_pull_cnt = sum(pull_cnt.values()) if pull_cnt else 0
@@ -1437,6 +1538,7 @@ class VectorRetrieveRunner:
         print(f"Average Remote Transfer Data per Transfer: {avg_remote_transfer_data_per_transfer:.0f} bits ({avg_remote_transfer_data_per_transfer/8:.0f} bytes)")
         print(f"Average Remote Transfer Data per Query: {avg_remote_transfer_data_per_query:.0f} bits ({avg_remote_transfer_data_per_query/8:.0f} bytes)")
         print(f"Average Distance Computations per Query: {avg_distance_cnt:.4f}")
+        print(f"Average Backtrack Count per Query: {avg_backtrack_cnt:.4f} (window={self.max_track_num}, ratio={backtrack_ratio:.4f})")
         if self.args.is_global_pull:
             print(f"Average Pull Count per Query: {avg_pull_cnt:.4f}")
             print(f"Average Pull Data per Pull: {avg_pull_data_per_pull:.0f} bits ({avg_pull_data_per_pull/8:.0f} bytes)")
@@ -1478,6 +1580,7 @@ class VectorRetrieveRunner:
                 "is_distributed": cluster_info.get("is_distributed") if cluster_info else True,
                 "is_shard": cluster_info.get("is_shard") if cluster_info else self.args.shard,
                 "is_global_pull": cluster_info.get("is_global_pull") if cluster_info else self.args.is_global_pull,
+                "max_track_num": self.max_track_num,
             }
 
             if cluster_params["partition_mode"] == "layer":
@@ -1503,6 +1606,7 @@ class VectorRetrieveRunner:
                 "is_distributed": self.cluster.is_distributed,
                 "is_shard": self.cluster.is_shard,
                 "is_global_pull": self.cluster.is_global_pull,
+                "max_track_num": self.max_track_num,
             }
 
             if self.cluster.partition_mode == "layer":
@@ -1526,12 +1630,15 @@ class VectorRetrieveRunner:
             "avg_pull_cnt": avg_pull_cnt,
             "avg_pull_data_per_pull": avg_pull_data_per_pull,
             "avg_pull_data_per_query": avg_pull_data_per_query,
+            "avg_backtrack_cnt": avg_backtrack_cnt,
+            "backtrack_ratio": backtrack_ratio,
             "recall": recall,
             "remote_transfer_cnt": remote_transfer_cnt,
             "remote_transfer_data": remote_transfer_data,
             "distance_cnt": distance_cnt,
             "pull_cnt": pull_cnt,
             "pull_data": pull_data,
+            "backtrack_cnt": backtrack_cnt,
         }
         if self.use_cpp:
             results_dir = "./results/cpp"
@@ -1634,14 +1741,14 @@ class VectorRetrieveRunner:
                     f"pids2=$(pgrep -f node_start.py || true); if [ -n \"$pids2\" ]; then kill -KILL $pids2 2>/dev/null || true; fi; fi"
                 )
                 cmd = [
-                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                    f"{self.user_name}@{ip}", remote_cmd
+                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30",
+                    f"{self.node_user_names[i]}@{ip}", remote_cmd
                 ]
                 proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 cleanup_procs.append((proc, ip))
             for proc, ip in cleanup_procs:
                 try:
-                    proc.communicate(timeout=15)
+                    proc.communicate(timeout=120)
                 except subprocess.TimeoutExpired:
                     proc.kill()
 
@@ -1687,6 +1794,7 @@ if __name__ == "__main__":
     parser.add_argument("--ib_dev", type=str, default="", help="RDMA IB device name (auto-detect if empty)")
     parser.add_argument("--ib_port", type=int, default=1, help="RDMA IB port number")
     parser.add_argument("--gid_index", type=int, default=-1, help="RDMA GID index (-1 for auto-detect)")
+    parser.add_argument("--max_track_num", type=int, default=10, help="Sliding window size for backtrack detection (transfer 回折返检测的目标节点窗口，0 关闭)")
     parser.add_argument("--num_runs", type=int, default=1, help="Number of query runs (>=3: trim max/min then average QPS)")
     parser.add_argument("--skip_prepare", action='store_true', default=False, help="Skip graph loading and partitioning (assume servers are already prepared)")
     parser.add_argument("--no_cleanup", action='store_true', default=False, help="Do not cleanup worker processes on exit")
@@ -1724,7 +1832,7 @@ if __name__ == "__main__":
             if runner.args.distributed:
                 print(f"Setting ef_search={runner.ef_search} on all nodes...")
                 for i, ip in enumerate(runner.node_ips):
-                    port = 19000 + i
+                    port = runner.node_ports[i]
                     connect_ip = "127.0.0.1" if i == runner.host_id else ip
                     sdk_client = ClusterSDKClient(ip=connect_ip, port=port, comm_mode=runner.comm_mode)
                     if not sdk_client.connect():
@@ -1749,7 +1857,7 @@ if __name__ == "__main__":
         if runner.args.distributed:
             print(f"[Verify] Expected ef_search={runner.ef_search} on all nodes:")
             for i, ip in enumerate(runner.node_ips):
-                port = 19000 + i
+                port = runner.node_ports[i]
                 connect_ip = "127.0.0.1" if i == runner.host_id else ip
                 try:
                     sdk_v = ClusterSDKClient(ip=connect_ip, port=port, comm_mode=runner.comm_mode)
@@ -1802,6 +1910,10 @@ if __name__ == "__main__":
             # 用最后一次的 thread_stats 保存结果，QPS 用均值
             runner.save_results(last_thread_stats, last_total_query_time, avg_qps, qps_runs=qps_list)
     except (QueryStallError, RuntimeError) as e:
+        if os.environ.get('NO_RESTART'):
+            print(f"[NO_RESTART] {type(e).__name__}: {e}. Skipping auto-restart for debugging.")
+            print("Worker logs preserved for inspection.")
+            sys.exit(2)
         print(f"[RESTART] {type(e).__name__}: {e}. Cleaning up and restarting main.py...")
         runner.cleanup_workers(force=True)
         # 重启时去掉 --skip_prepare，重新启动服务；保留 --no_cleanup 以维持 batch 的服务复用逻辑
@@ -1817,4 +1929,5 @@ if __name__ == "__main__":
         python = sys.executable
         os.execv(python, [python] + restart_argv)
     finally:
-        runner.cleanup_workers()
+        if not os.environ.get('NO_RESTART'):
+            runner.cleanup_workers()

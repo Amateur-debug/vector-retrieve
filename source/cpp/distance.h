@@ -99,6 +99,20 @@ static bool AVX512Capable() {
     return false;
 }
 
+// AVX-512BW（Byte/Word 操作）：uint8 内核的 _mm512_madd_epi16 / _mm512_sub_epi16 依赖 BW，
+// 仅 F 不够。Skylake-SP / Cannon Lake 有 F 没 BW，必须分开检测。
+static bool AVX512BWCapable() {
+    int cpuInfo[4];
+    cpuid(cpuInfo, 0);
+    int nIds = cpuInfo[0];
+    if (nIds >= 7) {
+        cpuid(cpuInfo, 7);
+    // 检测 AVX-512BW 支持：CPUID 功能 7 的 EBX 寄存器第 30 位
+        return (cpuInfo[1] & (1 << 30)) != 0;
+    }
+    return false;
+}
+
 static bool AVXCapable() {
     int cpuInfo[4];
     cpuid(cpuInfo, 0);
@@ -138,6 +152,7 @@ static bool AVX2Capable() {
 #else
 // 非 x86 平台：所有 SIMD 指令集能力检测均返回 false，回退使用标量实现
 static bool AVX512Capable() { return false; }
+static bool AVX512BWCapable() { return false; }
 static bool AVXCapable() { return false; }
 static bool SSECapable() { return false; }
 static bool AVX2Capable() { return false; }
@@ -1048,8 +1063,12 @@ inline uint32_t L2Sqr_AVX512<uint32_t, uint32_t>(const void* pVect1v, const void
     return (uint32_t)L2Sqr_AVX512<int32_t, int32_t>(pVect1v, pVect2v, qty_ptr);
 }
 
+#endif // __AVX512F__
+
 // uint8 → int32：一次 32 字节（32 维）：cvtepu8_epi16（32×u8→32×i16 in 512-bit）+ sub + madd_epi16（16 对 → 16×i32）
-// 需要 AVX-512BW 提供 _mm512_sub_epi16 / _mm512_madd_epi16。
+// 需要 AVX-512BW 提供 _mm512_cvtepu8_epi16 / _mm512_sub_epi16 / _mm512_madd_epi16，AVX-512F 不够。
+// Skylake-SP / Cannon Lake 有 F 没 BW，必须独立守卫。
+#if defined(__AVX512BW__) || defined(USE_AVX512BW)
 template<>
 inline int32_t L2Sqr_AVX512<uint8_t, int32_t>(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
     const uint8_t* pVect1 = (const uint8_t*)pVect1v;
@@ -1086,8 +1105,7 @@ inline int32_t L2Sqr_AVX512<uint8_t, int32_t>(const void* pVect1v, const void* p
 
     return res;
 }
-
-#endif // __AVX512F__
+#endif // __AVX512BW__
 
 //============================================================
 // L2 距离空间 —— 统一模板实现
@@ -1107,83 +1125,68 @@ public:
     L2Space(size_t dim) : dim_(dim), data_size_(dim * sizeof(T)) {
         dist_func_ = &L2Sqr_Scalar<T, DistT>;
 
-#if defined(__AVX512F__) || defined(USE_AVX512)
-        if (AVX512Capable()) {
-            dist_func_ = &L2Sqr_AVX512<T, DistT>;
-        } else
+        // 各 SIMD 内核都自带 dim%STEP 的尾巴循环处理任意 dim；
+        // dim 对齐时选择展开倍数高的变体（SSE16 / AVX2_16 / AVX16）以降低循环开销。
+        if constexpr (std::is_same_v<T, uint8_t>) {
+            // uint8: AVX-512BW > AVX2 > SSE > Scalar
+            // 注意 AVX-512 内核依赖 BW (madd_epi16 / sub_epi16 / cvtepu8_epi16)，仅 F 不够
+#if defined(__AVX512BW__) || defined(USE_AVX512BW)
+            if (AVX512BWCapable()) { dist_func_ = &L2Sqr_AVX512<T, DistT>; return; }
 #endif
-        {
-            if constexpr (std::is_floating_point_v<T>) {
-#if defined(__AVX__) || defined(USE_AVX) || defined(USE_AVX2)
-                if (AVXCapable()) {
-                    if constexpr (std::is_same_v<T, double>) {
-                        // double 仅有 AVX8（4 元素）变体
-                        dist_func_ = &L2Sqr_AVX8<T, DistT>;
-                    } else {
-                        // float 有 AVX16 / AVX8 两种变体，按维度对齐选择
-                        if (dim % 16 == 0) {
-                            dist_func_ = &L2Sqr_AVX16<T, DistT>;
-                        } else {
-                            dist_func_ = &L2Sqr_AVX8<T, DistT>;
-                        }
-                    }
-                } else
-#endif
-#if defined(__SSE__) || defined(USE_SSE)
-                if constexpr (std::is_same_v<T, float>) {
-                    if (SSECapable()) {
-                        if (dim % 16 == 0) {
-                            dist_func_ = &L2Sqr_SSE16<T, DistT>;
-                        } else if (dim % 4 == 0) {
-                            dist_func_ = &L2Sqr_SSE4<T, DistT>;
-                        }
-                    }
-                }
-#endif
-                ;
-            } else {
-                // 整数类型：AVX2 > SSE4.1 > Scalar
-                // 注意 uint8 和 int32/uint32 的 SIMD 展开步长不同（uint8 每 SIMD 通道装更多元素）
 #if defined(__AVX2__) || defined(USE_AVX2)
-                if (AVX2Capable()) {
-                    if constexpr (std::is_same_v<T, uint8_t>) {
-                        // uint8: AVX2_16 每次 32 维（dim%32 最佳）；AVX2_8 每次 16 维
-                        if (dim % 32 == 0) {
-                            dist_func_ = &L2Sqr_AVX2_16<T, DistT>;
-                        } else {
-                            dist_func_ = &L2Sqr_AVX2_8<T, DistT>;
-                        }
-                    } else {
-                        // int32/uint32: AVX2_16 每次 16 维；AVX2_8 每次 8 维
-                        if (dim % 16 == 0) {
-                            dist_func_ = &L2Sqr_AVX2_16<T, DistT>;
-                        } else {
-                            dist_func_ = &L2Sqr_AVX2_8<T, DistT>;
-                        }
-                    }
-                } else
+            if (AVX2Capable()) {
+                // AVX2_16 每次 32 维；AVX2_8 每次 16 维（带尾巴循环覆盖任意 dim）
+                dist_func_ = (dim % 32 == 0) ? &L2Sqr_AVX2_16<T, DistT> : &L2Sqr_AVX2_8<T, DistT>;
+                return;
+            }
 #endif
 #if defined(__SSE4_1__) || defined(__SSE__) || defined(USE_SSE)
-                if (SSECapable()) {
-                    if constexpr (std::is_same_v<T, uint8_t>) {
-                        // uint8: SSE16 每次 16 维；SSE4 每次 8 维
-                        if (dim % 16 == 0) {
-                            dist_func_ = &L2Sqr_SSE16<T, DistT>;
-                        } else if (dim % 8 == 0) {
-                            dist_func_ = &L2Sqr_SSE4<T, DistT>;
-                        }
-                    } else {
-                        // int32/uint32: SSE16 每次 16 维；SSE4 每次 4 维
-                        if (dim % 16 == 0) {
-                            dist_func_ = &L2Sqr_SSE16<T, DistT>;
-                        } else if (dim % 4 == 0) {
-                            dist_func_ = &L2Sqr_SSE4<T, DistT>;
-                        }
-                    }
-                }
-#endif
-                ;
+            if (SSECapable()) {
+                // SSE16 每次 16 维；SSE4 每次 8 维（带尾巴循环覆盖任意 dim）
+                dist_func_ = (dim % 16 == 0) ? &L2Sqr_SSE16<T, DistT> : &L2Sqr_SSE4<T, DistT>;
+                return;
             }
+#endif
+        } else if constexpr (std::is_floating_point_v<T>) {
+            // float / double: AVX-512F > AVX > SSE > Scalar
+#if defined(__AVX512F__) || defined(USE_AVX512)
+            if (AVX512Capable()) { dist_func_ = &L2Sqr_AVX512<T, DistT>; return; }
+#endif
+#if defined(__AVX__) || defined(USE_AVX) || defined(USE_AVX2)
+            if (AVXCapable()) {
+                if constexpr (std::is_same_v<T, double>) {
+                    dist_func_ = &L2Sqr_AVX8<T, DistT>;  // double 仅 AVX8 一种变体
+                } else {
+                    dist_func_ = (dim % 16 == 0) ? &L2Sqr_AVX16<T, DistT> : &L2Sqr_AVX8<T, DistT>;
+                }
+                return;
+            }
+#endif
+#if defined(__SSE__) || defined(USE_SSE)
+            if constexpr (std::is_same_v<T, float>) {
+                if (SSECapable()) {
+                    dist_func_ = (dim % 16 == 0) ? &L2Sqr_SSE16<T, DistT> : &L2Sqr_SSE4<T, DistT>;
+                    return;
+                }
+            }
+#endif
+        } else {
+            // int32 / uint32: AVX-512F > AVX2 > SSE > Scalar
+#if defined(__AVX512F__) || defined(USE_AVX512)
+            if (AVX512Capable()) { dist_func_ = &L2Sqr_AVX512<T, DistT>; return; }
+#endif
+#if defined(__AVX2__) || defined(USE_AVX2)
+            if (AVX2Capable()) {
+                dist_func_ = (dim % 16 == 0) ? &L2Sqr_AVX2_16<T, DistT> : &L2Sqr_AVX2_8<T, DistT>;
+                return;
+            }
+#endif
+#if defined(__SSE4_1__) || defined(__SSE__) || defined(USE_SSE)
+            if (SSECapable()) {
+                dist_func_ = (dim % 16 == 0) ? &L2Sqr_SSE16<T, DistT> : &L2Sqr_SSE4<T, DistT>;
+                return;
+            }
+#endif
         }
     }
 

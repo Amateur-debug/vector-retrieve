@@ -22,6 +22,7 @@ struct PayloadHeader {
     int distance_cnt;
     int pull_cnt;
     uint64_t pull_data;
+    int backtrack_cnt;
 };
 
 // 通用 PQHack：直接访问 priority_queue 的底层 vector 容器（protected 成员 c）。
@@ -54,10 +55,19 @@ struct Payload {
     int pull_cnt = 0;
     uint64_t pull_data = 0;
 
-    // 跨节点序列化传输使用的已访问向量 vid 列表（外部 ID）。
-    // 在分布式搜索中，各节点通过该列表同步已访问状态，避免重复计算距离。
-    // 注意：节点内部的 visited 判重由 VisitedListPool（基于 internal_id）独立管理，
-    // 该列表仅在跨节点边界传输时使用。
+    // 折返检测：最近 max_track_num 次 transfer 的目标 node_id 滑动窗口（FIFO）。
+    // 每次 transfer_to_remote 选定 target_node_id 后，若该 node_id 已在窗口内，
+    // 视为一次折返（backtrack），否则入窗；超过 max_track_num 则丢弃最旧元素。
+    // 该窗口跨节点随 payload 序列化传输，保持单条查询的全链路视角。
+    std::vector<int> recent_nodes;
+
+    // 折返次数累计：target_node_id 命中 recent_nodes 的次数。
+    int backtrack_cnt = 0;
+
+    // 跨节点序列化传输的已访问向量 vid 列表（外部 ID）。
+    // 选用 vector<int> 而非 set：序列化走单次 bulk memcpy，成本最低。
+    // 节点内部本地向量的 visited 判重仍由 VisitedListPool（基于 internal_id）独立管理；
+    // 远程邻居的 O(1) 去重由 search_layer_query 内部的局部 remote_visited_set 承担。
     std::vector<int> visited_vids;
 
     // 待处理的远程向量 vid 队列（按顺序逐个弹出处理）。
@@ -79,7 +89,7 @@ struct Payload {
     PayloadHeader to_header() const {
         return {continue_search, origin_node_id, require_id, start_level,
                 entry_point_id, remote_transfer_cnt, remote_transfer_data,
-                send_timestamp, distance_cnt, pull_cnt, pull_data};
+                send_timestamp, distance_cnt, pull_cnt, pull_data, backtrack_cnt};
     }
 
     // 从 PayloadHeader 恢复标量字段
@@ -95,17 +105,19 @@ struct Payload {
         distance_cnt = h.distance_cnt;
         pull_cnt = h.pull_cnt;
         pull_data = h.pull_data;
+        backtrack_cnt = h.backtrack_cnt;
     }
 
     void clear() {
         visited_vids.clear();
         pending_vids.clear();
+        recent_nodes.clear();
         candidates = decltype(candidates)();
         results = decltype(results)();
         send_timestamp = 0.0;
     }
 
-    // 预分配 visited_vids 的内存容量，减少搜索过程中 push_back 触发的动态扩容开销。
+    // 预分配 visited_vids 的向量容量，减少搜索过程中 push_back 触发的动态扩容开销。
     void reserve_visited(size_t capacity) {
         visited_vids.reserve(capacity);
     }
@@ -118,6 +130,8 @@ struct Payload {
         uint64_t visited_size = visited_vids.size() * sizeof(int) * 8;
 
         uint64_t pending_size = pending_vids.size() * sizeof(int) * 8;
+
+        // 注：recent_nodes 和 backtrack_cnt 为折返统计信息，不计入模拟传输数据量
 
         uint64_t candidates_size = candidates.size() * (sizeof(T) + sizeof(int)) * 8;
 

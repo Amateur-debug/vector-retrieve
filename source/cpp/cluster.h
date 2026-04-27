@@ -197,6 +197,7 @@ struct ReduceQueryAccumulator {
             merged_payload.distance_cnt += payload.distance_cnt;
             merged_payload.remote_transfer_cnt += payload.remote_transfer_cnt;
             merged_payload.remote_transfer_data += payload.remote_transfer_data;
+            merged_payload.backtrack_cnt += payload.backtrack_cnt;
             count = received_count.fetch_add(1) + 1;
         }
         if (count == total_nodes) {
@@ -317,64 +318,106 @@ public:
 
     // --- 序列化/反序列化辅助工具函数 ---
 
-template <typename P>
-void serialize_payload(Buffer &buf, Payload<P> &payload)
+// 前向声明：HNSWGraph 定义于 hnsw.h，避免循环依赖。
+template <typename T> class HNSWGraph;
+
+// serialize_payload / deserialize_payload 的 graph 参数语义：
+//   - 非空（节点侧，本地持有 HNSWGraph）：
+//       serialize 把堆内 iid 编码转成 wire 全局 vid（get_external_label 指针解引用，~1ns/项）。
+//       deserialize 把 wire vid 批量转回本节点 iid 编码（label_lookup_.find，命中→iid；未命中→-(vid+1)）。
+//   - 空（SDK 客户端，无本地 HNSW）：
+//       serialize 跳过转换（客户端侧堆本来就空），
+//       deserialize 将堆项统一置为 -(vid+1) 编码（客户端不再用来搜索，仅作为响应保留）。
+template <typename T>
+void serialize_payload(Buffer &buf, Payload<DistTOf<T>> &payload, const HNSWGraph<T> *graph)
 {
-    // 标量字段打包：一次 memcpy 写入所有标量（替代 9 次 write_val）
+    // 标量字段打包：一次 memcpy 写入所有标量
     PayloadHeader header = payload.to_header();
     buf.write_val(header);
 
+    // visited_vids (vector<int> of vids)：单次 bulk memcpy
     buf.write_vec(payload.visited_vids);
     buf.write_vec(payload.pending_vids);
+    buf.write_vec(payload.recent_nodes);
 
-    // 候选堆：直接访问底层 vector，O(n) 批量写入（替代 O(n log n) 的 pop 循环）
-    using CandPQ = decltype(payload.candidates);
-    const auto& cand_vec = PQAccessor<CandPQ>::get_container(payload.candidates);
-    int cand_size = (int)cand_vec.size();
-    buf.write_val(cand_size);
-    if (cand_size > 0)
-        buf.write(cand_vec.data(), cand_size * sizeof(pair<P, int>));
-
-    // 结果堆：同上
-    using ResPQ = decltype(payload.results);
-    const auto& res_vec = PQAccessor<ResPQ>::get_container(payload.results);
-    int res_size = (int)res_vec.size();
-    buf.write_val(res_size);
-    if (res_size > 0)
-        buf.write(res_vec.data(), res_size * sizeof(pair<P, int>));
+    // 候选/结果堆：thread_local tmp 做 iid→vid 转换 + 单次 bulk memcpy
+    using DistT = DistTOf<T>;
+    auto write_pq = [&](const auto& vec) {
+        int n = (int)vec.size();
+        buf.write_val(n);
+        if (n == 0) return;
+        static thread_local std::vector<std::pair<DistT, int>> tmp;
+        tmp.clear();
+        tmp.reserve(n);
+        if (graph)
+        {
+            for (const auto& item : vec)
+            {
+                int key = item.second;
+                int vid = (key >= 0) ? graph->get_external_label(key) : -(key + 1);
+                tmp.emplace_back(item.first, vid);
+            }
+        }
+        else
+        {
+            // 客户端：堆本应为空；即便非空，视为已是 vid 直接透传
+            for (const auto& item : vec) tmp.emplace_back(item);
+        }
+        buf.write(tmp.data(), (size_t)n * sizeof(std::pair<DistT, int>));
+    };
+    write_pq(PQAccessor<decltype(payload.candidates)>::get_container(payload.candidates));
+    write_pq(PQAccessor<decltype(payload.results)>::get_container(payload.results));
 }
 
-template <typename P>
-void deserialize_payload(Buffer &buf, Payload<P> &payload)
+template <typename T>
+void deserialize_payload(Buffer &buf, Payload<DistTOf<T>> &payload, const HNSWGraph<T> *graph)
 {
     // 标量字段打包：一次 memcpy 读出所有标量
     PayloadHeader header = buf.read_val<PayloadHeader>();
     payload.from_header(header);
 
+    // visited_vids：单次 bulk read
     payload.visited_vids = buf.read_vec<int>();
     payload.pending_vids = buf.read_vec<int>();
+    payload.recent_nodes = buf.read_vec<int>();
 
-    // 候选堆：批量读入 vector + make_heap，O(n)（替代 O(n log n) 的逐个 push）
-    int cand_size = buf.read_val<int>();
-    using CandPQ = decltype(payload.candidates);
-    auto& cand_vec = PQAccessor<CandPQ>::get_container_mut(payload.candidates);
-    cand_vec.resize(cand_size);
-    if (cand_size > 0)
-    {
-        buf.read(cand_vec.data(), cand_size * sizeof(pair<P, int>));
-        std::make_heap(cand_vec.begin(), cand_vec.end(), std::greater<pair<P, int>>());
-    }
-
-    // 结果堆：同上
-    int res_size = buf.read_val<int>();
-    using ResPQ = decltype(payload.results);
-    auto& res_vec = PQAccessor<ResPQ>::get_container_mut(payload.results);
-    res_vec.resize(res_size);
-    if (res_size > 0)
-    {
-        buf.read(res_vec.data(), res_size * sizeof(pair<P, int>));
-        std::make_heap(res_vec.begin(), res_vec.end(), std::less<pair<P, int>>());
-    }
+    // 候选/结果堆：bulk read 到 vec 拿到 (dist, vid)，原地做 vid→iid 编码 + make_heap。
+    // 用 software prefetch 掩盖 label_lookup_ bucket 查找的 cache miss。
+    using DistT = DistTOf<T>;
+    auto read_pq = [&](auto& vec, auto cmp) {
+        int n = buf.read_val<int>();
+        vec.resize(n);
+        if (n == 0) return;
+        buf.read(vec.data(), (size_t)n * sizeof(std::pair<DistT, int>));
+        if (graph)
+        {
+            const auto& lut = graph->label_lookup();
+            constexpr size_t PF_DIST = 4;
+            for (size_t i = 0; i < (size_t)n; ++i)
+            {
+                if (i + PF_DIST < (size_t)n)
+                {
+                    size_t bk = lut.bucket(vec[i + PF_DIST].second);
+                    auto bit = lut.begin(bk);
+                    if (bit != lut.end(bk))
+                        __builtin_prefetch(&(*bit), 0, 0);
+                }
+                int vid = vec[i].second;
+                auto it = lut.find(vid);
+                vec[i].second = (it != lut.end()) ? it->second : -(vid + 1);
+            }
+        }
+        else
+        {
+            // 客户端：全部按远程编码存，客户端不再用来搜索
+            for (auto& item : vec) item.second = -(item.second + 1);
+        }
+        std::make_heap(vec.begin(), vec.end(), cmp);
+    };
+    read_pq(PQAccessor<decltype(payload.candidates)>::get_container_mut(payload.candidates),
+            std::greater<std::pair<DistT, int>>());
+    read_pq(PQAccessor<decltype(payload.results)>::get_container_mut(payload.results),
+            std::less<std::pair<DistT, int>>());
 }
 
 template <typename T>
@@ -873,8 +916,12 @@ public:
     TransportConfig transport_config;
     std::shared_ptr<ITransport> transport;
 
-    Cluster(HNSWGraph<T> *hnsw, int node_num = 4, const TransportConfig& config = TransportConfig())
-        : hnsw(hnsw), node_num(node_num), transport_config(config)
+    // 折返检测窗口大小：transfer_to_remote 时保留最近 max_track_num 次目标节点 id，
+    // 若下一次 transfer 的目标已出现在窗口内则计为一次 backtrack。0 表示关闭统计。
+    int max_track_num = 10;
+
+    Cluster(HNSWGraph<T> *hnsw, int node_num = 4, const TransportConfig& config = TransportConfig(), int max_track_num = 10)
+        : hnsw(hnsw), node_num(node_num), transport_config(config), max_track_num(max_track_num)
     {
         transport = TransportFactory::create(transport_config);
         nodes.reserve(node_num);
@@ -1042,7 +1089,7 @@ public:
                 std::ostringstream oss;
                 oss << label << " [";
                 for (int d = 0; d < std::min(len, 8); d++)
-                    oss << (d ? "," : "") << v[d];
+                    oss << (d ? "," : "") << +v[d];  // unary + 防止 uint8_t 被当字符打印
                 if (len > 8) oss << ",...";
                 oss << "]";
                 LOG_INFO_STREAM(oss.str());
@@ -1554,52 +1601,97 @@ public:
         // 冗余机制：直接遍历 HNSW linklist，将远程邻居的 vid 添加到本地节点
         if (replication > 0)
         {
-            LOG_INFO_STREAM("[partition] Adding replication (direct HNSW traversal)...");
+            int nthreads = (num_threads > 0) ? num_threads
+                         : std::max(1, (int)std::thread::hardware_concurrency());
             size_t n = hnsw->get_cur_element_count();
+            LOG_INFO_STREAM("[partition] Adding replication (direct HNSW traversal)... n=" << n
+                            << " num_threads=" << num_threads << " nthreads=" << nthreads);
 
+            // 外层 replication 轮串行（下一轮依赖上一轮扩张后的 local_vids/vector_node_map）；
+            // 内层 vid 维度并行：每线程持有 per-thread 局部累加缓冲，循环结束归约合并到全局，无需加锁。
             for (int r = 0; r < replication; r++)
             {
+                std::vector<std::vector<std::unordered_set<int>>> thread_updates(
+                    nthreads, std::vector<std::unordered_set<int>>(node_num));
+                std::vector<std::vector<std::unordered_map<int, std::vector<int>>>> thread_route_updates(
+                    nthreads, std::vector<std::unordered_map<int, std::vector<int>>>(vector_node_map.size()));
+
+                {
+                    std::vector<std::thread> threads;
+                    size_t chunk = (n + (size_t)nthreads - 1) / (size_t)nthreads;
+                    for (int t = 0; t < nthreads; t++)
+                    {
+                        size_t start = (size_t)t * chunk;
+                        size_t end = std::min(start + chunk, n);
+                        if (start >= n) break;
+                        threads.emplace_back([&, t, start, end]() {
+                            auto &my_updates = thread_updates[t];
+                            auto &my_route = thread_route_updates[t];
+                            for (size_t i = start; i < end; i++)
+                            {
+                                int vid = hnsw->get_external_label((int)i);
+                                int elem_level = hnsw->element_levels_[i];
+
+                                for (int level = 0; level <= elem_level; level++)
+                                {
+                                    if (level < 0 || level >= (int)vector_node_map.size())
+                                        continue;
+
+                                    const auto &route_map = vector_node_map[level];
+                                    auto it = route_map.find(vid);
+                                    if (it == route_map.end())
+                                        continue;
+
+                                    int *ll = (level == 0) ? hnsw->get_linklist0((int)i) : hnsw->get_linklist((int)i, level);
+                                    int sz = hnsw->get_list_count(ll);
+                                    int *data = ll + 1;
+
+                                    for (int node_id : it->second)
+                                    {
+                                        if (node_id < 0 || node_id >= node_num)
+                                            continue;
+                                        for (int j = 0; j < sz; j++)
+                                        {
+                                            int neighbor_vid = hnsw->get_external_label(data[j]);
+                                            if (!local_vids[node_id].count(neighbor_vid) &&
+                                                !my_updates[node_id].count(neighbor_vid))
+                                            {
+                                                my_updates[node_id].insert(neighbor_vid);
+                                                auto &route = my_route[level][neighbor_vid];
+                                                if (std::find(route.begin(), route.end(), node_id) == route.end())
+                                                    route.push_back(node_id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    for (auto &th : threads) th.join();
+                }
+
+                // 归约：跨线程去重，仅当全局 updates 真正新增时才递增 replication_num
                 vector<unordered_set<int>> updates(node_num);
                 vector<unordered_map<int, std::vector<int>>> route_updates(vector_node_map.size());
-
-                for (size_t i = 0; i < n; i++)
+                for (int t = 0; t < nthreads; t++)
                 {
-                    int vid = hnsw->get_external_label((int)i);
-                    int elem_level = hnsw->element_levels_[i];
-
-                    // 遍历该元素的所有层
-                    for (int level = 0; level <= elem_level; level++)
+                    for (int node_id = 0; node_id < node_num; node_id++)
                     {
-                        if (level < 0 || level >= (int)vector_node_map.size())
-                            continue;
-
-                        const auto &route_map = vector_node_map[level];
-                        auto it = route_map.find(vid);
-                        if (it == route_map.end())
-                            continue;
-
-                        // 获取邻居列表
-                        int *ll = (level == 0) ? hnsw->get_linklist0((int)i) : hnsw->get_linklist((int)i, level);
-                        int sz = hnsw->get_list_count(ll);
-                        int *data = ll + 1;
-
-                        for (int node_id : it->second)
+                        for (int vid : thread_updates[t][node_id])
                         {
-                            if (node_id < 0 || node_id >= node_num)
-                                continue;
-                            for (int j = 0; j < sz; j++)
+                            if (updates[node_id].insert(vid).second)
+                                replication_num++;
+                        }
+                    }
+                    for (size_t lvl = 0; lvl < thread_route_updates[t].size(); lvl++)
+                    {
+                        for (const auto &kv : thread_route_updates[t][lvl])
+                        {
+                            auto &route = route_updates[lvl][kv.first];
+                            for (int node_id : kv.second)
                             {
-                                int neighbor_vid = hnsw->get_external_label(data[j]);
-                                if (!local_vids[node_id].count(neighbor_vid) &&
-                                    !updates[node_id].count(neighbor_vid))
-                                {
-                                    updates[node_id].insert(neighbor_vid);
-                                    replication_num++;
-
-                                    auto &route = route_updates[level][neighbor_vid];
-                                    if (std::find(route.begin(), route.end(), node_id) == route.end())
-                                        route.push_back(node_id);
-                                }
+                                if (std::find(route.begin(), route.end(), node_id) == route.end())
+                                    route.push_back(node_id);
                             }
                         }
                     }
@@ -1770,7 +1862,8 @@ public:
                         buf.write_val(query_id);
                         buf.write_val(k);
                         buf.write_vec(query_vector);
-                        serialize_payload(buf, node_payload);
+                        // node_payload 是空堆，传 nullptr 即可（serialize 会跳过转换）
+                        serialize_payload(buf, node_payload, (const HNSWGraph<T>*)nullptr);
 
                         uint64_t msg_size = buf.data.size();
                         try
@@ -1800,7 +1893,8 @@ public:
                                 int id = resp_buf.read_val<int>();
                                 out.results.push_back({dist, id});
                             }
-                            deserialize_payload(resp_buf, node_payload);
+                            // 堆内容对本节点不需要；传 nullptr，项按 -(vid+1) 编码（不再使用）
+                            deserialize_payload(resp_buf, node_payload, (const HNSWGraph<T>*)nullptr);
                         }
                         catch (...)
                         {
@@ -1815,11 +1909,13 @@ public:
                         {
                             node.local_hnsw->query(query_vector, node_payload, k);
 
+                            // 堆内存 iid 编码，pop 时解码成 vid 再入 out.results
                             auto pq = node_payload.results;
                             out.results.reserve(pq.size());
                             while (!pq.empty())
                             {
-                                out.results.push_back(pq.top());
+                                auto item = pq.top();
+                                out.results.push_back({item.first, node.local_hnsw->decode_key(item.second)});
                                 pq.pop();
                             }
                         }
@@ -1846,6 +1942,7 @@ public:
                 payload.distance_cnt += out.payload.distance_cnt;
                 payload.remote_transfer_cnt += out.payload.remote_transfer_cnt;
                 payload.remote_transfer_data += out.payload.remote_transfer_data;
+                payload.backtrack_cnt += out.payload.backtrack_cnt;
             }
 
             // 对所有结果排序并返回top-k
@@ -1991,6 +2088,22 @@ public:
 
         Node<T> &target_node = nodes[target_node_id];
 
+        // 折返检测：检查 target_node_id 是否出现在最近 max_track_num 次 transfer 的目标节点窗口中。
+        // 命中则累加 backtrack_cnt；然后 FIFO 更新窗口。max_track_num == 0 时关闭统计。
+        if (max_track_num > 0)
+        {
+            auto &recent = payload.recent_nodes;
+            if (std::find(recent.begin(), recent.end(), target_node_id) != recent.end())
+            {
+                payload.backtrack_cnt += 1;
+            }
+            if ((int)recent.size() >= max_track_num)
+            {
+                recent.erase(recent.begin());
+            }
+            recent.push_back(target_node_id);
+        }
+
         // 累计本次 transfer 的数据量（在序列化之前计算）
         payload.remote_transfer_data += payload.size_bits();
 
@@ -2013,7 +2126,19 @@ public:
             buf.write_val(query_id);
             buf.write_val(k);
             buf.write_vec(query_vector);
-            serialize_payload(buf, payload);
+            // 本地搜索产出的堆以 iid 编码，此处转回 wire vid
+            // 注意：必须用本机持有的 local_hnsw（partition 后的子图）做 iid→vid 映射，
+            // 不能用 cluster->hnsw（worker 节点上是 node_start.py 创建的空 dummy 图）。
+            HNSWGraph<T> *src_local_hnsw = nullptr;
+            for (int i = 0; i < node_num; i++)
+            {
+                if (!nodes[i].is_remote_node)
+                {
+                    src_local_hnsw = nodes[i].local_hnsw;
+                    break;
+                }
+            }
+            serialize_payload(buf, payload, src_local_hnsw);
 
             uint64_t msg_size = buf.data.size();
 
@@ -2382,7 +2507,7 @@ public:
                 buf.write_val(k);
                 buf.write_vec(query_vector);
                 Payload<DistT> empty_payload;
-                serialize_payload(buf, empty_payload);
+                serialize_payload(buf, empty_payload, (const HNSWGraph<T>*)nullptr);
 
                 uint64_t msg_size = buf.data.size();
                 cluster_->transport->send_raw(node_conns_[i], &msg_size, sizeof(uint64_t));
@@ -2402,10 +2527,12 @@ public:
                 {
                     Payload<DistT> local_payload;
                     node.local_hnsw->query(query_vector, local_payload, k);
+                    // 堆内存 iid 编码，pop 时解码成 vid
                     auto pq = local_payload.results;
                     while (!pq.empty())
                     {
-                        all_results.push_back(pq.top());
+                        auto item = pq.top();
+                        all_results.push_back({item.first, node.local_hnsw->decode_key(item.second)});
                         pq.pop();
                     }
                     payload.distance_cnt += local_payload.distance_cnt;
@@ -2438,10 +2565,12 @@ public:
                     }
 
                     Payload<DistT> node_payload;
-                    deserialize_payload(resp_buf, node_payload);
+                    // 堆内容不使用，传 nullptr
+                    deserialize_payload(resp_buf, node_payload, (const HNSWGraph<T>*)nullptr);
                     payload.distance_cnt += node_payload.distance_cnt;
                     payload.remote_transfer_cnt += node_payload.remote_transfer_cnt;
                     payload.remote_transfer_data += node_payload.remote_transfer_data;
+                    payload.backtrack_cnt += node_payload.backtrack_cnt;
                 }
                 catch (const std::exception &e)
                 {
@@ -2694,7 +2823,7 @@ void Node<T>::handle_node_client(int conn_id)
                     std::vector<int> results = buf->read_vec<int>();
 
                     Payload<DistT> payload;
-                    deserialize_payload(*buf, payload);
+                    deserialize_payload(*buf, payload, local_hnsw);
 
                     std::shared_ptr<SDKCompletionQueue<T>> cq;
                     {
@@ -2728,7 +2857,7 @@ void Node<T>::handle_node_client(int conn_id)
                         results.push_back({dist, id});
                     }
                     Payload<DistT> payload;
-                    deserialize_payload(*buf, payload);
+                    deserialize_payload(*buf, payload, local_hnsw);
 
                     std::shared_ptr<ReduceQueryAccumulator<T>> accum;
                     {
@@ -2777,7 +2906,7 @@ void Node<T>::handle_node_client(int conn_id)
                         std::vector<T> query_vector = buf->read_vec<T>();
 
                         Payload<DistT> payload;
-                        deserialize_payload(*buf, payload);
+                        deserialize_payload(*buf, payload, local_hnsw);
 
                         LOG_DEBUG_STREAM("[Node " << node_id << "] Received MSG_SEARCH for query " << query_id << ", transfer_cnt=" << payload.remote_transfer_cnt << ", origin=" << payload.origin_node_id);
 
@@ -2816,16 +2945,18 @@ void Node<T>::handle_node_client(int conn_id)
                         std::vector<T> query_vector = buf->read_vec<T>();
 
                         Payload<DistT> payload;
-                        deserialize_payload(*buf, payload);
+                        deserialize_payload(*buf, payload, local_hnsw);
 
                         std::vector<pair<DistT, int>> results;
                         if (local_hnsw)
                         {
                             local_hnsw->query(query_vector, payload, k);
+                            // 堆内存 iid 编码，pop 时解码成 vid
                             auto pq = payload.results;
                             while (!pq.empty())
                             {
-                                results.push_back(pq.top());
+                                auto item = pq.top();
+                                results.push_back({item.first, local_hnsw->decode_key(item.second)});
                                 pq.pop();
                             }
                         }
@@ -2837,7 +2968,7 @@ void Node<T>::handle_node_client(int conn_id)
                             resp_buf.write_val(p.first);
                             resp_buf.write_val(p.second);
                         }
-                        serialize_payload(resp_buf, payload);
+                        serialize_payload(resp_buf, payload, local_hnsw);
 
                         uint64_t resp_size = resp_buf.data.size();
                         cluster->transport->send_raw(conn_id, &resp_size, sizeof(uint64_t));
@@ -2856,10 +2987,12 @@ void Node<T>::handle_node_client(int conn_id)
                         if (local_hnsw)
                         {
                             local_hnsw->query(query_vector, payload, k);
+                            // 堆内存 iid 编码，pop 时解码成 vid
                             auto pq = payload.results;
                             while (!pq.empty())
                             {
-                                results.push_back(pq.top());
+                                auto item = pq.top();
+                                results.push_back({item.first, local_hnsw->decode_key(item.second)});
                                 pq.pop();
                             }
                         }
@@ -2893,7 +3026,7 @@ void Node<T>::handle_node_client(int conn_id)
                                         resp_buf.write_val(p.first);
                                         resp_buf.write_val(p.second);
                                     }
-                                    serialize_payload(resp_buf, payload);
+                                    serialize_payload(resp_buf, payload, local_hnsw);
                                     uint64_t resp_size = resp_buf.data.size();
                                     cluster->transport->send_raw(sock, &resp_size, sizeof(uint64_t));
                                     cluster->transport->send_raw(sock, resp_buf.data.data(), resp_size);
@@ -2967,7 +3100,7 @@ void Node<T>::handle_sdk_client(int client_fd)
                     resp_buf.write_val((DistT)0.0);
                     resp_buf.write_val(id);
                 }
-                serialize_payload(resp_buf, result.payload);
+                serialize_payload(resp_buf, result.payload, local_hnsw);
 
                 uint64_t resp_size = resp_buf.data.size();
                 send_all(client_fd, &resp_size, sizeof(uint64_t));
@@ -3029,7 +3162,7 @@ void Node<T>::handle_sdk_client(int client_fd)
                 std::vector<T> query_vector = buf.read_vec<T>();
 
                 Payload<DistT> payload;
-                deserialize_payload(buf, payload);
+                deserialize_payload(buf, payload, local_hnsw);
 
                 // 查询执行提交到 msg_pool_，reader 线程只负责接收
                 auto qv = std::make_shared<std::vector<T>>(std::move(query_vector));
@@ -3097,9 +3230,11 @@ void Node<T>::handle_sdk_client(int client_fd)
                                     Payload<DistT> local_payload;
                                     nd.local_hnsw->query(*qv, local_payload, k);
                                     std::vector<std::pair<DistT, int>> local_results;
+                                    // 堆内存 iid 编码，pop 时解码成 vid
                                     auto pq = local_payload.results;
                                     while (!pq.empty()) {
-                                        local_results.push_back(pq.top());
+                                        auto item = pq.top();
+                                        local_results.push_back({item.first, nd.local_hnsw->decode_key(item.second)});
                                         pq.pop();
                                     }
                                     accum->add_node_results(local_results, local_payload);
@@ -3122,8 +3257,7 @@ void Node<T>::handle_sdk_client(int client_fd)
 
                         if (!cluster->is_distributed || !pl->continue_search)
                         {
-                            auto topk = pl->topk_ids(k);
-                            completion_queue->push({query_id, std::move(topk), std::move(*pl)});
+                            completion_queue->push({query_id, std::move(results), std::move(*pl)});
                         }
                         else
                         {
@@ -3472,7 +3606,7 @@ void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& result
         buf.write_val((int)MSG_SEARCH_RESULT);
         buf.write_val(query_id);
         buf.write_vec(results);
-        serialize_payload(buf, payload);
+        serialize_payload(buf, payload, local_hnsw);
         
         uint64_t msg_size = buf.data.size();
         cluster->transport->send_raw(sock, &msg_size, sizeof(uint64_t));
@@ -3528,8 +3662,7 @@ std::vector<int> Node<T>::query(int query_id, const vector<T> &query_vector, Pay
         {
             num_queries++;
             LOG_DEBUG_STREAM("[Node " << node_id << "] Query " << query_id << " COMPLETED, sending to origin " << payload.origin_node_id);
-            std::vector<int> topk_results = payload.topk_ids(k);
-            send_result_to_origin(query_id, topk_results, payload);
+            send_result_to_origin(query_id, results, payload);
         }
     }
     else
@@ -3546,7 +3679,7 @@ std::vector<int> Node<T>::query(int query_id, const vector<T> &query_vector, Pay
         }
     }
     LOG_DEBUG_STREAM("[Node " << node_id << "] Returning result for query " << query_id);
-    return payload.topk_ids(k);
+    return results;
 }
 
 template <typename T>

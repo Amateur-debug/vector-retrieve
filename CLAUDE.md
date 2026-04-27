@@ -65,6 +65,9 @@ conda env create -f environment.yaml
 ## 运行命令
 
 ```bash
+# 先激活 conda 环境
+conda activate vector-retrieve
+
 # 使用 C++ 后端运行
 python main.py --use_cpp True
 

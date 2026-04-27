@@ -83,6 +83,16 @@ public:
     // === 外部 ID 与内部 ID 的映射关系 ===
     std::unordered_map<int, int> label_lookup_;  // vid → internal_id 的哈希映射
 
+    // 外部只读访问 label_lookup_，供序列化侧批量做 vid → iid 解析使用
+    const std::unordered_map<int, int>& label_lookup() const { return label_lookup_; }
+
+    // 将 Payload 堆里的 key（iid 编码：>=0 本地 iid，<0 远程 -(vid+1)）解码为全局 vid。
+    // 调用方保证传入的 key 是合法堆项（不是 top1_id/topk_ids 的空集合 sentinel -1）。
+    inline int decode_key(int key) const
+    {
+        return (key >= 0) ? get_external_label(key) : -(key + 1);
+    }
+
     // === 距离计算函数（运行时动态选择最优 SIMD 实现） ===
     DISTFUNC<DistT> dist_func_;                      // 距离计算函数指针
     void *dist_func_param_;                      // 距离函数辅助参数（指向维度值 dim 的指针）
@@ -491,9 +501,9 @@ public:
             bool good = true;
             for (auto &ret : return_list)
             {
-                T cur_dist = dist_func_(get_data_by_id(cur.second),
-                                        get_data_by_id(ret.second),
-                                        dist_func_param_);
+                DistT cur_dist = dist_func_(get_data_by_id(cur.second),
+                                            get_data_by_id(ret.second),
+                                            dist_func_param_);
                 if (cur_dist < dist_to_query)
                 {
                     good = false;
@@ -579,9 +589,9 @@ public:
             else
             {
                 // 邻居已满，需要用启发式选择缩减
-                T d_max = dist_func_(get_data_by_id(cur_c),
-                                     get_data_by_id(selected_id),
-                                     dist_func_param_);
+                DistT d_max = dist_func_(get_data_by_id(cur_c),
+                                         get_data_by_id(selected_id),
+                                         dist_func_param_);
 
                 // 构建候选集 = 现有邻居 + 新节点
                 std::priority_queue<std::pair<DistT, int>, std::vector<std::pair<DistT, int>>,
@@ -645,9 +655,9 @@ public:
         {
             auto cand = candidate_set.top();
 
-            // 终止条件：候选距离超过当前最远结果，且结果集已达到 ef_construction 容量。
-            // 仅在结果集填满后才允许终止，防止建图阶段因图稀疏而过早停止搜索。
-            if (cand.first > lower_bound && (int)top_candidates.size() == ef)
+            // 终止条件（hnswlib 标准）：候选集堆顶距离已超过结果集堆顶，
+            // 后续展开不可能产生更优结果。candidate_set 自然耗尽时也会退出循环。
+            if (cand.first > lower_bound)
                 break;
 
             candidate_set.pop();
@@ -822,7 +832,7 @@ public:
         if (curlevel < maxlevelcopy)
         {
             const void *query_data = vec.data();
-            T cur_dist = dist_func_(query_data, get_data_by_id(ep), dist_func_param_);
+            DistT cur_dist = dist_func_(query_data, get_data_by_id(ep), dist_func_param_);
 
             for (int level = maxlevelcopy; level > curlevel; level--)
             {
@@ -922,20 +932,37 @@ public:
             return {d, true};
         };
 
-        // 远程 vid 的访问判重集合（compact 模式下使用，因为远程 vid 无法标记到 visited_array 中）
+        // 远程 vid 的访问判重集合（compact 模式下使用，主循环展开远程邻居时做 O(1) 去重）。
+        // 搜索函数作用域内，跨节点传输不序列化（其状态由 visited_vids 和 pending_vids 共同推出）。
         std::unordered_set<int> remote_visited_set;
 
-        // 预分配 visited_vids 容量，减少搜索过程中 push_back 触发的动态扩容开销
+        // 预分配 visited_vids 容量，减少搜索过程中 push_back 触发的动态扩容
         payload.reserve_visited(ef + 16);
 
-        // ---- 进入边界处理：恢复跨节点传输的 visited 状态（vid → internal_id，冷路径 hash 查找） ----
-        for (int vid : payload.visited_vids)
+        // ---- 进入边界处理：恢复跨节点传输的 visited 状态 ----
+        // visited_vids 只包含已计算距离的 vid（本地命中或另一节点计算后回传）：
+        //   - 本地命中：标 visited_array（O(1)）
+        //   - 远程（compact 模式）：进 remote_visited_set 以供主循环去重
+        // 对 label_lookup_ bucket 做 software prefetch，掩盖 hash 查找的 cache miss。
         {
-            auto it = label_lookup_.find(vid);
-            if (it != label_lookup_.end())
-                visited_array[it->second] = visited_tag;
-            else if (is_compacted)
-                remote_visited_set.insert(vid);  // 远程 vid 无法标记到 visited_array
+            const size_t n = payload.visited_vids.size();
+            constexpr size_t PF_DIST = 8;
+            for (size_t i = 0; i < n; ++i)
+            {
+                if (i + PF_DIST < n)
+                {
+                    size_t bk = label_lookup_.bucket(payload.visited_vids[i + PF_DIST]);
+                    auto bit = label_lookup_.begin(bk);
+                    if (bit != label_lookup_.end(bk))
+                        __builtin_prefetch(&(*bit), 0, 0);
+                }
+                int vid = payload.visited_vids[i];
+                auto it = label_lookup_.find(vid);
+                if (it != label_lookup_.end())
+                    visited_array[it->second] = visited_tag;
+                else if (is_compacted)
+                    remote_visited_set.insert(vid);
+            }
         }
 
         // ---- 逐个处理待处理的远程 vid 列表 ----
@@ -970,8 +997,10 @@ public:
 
             if ((int)payload.results.size() < ef || dist < (payload.results.empty() ? std::numeric_limits<DistT>::max() : payload.results.top().first))
             {
-                payload.candidates.push({dist, rvid});
-                payload.results.push({dist, rvid});
+                // 堆内以 iid 编码：>=0 为本地 internal_id，<0 为远程 -(vid+1)。
+                // 这里已经解析到本地 riid，直接存。
+                payload.candidates.push({dist, riid});
+                payload.results.push({dist, riid});
 
                 if ((int)payload.results.size() > ef)
                     payload.results.pop();
@@ -1016,41 +1045,46 @@ public:
                     payload.distance_cnt++;
                     visited_array[ep_iid] = visited_tag;
                     payload.visited_vids.push_back(ep_vid);
-                    payload.candidates.push({dist, ep_vid});
-                    payload.results.push({dist, ep_vid});
+                    // 堆内存 iid（本地 internal_id），避免主循环每次 pop 都做 label_lookup_.find
+                    payload.candidates.push({dist, ep_iid});
+                    payload.results.push({dist, ep_iid});
                 }
             }
         }
 
-        // ---- 搜索主循环：全程以 (dist, vid) 为单位，像在一张完整图上搜索 ----
+        // ---- 搜索主循环：堆内 (dist, key) 以 iid 编码 ----
+        // key >= 0  → 本地 internal_id，直接展开邻居（零 hash 查找）
+        // key <  0  → 远程，vid = -(key+1)，触发 transfer
+        // 终止条件对齐 CoTra/hnswlib bare_bone：仅 cand_dist > lower_bound
         DistT lower_bound = payload.results.empty() ? std::numeric_limits<DistT>::max() : payload.results.top().first;
 
         while (!payload.candidates.empty())
         {
-            auto [cand_dist, cand_vid] = payload.candidates.top();
-            if (cand_dist > lower_bound && (int)payload.results.size() >= ef)
+            auto [cand_dist, cand_key] = payload.candidates.top();
+            if (cand_dist > lower_bound)
                 break;
             payload.candidates.pop();
 
-            // 查找 candidate 是否在本地
-            auto it = label_lookup_.find(cand_vid);
-            if (it == label_lookup_.end())
+            int cur_node;
+            if (cand_key >= 0)
             {
-                // 远程 candidate：本地无法展开邻居，transfer 到远程节点展开
-                // candidate 已在 candidates 堆中，远程节点弹出堆顶自然就是它
+                cur_node = cand_key;  // 本地 iid，直接用
+            }
+            else
+            {
+                // 远程 candidate：transfer 到其所在节点继续展开
+                int remote_vid = -(cand_key + 1);
                 if (is_compacted)
                 {
-                    payload.candidates.push({cand_dist, cand_vid});
+                    payload.candidates.push({cand_dist, cand_key});  // 原编码 re-push
                     payload.continue_search = true;
-                    payload.require_id = cand_vid;
+                    payload.require_id = remote_vid;
                     payload.start_level = level;
                     visited_pool_->release_list(vl);
                     return;
                 }
                 continue;
             }
-
-            int cur_node = it->second;  // internal_id
 
             int *ll_cur;
             if (level == 0)
@@ -1091,10 +1125,9 @@ public:
                     int remote_vid = -(neighbor_id + 1);
                     if (remote_visited_set.count(remote_vid))
                         continue;
-                    // 收集所有未访问的远程邻居，等本地邻居遍历完后一起 transfer
-                    // 注意：只标记 remote_visited_set 防止重复收集，不加入 visited_vids
-                    // visited_vids 在 pending_vids 处理时计算完距离后再加，
-                    // 否则恢复 visited 阶段会提前标记 visited_array 导致 pending_vids 处理时被跳过
+                    // 仅入 remote_visited_set 防止本地重复收集，以及 pending_vids 驱动 transfer；
+                    // visited_vids 延迟到 pending_vids 处理时计算完距离后再 push_back，
+                    // 避免远程 vid 在下一节点的 restore 阶段被误标 visited_array。
                     remote_visited_set.insert(remote_vid);
                     payload.pending_vids.push_back(remote_vid);
                     continue;
@@ -1114,8 +1147,9 @@ public:
 
                 if ((int)payload.results.size() < ef || neighbor_dist < lower_bound)
                 {
-                    payload.candidates.push({neighbor_dist, neighbor_vid});
-                    payload.results.push({neighbor_dist, neighbor_vid});
+                    // 堆内以 iid 编码，省去每次 pop 的 label_lookup_.find
+                    payload.candidates.push({neighbor_dist, neighbor_id});
+                    payload.results.push({neighbor_dist, neighbor_id});
 
                     if ((int)payload.results.size() > ef)
                         payload.results.pop();
@@ -1161,6 +1195,18 @@ public:
         if (cur_element_count_.load() == 0)
             return {};
 
+        // 堆里存 iid 编码，需要在 top1_id/topk_ids 的返回值上做解码。
+        // 空集合时 top1_id 返回 -1 与合法 key=-1（vid=0 远程）会冲突，因此外层先判空。
+        auto topk_as_vids = [this](Payload<DistT>& p, int kk) -> std::vector<int> {
+            std::vector<int> ids = p.topk_ids(kk);
+            for (int& v : ids) v = decode_key(v);
+            return ids;
+        };
+        auto top1_as_vid = [this](Payload<DistT>& p) -> int {
+            if (p.results.empty()) return -1;
+            return decode_key(p.top1_id());
+        };
+
         // 如果是续搜，从 start_level 逐层搜索到 level 0
         if (payload.continue_search)
         {
@@ -1176,7 +1222,7 @@ public:
                 else
                 {
                     // 后续层：从上一层结果取最近点作为入口，清理中间状态重新搜索
-                    int ep_vid = payload.top1_id();
+                    int ep_vid = top1_as_vid(payload);
                     payload.clear();
                     payload.continue_search = false;
                     payload.entry_point_id = ep_vid;
@@ -1186,9 +1232,9 @@ public:
                 }
                 // 续搜中再次被中断，返回中间结果让调用方继续 transfer
                 if (payload.continue_search)
-                    return payload.topk_ids(k);
+                    return topk_as_vids(payload, k);
             }
-            return payload.topk_ids(k);
+            return topk_as_vids(payload, k);
         }
 
         // 非续搜：从最高层开始，逐层调用 search_layer_query（统一走 transfer 机制）
@@ -1206,14 +1252,14 @@ public:
             int actual_ef = (level == 0) ? std::max(ef_search, k) : 1;
             search_layer_query(query_vector, level, actual_ef, payload);
             if (payload.continue_search)
-                return payload.topk_ids(k);
+                return topk_as_vids(payload, k);
             // 取当前层最近的点作为下一层入口
-            int next_ep = payload.top1_id();
+            int next_ep = top1_as_vid(payload);
             if (next_ep != -1)
                 ep_vid = next_ep;
         }
 
-        return payload.topk_ids(k);
+        return topk_as_vids(payload, k);
     }
 
     // ========================================================

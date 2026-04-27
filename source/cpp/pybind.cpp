@@ -34,6 +34,7 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("pull_data", &Payload<float>::pull_data)
         .def_readwrite("send_timestamp", &Payload<float>::send_timestamp)
         .def_readwrite("distance_cnt", &Payload<float>::distance_cnt)
+        .def_readwrite("backtrack_cnt", &Payload<float>::backtrack_cnt)
         .def_readwrite("results", &Payload<float>::results)
         .def("topk_ids", &Payload<float>::topk_ids, py::arg("k"));
 
@@ -50,6 +51,7 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("pull_data", &Payload<double>::pull_data)
         .def_readwrite("send_timestamp", &Payload<double>::send_timestamp)
         .def_readwrite("distance_cnt", &Payload<double>::distance_cnt)
+        .def_readwrite("backtrack_cnt", &Payload<double>::backtrack_cnt)
         .def_readwrite("results", &Payload<double>::results)
         .def("topk_ids", &Payload<double>::topk_ids, py::arg("k"));
 
@@ -66,6 +68,7 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("pull_data", &Payload<int32_t>::pull_data)
         .def_readwrite("send_timestamp", &Payload<int32_t>::send_timestamp)
         .def_readwrite("distance_cnt", &Payload<int32_t>::distance_cnt)
+        .def_readwrite("backtrack_cnt", &Payload<int32_t>::backtrack_cnt)
         .def_readwrite("results", &Payload<int32_t>::results)
         .def("topk_ids", &Payload<int32_t>::topk_ids, py::arg("k"));
 
@@ -82,6 +85,7 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("pull_data", &Payload<uint32_t>::pull_data)
         .def_readwrite("send_timestamp", &Payload<uint32_t>::send_timestamp)
         .def_readwrite("distance_cnt", &Payload<uint32_t>::distance_cnt)
+        .def_readwrite("backtrack_cnt", &Payload<uint32_t>::backtrack_cnt)
         .def_readwrite("results", &Payload<uint32_t>::results)
         .def("topk_ids", &Payload<uint32_t>::topk_ids, py::arg("k"));
 
@@ -293,19 +297,20 @@ PYBIND11_MODULE(vector_retrieve, m)
     // 绑定 Cluster 类（float 版本），提供集群级别的建图、查询、分区、序列化等操作
     py::class_<Cluster<float>, std::unique_ptr<Cluster<float>>>(m, "ClusterFloat")
         .def(py::init([](HNSWGraph<float> *hnsw, int node_num, const std::string &comm_mode,
-                         const std::string &ib_dev, int ib_port, int gid_index) {
+                         const std::string &ib_dev, int ib_port, int gid_index, int max_track_num) {
                 TransportConfig config;
                 config.comm_mode = comm_mode;
                 config.ib_dev = ib_dev;
                 config.ib_port = ib_port;
                 config.gid_index = gid_index;
-                return new Cluster<float>(hnsw, node_num, config);
+                return new Cluster<float>(hnsw, node_num, config, max_track_num);
              }),
              py::arg("hnsw"), py::arg("node_num") = 4,
              py::arg("comm_mode") = "tcp",
              py::arg("ib_dev") = "",
              py::arg("ib_port") = 1,
-             py::arg("gid_index") = -1)
+             py::arg("gid_index") = -1,
+             py::arg("max_track_num") = 10)
         .def_property_readonly("nodes", [](Cluster<float> &c)
                                {
             std::vector<Node<float> *> ptrs;
@@ -351,19 +356,20 @@ PYBIND11_MODULE(vector_retrieve, m)
     // 绑定 Cluster 类（double 版本），接口与 float 版本完全一致
     py::class_<Cluster<double>, std::unique_ptr<Cluster<double>>>(m, "ClusterDouble")
         .def(py::init([](HNSWGraph<double> *hnsw, int node_num, const std::string &comm_mode,
-                         const std::string &ib_dev, int ib_port, int gid_index) {
+                         const std::string &ib_dev, int ib_port, int gid_index, int max_track_num) {
                 TransportConfig config;
                 config.comm_mode = comm_mode;
                 config.ib_dev = ib_dev;
                 config.ib_port = ib_port;
                 config.gid_index = gid_index;
-                return new Cluster<double>(hnsw, node_num, config);
+                return new Cluster<double>(hnsw, node_num, config, max_track_num);
              }),
              py::arg("hnsw"), py::arg("node_num") = 4,
              py::arg("comm_mode") = "tcp",
              py::arg("ib_dev") = "",
              py::arg("ib_port") = 1,
-             py::arg("gid_index") = -1)
+             py::arg("gid_index") = -1,
+             py::arg("max_track_num") = 10)
         .def_property_readonly("nodes", [](Cluster<double> &c)
                                {
             std::vector<Node<double> *> ptrs;
@@ -409,19 +415,20 @@ PYBIND11_MODULE(vector_retrieve, m)
     // 绑定 Cluster 类（int32_t 版本）
     py::class_<Cluster<int32_t>, std::unique_ptr<Cluster<int32_t>>>(m, "ClusterInt32")
         .def(py::init([](HNSWGraph<int32_t> *hnsw, int node_num, const std::string &comm_mode,
-                         const std::string &ib_dev, int ib_port, int gid_index) {
+                         const std::string &ib_dev, int ib_port, int gid_index, int max_track_num) {
                 TransportConfig config;
                 config.comm_mode = comm_mode;
                 config.ib_dev = ib_dev;
                 config.ib_port = ib_port;
                 config.gid_index = gid_index;
-                return new Cluster<int32_t>(hnsw, node_num, config);
+                return new Cluster<int32_t>(hnsw, node_num, config, max_track_num);
              }),
              py::arg("hnsw"), py::arg("node_num") = 4,
              py::arg("comm_mode") = "tcp",
              py::arg("ib_dev") = "",
              py::arg("ib_port") = 1,
-             py::arg("gid_index") = -1)
+             py::arg("gid_index") = -1,
+             py::arg("max_track_num") = 10)
         .def_property_readonly("nodes", [](Cluster<int32_t> &c)
                                {
             std::vector<Node<int32_t> *> ptrs;
@@ -467,19 +474,20 @@ PYBIND11_MODULE(vector_retrieve, m)
     // 绑定 Cluster 类（uint32_t 版本）
     py::class_<Cluster<uint32_t>, std::unique_ptr<Cluster<uint32_t>>>(m, "ClusterUInt32")
         .def(py::init([](HNSWGraph<uint32_t> *hnsw, int node_num, const std::string &comm_mode,
-                         const std::string &ib_dev, int ib_port, int gid_index) {
+                         const std::string &ib_dev, int ib_port, int gid_index, int max_track_num) {
                 TransportConfig config;
                 config.comm_mode = comm_mode;
                 config.ib_dev = ib_dev;
                 config.ib_port = ib_port;
                 config.gid_index = gid_index;
-                return new Cluster<uint32_t>(hnsw, node_num, config);
+                return new Cluster<uint32_t>(hnsw, node_num, config, max_track_num);
              }),
              py::arg("hnsw"), py::arg("node_num") = 4,
              py::arg("comm_mode") = "tcp",
              py::arg("ib_dev") = "",
              py::arg("ib_port") = 1,
-             py::arg("gid_index") = -1)
+             py::arg("gid_index") = -1,
+             py::arg("max_track_num") = 10)
         .def_property_readonly("nodes", [](Cluster<uint32_t> &c)
                                {
             std::vector<Node<uint32_t> *> ptrs;
@@ -785,19 +793,20 @@ PYBIND11_MODULE(vector_retrieve, m)
 
     py::class_<Cluster<uint8_t>, std::unique_ptr<Cluster<uint8_t>>>(m, "ClusterUInt8")
         .def(py::init([](HNSWGraph<uint8_t> *hnsw, int node_num, const std::string &comm_mode,
-                         const std::string &ib_dev, int ib_port, int gid_index) {
+                         const std::string &ib_dev, int ib_port, int gid_index, int max_track_num) {
                 TransportConfig config;
                 config.comm_mode = comm_mode;
                 config.ib_dev = ib_dev;
                 config.ib_port = ib_port;
                 config.gid_index = gid_index;
-                return new Cluster<uint8_t>(hnsw, node_num, config);
+                return new Cluster<uint8_t>(hnsw, node_num, config, max_track_num);
              }),
              py::arg("hnsw"), py::arg("node_num") = 4,
              py::arg("comm_mode") = "tcp",
              py::arg("ib_dev") = "",
              py::arg("ib_port") = 1,
-             py::arg("gid_index") = -1)
+             py::arg("gid_index") = -1,
+             py::arg("max_track_num") = 10)
         .def_property_readonly("nodes", [](Cluster<uint8_t> &c)
                                {
             std::vector<Node<uint8_t> *> ptrs;
