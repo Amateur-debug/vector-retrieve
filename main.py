@@ -1,3 +1,17 @@
+#!/usr/bin/env python
+"""
+main.py — 向量检索实验主入口
+
+职责：
+  - 单机/多机分布式 HNSW 建图与分区
+  - 通过 SSH/srun 在集群各节点启动 node_start.py worker 和 query.py 客户端
+  - 文件屏障同步多机并发查询，聚合结果并保存
+
+运行模式：
+  1. 分布式模式 (--distributed)：通过 SDK 远程操控各 worker 节点，建图/分区/查询均在远端
+  2. 单机模拟模式（无 --distributed）：本地创建 Cluster + 多 HNSW 节点，本地查询
+"""
+
 import os
 import time
 import argparse
@@ -52,6 +66,12 @@ DATASET_PRESETS = {
         "groundtruth_path": os.path.join(_dataset_root, "sift100m/gt_100.bin"),
         "dtype":            "float",
     },
+    "sift100m-u8": {
+        "data_path":        os.path.join(_dataset_root, "sift100m/base.u8bin"),
+        "query_path":       os.path.join(_dataset_root, "sift100m/queries.u8bin"),
+        "groundtruth_path": os.path.join(_dataset_root, "sift100m/gt_100.bin"),
+        "dtype":            "uint8",
+    },
     "deep100m": {
         "data_path":        os.path.join(_dataset_root, "deep100m/base.fbin"),
         "query_path":       os.path.join(_dataset_root, "deep100m/queries.fbin"),
@@ -75,7 +95,9 @@ _DTYPE_CLASS_MAP = {
     "uint8":  ("PayloadInt32",  "HNSWGraphUInt8",  "ClusterUInt8",  "ClusterSDKClientUInt8"),
 }
 
-# 从命令行提前解析 --dtype 和 --data_name 以确定数据类型
+# -------------------- 模块级初始化 --------------------
+# dtype 两阶段解析：先尝试命令行 --dtype，否则从 preset 推断。
+# 必须在 import C++ 模块之前确定类型，以加载正确的模板实例化。
 _dtype_parser = argparse.ArgumentParser(add_help=False)
 _dtype_parser.add_argument("--dtype", type=str, default=None)
 _dtype_parser.add_argument("--data_name", type=str, default="sift")
@@ -93,12 +115,17 @@ if use_cpp:
         if build_dir not in sys.path:
             sys.path.insert(0, build_dir)
 
-    import vector_retrieve as _vr
-    _payload_cls, _hnsw_cls, _cluster_cls, _sdk_cls = _DTYPE_CLASS_MAP[_active_dtype]
-    Payload = getattr(_vr, _payload_cls)
-    HNSWGraph = getattr(_vr, _hnsw_cls)
-    Cluster = getattr(_vr, _cluster_cls)
-    ClusterSDKClient = getattr(_vr, _sdk_cls)
+    try:
+        import vector_retrieve as _vr
+        _payload_cls, _hnsw_cls, _cluster_cls, _sdk_cls = _DTYPE_CLASS_MAP[_active_dtype]
+        Payload = getattr(_vr, _payload_cls)
+        HNSWGraph = getattr(_vr, _hnsw_cls)
+        Cluster = getattr(_vr, _cluster_cls)
+        ClusterSDKClient = getattr(_vr, _sdk_cls)
+    except ImportError:
+        # query.py 等其他脚本 import main.py 时可能不需要 C++ 模块
+        if __name__ == "__main__":
+            raise
 else:
     if os.path.isdir(py_source_dir):
         if py_source_dir not in sys.path:
@@ -199,29 +226,40 @@ def read_groundtruth(filename, c_contiguous=True):
         raise ValueError(f"Unsupported groundtruth format: {ext} ({filename})")
 
 class VectorRetrieveRunner:
+    """向量检索实验运行器，封装建图、分区、查询全流程。
+
+    通过 config.json 获取集群拓扑，支持：
+      - 协调器模式（host 不在 work_nodes 中）：仅调度，不运行本地 worker
+      - 混合模式（host 在 work_nodes 中）：调度 + 本地 worker"""
+
     def __init__(self, args, use_cpp):
         self.args = args
         self.use_cpp = use_cpp
 
         self.num_construction_threads = args.num_construction_threads
-        self.num_query_threads = args.num_query_threads
+        self.num_query_threads = args.num_query_threads  # 全局查询线程总数
         self.num_threads = args.num_threads  # 服务端每 node 搜索线程数（msg_pool_size）
         self.num_cpu = args.num_cpu
 
-        # 集群部署参数统一从 config.json 读取；新环境只需编辑 config.json。
-        # 约定：host 大括号描述本机（运行 main.py 的机器）；nodes 为集群节点有序列表，
-        # 节点按任意顺序排列均可。若 host 也参与集群，其信息须同时出现在 nodes 中
-        # （位置任意，子集选取逻辑会保证包含 host）；若 host 不在 nodes 中，则 main.py
-        # 仅作协调器，无本地 worker。
-        self.host_info = _CLUSTER_CONFIG["host"]
-        self.all_nodes = list(_CLUSTER_CONFIG["nodes"])
+        # 集群拓扑从 config.json 读取。约定：
+        #   host_node — 运行 main.py 的机器（可不在 work_nodes 中，此时仅作协调器）
+        #   work_nodes — 参与 HNSW 存储/搜索的节点列表
+        #   query_nodes — 发查询的机器列表（可选，用于多机分布式压测）
+        self.host_info = _CLUSTER_CONFIG["host_node"]
+        self.all_nodes = list(_CLUSTER_CONFIG["work_nodes"])
+        # query_nodes：负责发查询的机器列表（可选，用于多机分布式 query）
+        self.query_nodes = list(_CLUSTER_CONFIG.get("query_nodes", []))
         for key in ("ip", "port", "user_name"):
             if key not in self.host_info:
-                raise ValueError(f"config.json: host 缺少字段 '{key}'")
+                raise ValueError(f"config.json: host_node 缺少字段 '{key}'")
         for idx, nd in enumerate(self.all_nodes):
             for key in ("ip", "port", "user_name"):
                 if key not in nd:
-                    raise ValueError(f"config.json: nodes[{idx}] 缺少字段 '{key}'")
+                    raise ValueError(f"config.json: work_nodes[{idx}] 缺少字段 '{key}'")
+        for idx, nd in enumerate(self.query_nodes):
+            for key in ("ip", "port", "user_name"):
+                if key not in nd:
+                    raise ValueError(f"config.json: query_nodes[{idx}] 缺少字段 '{key}'")
 
         self.host_ip = self.host_info["ip"]
         self.host_port = int(self.host_info["port"])
@@ -238,8 +276,8 @@ class VectorRetrieveRunner:
         # 兼容旧字段
         self.user_name = self.host_user_name
 
-        # 选择实际使用的节点子集：按 nodes 顺序取前 node_num 个；
-        # 若 host 在 nodes 中，子集必须包含 host（host 不在前 node_num 时，替换末位为 host）。
+    # 选择实际使用的节点子集：按 work_nodes 顺序取前 node_num 个。
+    # 若 host 在 work_nodes 中，保证子集始终包含 host。
         if self.args.distributed:
             requested = self.args.node_num if self.args.node_num and self.args.node_num > 0 else len(self.all_nodes)
             requested = min(requested, len(self.all_nodes))
@@ -263,6 +301,7 @@ class VectorRetrieveRunner:
             self.node_ips = [nd["ip"] for nd in selected]
             self.node_ports = [int(nd["port"]) for nd in selected]
             self.node_user_names = [nd["user_name"] for nd in selected]
+            self.node_hostnames = [nd.get("hostname", nd["ip"]) for nd in selected]
             self.node_num = len(self.node_ips)
             if self.host_is_node:
                 # host_id 为 host 在子集中的实际位置（不一定是 0）
@@ -296,28 +335,21 @@ class VectorRetrieveRunner:
         self.partition_mode = args.partition_mode
         self.use_layer = args.layer
 
-        self.layer_config = {
-            0: [0, 1, 2, 3, 4],
-            1: [0, 1, 2, 3, 4],
-            2: [0, 1, 2, 3, 4],
-            3: [0, 1, 2, 3, 4],
-            4: [0, 1, 2, 3, 4],
-            5: [0, 1, 2, 3, 4]
-        }
-        
-        self.layer_replicate_flags = [
-            False, False, True, True, True, True
-        ]
-        if hasattr(args, "layer_replicate_flags") and args.layer_replicate_flags:
-            try:
-                parsed_flags = json.loads(args.layer_replicate_flags)
-                if isinstance(parsed_flags, list):
-                    if len(parsed_flags) > 0:
-                        self.layer_replicate_flags = [bool(v) for v in parsed_flags]
-                else:
-                    print(f"Warning: --layer_replicate_flags should be a JSON list, fallback to default {self.layer_replicate_flags}")
-            except Exception as e:
-                print(f"Warning: failed to parse --layer_replicate_flags ({e}), fallback to default {self.layer_replicate_flags}")
+        # layer_config 与 layer_replicate_flags 从 config.json 读取，缺失时回退默认
+        _default_layer_config = {l: list(range(self.node_num)) for l in range(self.limited_level + 1)}
+        _default_layer_flags = [l >= 2 for l in range(self.limited_level + 1)]
+
+        raw_layer_config = _CLUSTER_CONFIG.get("layer_config")
+        if raw_layer_config:
+            self.layer_config = {int(k): list(v) for k, v in raw_layer_config.items()}
+        else:
+            self.layer_config = _default_layer_config
+
+        raw_layer_flags = _CLUSTER_CONFIG.get("layer_replicate_flags")
+        if raw_layer_flags:
+            self.layer_replicate_flags = [bool(v) for v in raw_layer_flags]
+        else:
+            self.layer_replicate_flags = _default_layer_flags
 
         self.replication = args.replication
 
@@ -337,6 +369,13 @@ class VectorRetrieveRunner:
         self.num_queries = 0
 
     def setup_distributed_nodes(self):
+        """在集群各节点启动 worker 进程。
+
+        流程：
+          1. 清理所有节点上的旧 node_start.py 进程（两阶段：TERM + KILL）
+          2. 等待端口释放（TCP TIME_WAIT）
+          3. 通过 srun（SLURM）或 SSH 在各节点启动 node_start.py
+          4. TCP 端口探测确认所有 worker 就绪"""
         if not self.args.distributed:
             return
         if self.args.skip_prepare:
@@ -348,6 +387,7 @@ class VectorRetrieveRunner:
 
         # Clean up old worker processes on all remote nodes and the local host
         print("Cleaning up old worker processes...")
+        use_slurm = bool(self.args.slurm)
 
         def _kill_local_node_start():
             # Two-stage local kill: TERM, wait, then KILL if still present
@@ -374,19 +414,23 @@ class VectorRetrieveRunner:
             ip = self.node_ips[i]
             if ip == self.host_ip:
                 print(f"Host machine identified as node {self.host_id} with IP {self.host_ip}.")
-                # We already attempted local cleanup; continue to next
                 continue
             # Remote two-stage kill: find PIDs, TERM, wait, then KILL if still present
-            remote_cmd = (
+            kill_script = (
                 f"pids=$(pgrep -f node_start.py || true); "
                 f"if [ -n \"$pids\" ]; then echo \"Killing PIDs: $pids on {ip}\"; kill -TERM $pids 2>/dev/null || true; sleep 1; "
                 f"pids2=$(pgrep -f node_start.py || true); if [ -n \"$pids2\" ]; then echo \"Force killing PIDs: $pids2 on {ip}\"; kill -KILL $pids2 2>/dev/null || true; fi; fi"
             )
-            cmd = [
-                "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30",
-                f"{self.node_user_names[i]}@{ip}",
-                remote_cmd
-            ]
+            if use_slurm:
+                hostname = self.node_hostnames[i]
+                cmd = ["srun", "-N1", "-n1", "--overlap", "--overcommit",
+                       "-w", hostname, "bash", "-lc", kill_script]
+            else:
+                cmd = [
+                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30",
+                    f"{self.node_user_names[i]}@{ip}",
+                    kill_script
+                ]
             print(f"  Cleaning node {i} on {ip}...")
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             cleanup_procs.append((proc, ip))
@@ -449,35 +493,60 @@ class VectorRetrieveRunner:
                 worker_processes.append(proc)
             else:
                 # Launch remote worker
-                print(f"Launching worker node {i} on {self.node_user_names[i]}@{ip}...")
                 log_file = f"{current_dir}/worker_{i}.log"
 
                 distributed_flag = "--distributed" if self.args.distributed else ""
                 shard_flag = "--shard" if self.args.shard else ""
                 global_pull_flag = "--global-pull" if self.args.is_global_pull else ""
 
-                # Build remote command as a single string
                 cpu_prefix = f"taskset -c 0-{self.num_cpu - 1} " if self.num_cpu and self.num_cpu > 0 else ""
-                remote_cmd = (
-                    f"cd {current_dir} && "
-                    f"conda activate vector-retrieve && "
-                    f"nohup {cpu_prefix}python -u node_start.py "
-                    f"--node_id {i} --node_ips {node_ips_str} "
-                    f"--dtype {_active_dtype} "
-                    f"--m {self.args.m} --ef_construction {self.args.ef_construction} "
-                    f"--ef_search {self.ef_search} --limited_level {self.args.limited_level} "
-                    f"--comm_mode {self.comm_mode} "
-                    f"--num_threads {self.num_threads} "
-                    f"--max_track_num {self.max_track_num} "
-                    f"{distributed_flag} {shard_flag} {global_pull_flag} "
-                    f"> {log_file} 2>&1 &"
-                )
 
-                cmd = ["ssh", f"{self.node_user_names[i]}@{ip}", remote_cmd]
-                print(f"  CMD: {' '.join(cmd)}")
-
-                # Launch worker process in background (no output redirection needed, handled by nohup)
-                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if use_slurm:
+                    # srun 方式启动远程 worker
+                    hostname = self.node_hostnames[i]
+                    srun_cmd = [
+                        "srun", "-N1", "-n1",
+                        "--overlap", "--overcommit",
+                        "--export=ALL",
+                        "-w", hostname,
+                        "-o", log_file,
+                        "-e", log_file,
+                        "bash", "-lc",
+                        f"cd {current_dir} && eval \"$(conda shell.bash hook)\" && conda activate vector-retrieve && "
+                        f"{cpu_prefix}python -u node_start.py "
+                        f"--node_id {i} --node_ips {node_ips_str} "
+                        f"--dtype {_active_dtype} "
+                        f"--m {self.args.m} --ef_construction {self.args.ef_construction} "
+                        f"--ef_search {self.ef_search} --limited_level {self.args.limited_level} "
+                        f"--comm_mode {self.comm_mode} "
+                        f"--num_threads {self.num_threads} "
+                        f"--max_track_num {self.max_track_num} "
+                        f"{distributed_flag} {shard_flag} {global_pull_flag}"
+                    ]
+                    print(f"  CMD: {' '.join(srun_cmd)}")
+                    proc = subprocess.Popen(srun_cmd, stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    # SSH 方式启动远程 worker
+                    print(f"Launching worker node {i} on {self.node_user_names[i]}@{ip}...")
+                    remote_cmd = (
+                        f"cd {current_dir} && "
+                        f"conda activate vector-retrieve && "
+                        f"nohup {cpu_prefix}python -u node_start.py "
+                        f"--node_id {i} --node_ips {node_ips_str} "
+                        f"--dtype {_active_dtype} "
+                        f"--m {self.args.m} --ef_construction {self.args.ef_construction} "
+                        f"--ef_search {self.ef_search} --limited_level {self.args.limited_level} "
+                        f"--comm_mode {self.comm_mode} "
+                        f"--num_threads {self.num_threads} "
+                        f"--max_track_num {self.max_track_num} "
+                        f"{distributed_flag} {shard_flag} {global_pull_flag} "
+                        f"> {log_file} 2>&1 &"
+                    )
+                    cmd = ["ssh", f"{self.node_user_names[i]}@{ip}", remote_cmd]
+                    print(f"  CMD: {' '.join(cmd)}")
+                    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 worker_processes.append(proc)
 
         # 等待所有 worker 节点真正启动并可连接
@@ -511,6 +580,8 @@ class VectorRetrieveRunner:
         self.worker_processes = worker_processes
 
     def build_index(self, data, num_elements):
+        """通过 SDK 将向量添加到远端/本地 HNSW 图。
+        多线程模式下，每个线程独立持有 SDK 连接，分担建图负载。"""
         mode_label = "shard" if self.args.shard else "normal"
         if self.num_construction_threads > 1:
             print(f"Building in {mode_label} with {self.num_construction_threads} threads via SDK...")
@@ -623,14 +694,24 @@ class VectorRetrieveRunner:
                 print(f"  Node {i}: (error: {e})")
 
     def prepare(self):
-        if self.args.skip_prepare:
+        """准备阶段：加载/构建 HNSW 图并分区。
+
+        分支逻辑：
+          1. --skip_prepare：跳过，仅设置 SDK 配置
+          2. --distributed + 有 graph_path：通过 SDK 远程加载已有图
+          3. --distributed + 无图：加载数据，通过 SDK 远程建图
+          4. 非分布式 + 有 cluster_path：本地加载 Cluster
+          5. 非分布式 + 有 graph_path：本地加载图 → 分区
+          6. 非分布式 + shard：轮询建各节点独立图
+          7. 非分布式 + 传统：先建统一图 → 再分区"""
             print("Skipping graph loading and partitioning (--skip_prepare)")
             if self.args.distributed:
                 self.cluster = None
                 self.hnsw = None
+                sdk_idx = max(0, self.host_id)
                 self.sdk_config = {
-                    'ip': '127.0.0.1',
-                    'port': self.node_ports[self.host_id]
+                    'ip': '127.0.0.1' if self.host_is_node else self.node_ips[0],
+                    'port': self.node_ports[sdk_idx]
                 }
             return
 
@@ -642,10 +723,11 @@ class VectorRetrieveRunner:
             self.hnsw = None
 
             # 分布式模式：如有 graph_path 则直接通过 SDK 加载
-            print(f"Configuring SDK for local node {self.host_id} ({self.node_ips[self.host_id]}:{self.node_ports[self.host_id]}) for building...")
+            sdk_idx = max(0, self.host_id)
+            print(f"Configuring SDK for {'local node' if self.host_is_node else 'remote node'} {sdk_idx} ({self.node_ips[sdk_idx]}:{self.node_ports[sdk_idx]}) for building...")
             self.sdk_config = {
-                'ip': '127.0.0.1',
-                'port': self.node_ports[self.host_id]
+                'ip': '127.0.0.1' if self.host_is_node else self.node_ips[0],
+                'port': self.node_ports[sdk_idx]
             }
 
             if self.graph_path is not None and os.path.exists(self.graph_path) and not self.args.shard:
@@ -923,540 +1005,8 @@ class VectorRetrieveRunner:
                 partition_time = time.time() - start_time
                 print(f"Partitioning Time: {partition_time:.4f} seconds.")
 
-    def run_queries(self):
-        queries = read_vectors(self.query_path)
-        groundtruth = read_groundtruth(self.groundtruth_path)
-        print(f"Queries shape: {queries.shape}")
-        print(f"Groundtruth shape: {groundtruth.shape}")
-        max_num_queries = queries.shape[0]
-        self.num_queries = max_num_queries
-
-        print("Performing queries...")
-
-        # 分布式模式下，查询入口路由由 SDK 负责并进行一次性初始化。
-        if self.args.distributed:
-            if self.sdk_config is None:
-                self.sdk_config = {
-                    'ip': "127.0.0.1",
-                    'port': self.node_ports[self.host_id]
-                }
-            print("Distributed query entry nodes are initialized by SDK from cluster info.")
-
-        # 各线程查询循环结束的时间戳，用于准确计算 QPS（不包含离线召回率计算时间）
-        thread_query_end_times = [0.0] * self.num_query_threads
-
-        def query(worker_id, stats_list, progress_counter=None):
-            # 查询结果暂存，召回率等 Python 密集计算推迟到查询循环外，减少 GIL 竞争
-            local_results = {}          # i -> list[int]
-            local_payloads = {}         # i -> (remote_transfer_cnt, remote_transfer_data, distance_cnt, pull_cnt, pull_data, backtrack_cnt)
-
-            # 每个进程创建独立的 SDK 客户端实例。
-            thread_sdk_client = None
-            if self.args.distributed:
-                thread_sdk_client = ClusterSDKClient(
-                    ip=self.sdk_config['ip'],
-                    port=self.sdk_config['port'],
-                    comm_mode=self.comm_mode
-                )
-                # 所有分布式模式都需要初始化路由（包括 shard 模式）
-                if not thread_sdk_client.init_routes():
-                    # init_routes 失败时回退到默认地址
-                    print(f"[Worker {worker_id}] Warning: init_routes failed, using default endpoint")
-
-            try:
-                # 打乱查询顺序，每个线程使用不同的随机顺序
-                import random
-                query_indices = list(range(self.num_queries))
-                random.seed(worker_id)  # 每个线程使用不同的种子
-                random.shuffle(query_indices)
-
-                local_count = 0
-                if self.args.distributed:
-                    # 流水线模式：先发后收，充分利用远程转发等待时间
-                    PIPELINE_DEPTH = 16
-                    pending = {}  # query_id -> (original_index, payload)
-                    sent = 0
-                    received = 0
-
-                    for idx, i in enumerate(query_indices):
-                        payload = Payload()
-                        qid = i + worker_id * self.num_queries
-                        thread_sdk_client.query_send(qid, queries[i], payload, k=self.k)
-                        pending[qid] = (i, payload)
-                        sent += 1
-
-                        # 管道满时收一个结果
-                        while sent - received >= PIPELINE_DEPTH:
-                            ret_qid, results, ret_payload = thread_sdk_client.query_recv()
-                            orig_idx, _ = pending.pop(ret_qid)
-                            local_results[orig_idx] = results
-                            local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data, ret_payload.backtrack_cnt)
-                            received += 1
-                            local_count += 1
-                            if progress_counter is not None and local_count % 10 == 0:
-                                progress_counter[0] += 10
-                                local_count = 0
-
-                    # 收完剩余结果
-                    while received < sent:
-                        ret_qid, results, ret_payload = thread_sdk_client.query_recv()
-                        orig_idx, _ = pending.pop(ret_qid)
-                        local_results[orig_idx] = results
-                        local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data, ret_payload.backtrack_cnt)
-                        received += 1
-                        local_count += 1
-                        if progress_counter is not None and local_count % 10 == 0:
-                            progress_counter[0] += 10
-                            local_count = 0
-                else:
-                    for idx, i in enumerate(query_indices):
-                        payload = Payload()
-                        if self.args.shard:
-                            results = self.cluster.query(i + worker_id * self.num_queries, queries[i], payload, self.K)
-                        else:
-                            results = self.cluster.nodes[self.host_id].query(i + worker_id * self.num_queries, queries[i], payload, k=self.k)
-
-                        local_results[i] = results
-                        local_payloads[i] = (payload.remote_transfer_cnt, payload.remote_transfer_data, payload.distance_cnt, payload.pull_cnt, payload.pull_data, payload.backtrack_cnt)
-
-                        local_count += 1
-                        if progress_counter is not None:
-                            if local_count % 10 == 0:
-                                progress_counter[0] += 10
-                                local_count = 0
-
-                # 更新剩余的进度
-                if progress_counter is not None and local_count > 0:
-                    progress_counter[0] += local_count
-
-            finally:
-                # 每个进程完成查询后主动释放连接。
-                if thread_sdk_client:
-                    thread_sdk_client.disconnect()
-
-            # 记录查询循环结束时间（不含后续召回率计算），用于准确计算 QPS
-            thread_query_end_times[worker_id] = time.time()
-
-            # ---- 查询循环结束后，在线程内离线计算召回率等统计 ----
-            # 此时所有线程的查询已完成（或即将完成），GIL 竞争大幅降低
-            local_recall = {}
-            local_remote_transfer_cnt = {}
-            local_remote_transfer_data = {}
-            local_distance_cnt = {}
-            local_pull_cnt = {}
-            local_pull_data = {}
-            local_backtrack_cnt = {}
-
-            for i, results in local_results.items():
-                results_set = set(results)
-                true_ids = set(groundtruth[i][:self.k])
-                correct = len(results_set.intersection(true_ids))
-                local_recall[i] = correct / self.k
-
-                rtc, rtl, dc, pc, pd, bt = local_payloads[i]
-                local_remote_transfer_cnt[i] = rtc
-                local_remote_transfer_data[i] = rtl
-                local_distance_cnt[i] = dc
-                local_pull_cnt[i] = pc
-                local_pull_data[i] = pd
-                local_backtrack_cnt[i] = bt
-
-            stats_list[worker_id] = {
-                "recall": local_recall,
-                "remote_transfer_cnt": local_remote_transfer_cnt,
-                "remote_transfer_data": local_remote_transfer_data,
-                "distance_cnt": local_distance_cnt,
-                "pull_cnt": local_pull_cnt,
-                "pull_data": local_pull_data,
-                "backtrack_cnt": local_backtrack_cnt,
-            }
-
-        total_query_start_time = time.time()
-        total_queries = self.num_queries * self.num_query_threads
-
-        if self.num_query_threads > 1:
-            # 使用多进程（绕过 GIL，真正的 CPU 并行）
-            import multiprocessing as mp
-
-            # 子进程入口函数（必须是顶层可 pickle 的 target）
-            # 通过 mp.Queue 传回结果，通过 mp.Value 共享进度
-            progress_counter_mp = mp.Value('i', 0)
-            result_queue = mp.Queue()
-
-            build_dir_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'build'))
-
-            def query_worker_process(worker_id, num_queries, queries_np, groundtruth, k,
-                                     distributed, shard, sdk_config, comm_mode,
-                                     host_id, cluster_ref, progress_val, result_q,
-                                     build_dir_for_subprocess,
-                                     sdk_cls_name, payload_cls_name):
-                """子进程入口：独立创建 SDK 客户端，执行查询，通过 Queue 返回结果"""
-                import random
-                import sys
-                if build_dir_for_subprocess not in sys.path:
-                    sys.path.insert(0, build_dir_for_subprocess)
-
-                local_results = {}
-                local_payloads = {}
-
-                thread_sdk_client = None
-                if distributed:
-                    import vector_retrieve as _vr_sub
-                    ClusterSDKClient = getattr(_vr_sub, sdk_cls_name)
-                    Payload = getattr(_vr_sub, payload_cls_name)
-                    thread_sdk_client = ClusterSDKClient(
-                        ip=sdk_config['ip'],
-                        port=sdk_config['port'],
-                        comm_mode=comm_mode
-                    )
-                    if not thread_sdk_client.init_routes():
-                        print(f"[Worker {worker_id}] Warning: init_routes failed, using default endpoint")
-
-                try:
-                    query_indices = list(range(num_queries))
-                    random.seed(worker_id)
-                    random.shuffle(query_indices)
-
-                    local_count = 0
-                    if distributed:
-                        PIPELINE_DEPTH = 16
-                        pending = {}
-                        sent = 0
-                        received = 0
-
-                        for idx, i in enumerate(query_indices):
-                            payload = Payload()
-                            qid = i + worker_id * num_queries
-                            thread_sdk_client.query_send(qid, queries_np[i].tolist(), payload, k=k)
-                            pending[qid] = i
-                            sent += 1
-
-                            while sent - received >= PIPELINE_DEPTH:
-                                ret_qid, results, ret_payload = thread_sdk_client.query_recv()
-                                orig_idx = pending.pop(ret_qid)
-                                local_results[orig_idx] = results
-                                local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data, ret_payload.backtrack_cnt)
-                                received += 1
-                                local_count += 1
-                                if local_count % 10 == 0:
-                                    with progress_val.get_lock():
-                                        progress_val.value += 10
-                                    local_count = 0
-
-                        while received < sent:
-                            ret_qid, results, ret_payload = thread_sdk_client.query_recv()
-                            orig_idx = pending.pop(ret_qid)
-                            local_results[orig_idx] = results
-                            local_payloads[orig_idx] = (ret_payload.remote_transfer_cnt, ret_payload.remote_transfer_data, ret_payload.distance_cnt, ret_payload.pull_cnt, ret_payload.pull_data, ret_payload.backtrack_cnt)
-                            received += 1
-                            local_count += 1
-                            if local_count % 10 == 0:
-                                with progress_val.get_lock():
-                                    progress_val.value += 10
-                                local_count = 0
-                    else:
-                        # 非分布式模式：子进程无法共享 cluster 对象，回退到线程模式
-                        # 此分支不应被多进程调用，仅作防御
-                        pass
-
-                    if local_count > 0:
-                        with progress_val.get_lock():
-                            progress_val.value += local_count
-
-                finally:
-                    if thread_sdk_client:
-                        thread_sdk_client.disconnect()
-
-                # 查询循环结束时间
-                query_end_time = time.time()
-
-                # 离线计算召回率
-                local_recall = {}
-                local_remote_transfer_cnt = {}
-                local_remote_transfer_data = {}
-                local_distance_cnt = {}
-                local_pull_cnt = {}
-                local_pull_data = {}
-                local_backtrack_cnt = {}
-
-                for i, results in local_results.items():
-                    results_set = set(results)
-                    true_ids = set(groundtruth[i][:k])
-                    correct = len(results_set.intersection(true_ids))
-                    local_recall[i] = correct / k
-
-                    rtc, rtl, dc, pc, pd, bt = local_payloads[i]
-                    local_remote_transfer_cnt[i] = rtc
-                    local_remote_transfer_data[i] = rtl
-                    local_distance_cnt[i] = dc
-                    local_pull_cnt[i] = pc
-                    local_pull_data[i] = pd
-                    local_backtrack_cnt[i] = bt
-
-                result_q.put((worker_id, query_end_time, {
-                    "recall": local_recall,
-                    "remote_transfer_cnt": local_remote_transfer_cnt,
-                    "remote_transfer_data": local_remote_transfer_data,
-                    "distance_cnt": local_distance_cnt,
-                    "pull_cnt": local_pull_cnt,
-                    "pull_data": local_pull_data,
-                    "backtrack_cnt": local_backtrack_cnt,
-                }))
-
-            if self.args.distributed:
-                # 多进程模式（分布式查询，绕过 GIL）
-                processes = []
-                for i in range(self.num_query_threads):
-                    p = mp.Process(target=query_worker_process, args=(
-                        i, self.num_queries, queries, groundtruth, self.k,
-                        True, self.args.shard,
-                        self.sdk_config, self.comm_mode,
-                        self.host_id, None,
-                        progress_counter_mp, result_queue,
-                        build_dir_path,
-                        _sdk_cls, _payload_cls
-                    ))
-                    p.start()
-                    processes.append(p)
-                self.query_worker_processes = processes
-
-                # 进度条显示
-                # 进度条：只跟踪查询发送进度，到 100% 后立即关闭
-                with tqdm(total=total_queries, desc="Querying", unit="qry",
-                          bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, QPS: {postfix}]') as pbar:
-                    pbar.set_postfix_str("0.0")
-                    last_value = 0
-                    last_update_time = time.time()
-                    stall_last_value = 0
-                    stall_check_time = time.time()
-                    STALL_TIMEOUT = 60
-
-                    while True:
-                        current = progress_counter_mp.value
-                        now = time.time()
-
-                        if now - last_update_time >= 0.5 or current >= total_queries:
-                            elapsed = now - total_query_start_time
-                            current_qps = current / elapsed if elapsed > 0 else 0.0
-                            pbar.update(current - last_value)
-                            pbar.set_postfix_str(f"{current_qps:.1f}")
-                            last_value = current
-                            last_update_time = now
-
-                        # 查询全部完成，退出进度条循环
-                        if current >= total_queries:
-                            break
-
-                        if current != stall_last_value:
-                            stall_last_value = current
-                            stall_check_time = now
-                        elif now - stall_check_time >= STALL_TIMEOUT:
-                            print(f"\n[WARNING] Query progress stalled for {STALL_TIMEOUT}s (stuck at {current}/{total_queries}). Restarting main.py...")
-                            raise QueryStallError(f"Query progress stalled for {STALL_TIMEOUT}s")
-
-                        time.sleep(0.1)
-
-                # 先从 Queue 读结果（必须在 join 之前，否则管道满时会死锁）
-                stats_list = [None] * self.num_query_threads
-                for _ in range(self.num_query_threads):
-                    worker_id, query_end_time, stats = result_queue.get()
-                    stats_list[worker_id] = stats
-                    thread_query_end_times[worker_id] = query_end_time
-
-                # 再 join 进程
-                for p in processes:
-                    p.join()
-
-                thread_stats = stats_list
-            else:
-                # 非分布式模式：仍使用线程（cluster 对象无法跨进程共享）
-                stats_list = [None] * self.num_query_threads
-                progress_counter = [0]
-                threads = []
-                for i in range(self.num_query_threads):
-                    t = threading.Thread(target=query, args=(i, stats_list, progress_counter))
-                    t.start()
-                    threads.append(t)
-
-                with tqdm(total=total_queries, desc="Querying", unit="qry",
-                          bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] QPS: {postfix}') as pbar:
-                    pbar.set_postfix_str("0.0")
-                    last_value = 0
-                    last_update_time = time.time()
-                    stall_last_value = 0
-                    stall_check_time = time.time()
-                    STALL_TIMEOUT = 60
-
-                    while any(t.is_alive() for t in threads):
-                        current = progress_counter[0]
-                        now = time.time()
-                        if now - last_update_time >= 0.5:
-                            elapsed = now - total_query_start_time
-                            current_qps = current / elapsed if elapsed > 0 else 0.0
-                            pbar.update(current - last_value)
-                            pbar.set_postfix_str(f"{current_qps:.1f}")
-                            last_value = current
-                            last_update_time = now
-
-                        if current != stall_last_value:
-                            stall_last_value = current
-                            stall_check_time = now
-                        elif now - stall_check_time >= STALL_TIMEOUT:
-                            print(f"\n[WARNING] Query progress stalled for {STALL_TIMEOUT}s (stuck at {current}/{total_queries}). Restarting main.py...")
-                            raise QueryStallError(f"Query progress stalled for {STALL_TIMEOUT}s")
-
-                        time.sleep(0.1)
-
-                    for t in threads:
-                        t.join()
-
-                    current = progress_counter[0]
-                    elapsed = time.time() - total_query_start_time
-                    current_qps = current / elapsed if elapsed > 0 else 0.0
-                    pbar.update(current - last_value)
-                    pbar.set_postfix_str(f"{current_qps:.1f}")
-
-                thread_stats = stats_list
-        else:
-            # 单线程模式也显示进度条
-            progress_counter = [0]
-            progress_lock = threading.Lock()
-            
-            # 包装query函数以显示进度
-            stats_list = [None]
-
-            # 单线程模式的看门狗线程：检测进度停滞
-            stall_detected = [False]
-            def _single_thread_watchdog(counter, stall_flag):
-                STALL_TIMEOUT = 10
-                last_val = counter[0]
-                last_change_time = time.time()
-                while not stall_flag[0]:
-                    time.sleep(1)
-                    cur = counter[0]
-                    if cur != last_val:
-                        last_val = cur
-                        last_change_time = time.time()
-                    elif time.time() - last_change_time >= STALL_TIMEOUT:
-                        print(f"\n[WARNING] Single-thread query progress stalled for {STALL_TIMEOUT}s (stuck at {cur}/{total_queries}). Restarting main.py...")
-                        stall_flag[0] = True
-                        # 中断主线程
-                        import ctypes
-                        ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                            ctypes.c_ulong(threading.main_thread().ident),
-                            ctypes.py_object(QueryStallError)
-                        )
-                        return
-
-            watchdog_thread = threading.Thread(target=_single_thread_watchdog, args=(progress_counter, stall_detected), daemon=True)
-            watchdog_thread.start()
-            
-            with tqdm(total=total_queries, desc="Querying", unit="qry",
-                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] QPS: {postfix}') as pbar:
-                pbar.set_postfix_str("0.0")
-                last_update_time = time.time()
-                
-                # 在主线程中执行查询
-                thread_sdk_client = None
-                if self.args.distributed:
-                    thread_sdk_client = ClusterSDKClient(
-                        ip=self.sdk_config['ip'],
-                        port=self.sdk_config['port'],
-                        comm_mode=self.comm_mode
-                    )
-                    # 所有分布式模式都需要初始化路由（包括 shard 模式）
-                    if not thread_sdk_client.init_routes():
-                        print("[Query] Warning: init_routes failed, using default endpoint")
-
-                local_recall = {}
-                local_remote_transfer_cnt = {}
-                local_remote_transfer_data = {}
-                local_distance_cnt = {}
-                local_backtrack_cnt = {}
-
-                try:
-                    import random
-                    query_indices = list(range(self.num_queries))
-                    random.seed(0)
-                    random.shuffle(query_indices)
-
-                    for idx, i in enumerate(query_indices):
-                        query_vec = queries[i]
-                        start_time = time.time()
-
-                        payload = Payload()
-                        if self.args.distributed:
-                            thread_sdk_client.query_send(i, query_vec, payload, k=self.k)
-                            ret_qid, results, ret_payload = thread_sdk_client.query_recv()
-                            results = set(results)
-                            local_remote_transfer_cnt[i] = ret_payload.remote_transfer_cnt
-                            local_remote_transfer_data[i] = ret_payload.remote_transfer_data
-                            local_distance_cnt[i] = ret_payload.distance_cnt
-                            local_backtrack_cnt[i] = ret_payload.backtrack_cnt
-                        else:
-                            if self.args.shard:
-                                results = self.cluster.query(i, query_vec, payload, self.k)
-                                results = set(results)
-                                local_remote_transfer_cnt[i] = 0
-                                local_remote_transfer_data[i] = 0.0
-                            else:
-                                results = self.cluster.nodes[self.host_id].query(i, query_vec, payload, k=self.k)
-                                results = set(results)
-                                local_remote_transfer_cnt[i] = payload.remote_transfer_cnt
-                                local_remote_transfer_data[i] = payload.remote_transfer_data
-                            local_distance_cnt[i] = payload.distance_cnt
-                            local_backtrack_cnt[i] = payload.backtrack_cnt
-                        true_ids = set(groundtruth[i][:self.k])
-                        correct = len(results.intersection(true_ids))
-                        local_recall[i] = correct / self.k
-
-                        # 更新进度条
-                        pbar.update(1)
-                        progress_counter[0] = pbar.n  # 同步给看门狗线程
-                        now = time.time()
-                        if now - last_update_time >= 0.5:
-                            elapsed = now - total_query_start_time
-                            current_qps = pbar.n / elapsed if elapsed > 0 else 0.0
-                            pbar.set_postfix_str(f"{current_qps:.1f}")
-                            last_update_time = now
-                finally:
-                    if thread_sdk_client:
-                        thread_sdk_client.disconnect()
-
-                stats_list[0] = {
-                    "recall": local_recall,
-                    "remote_transfer_cnt": local_remote_transfer_cnt,
-                    "remote_transfer_data": local_remote_transfer_data,
-                    "distance_cnt": local_distance_cnt,
-                    "backtrack_cnt": local_backtrack_cnt,
-                }
-            
-            # 查询正常完成，停止看门狗线程
-            stall_detected[0] = True
-            thread_stats = stats_list
-
-        # 注意：每个进程自己的连接已经在 query() 函数结束时断开
-
-        # 用各线程查询结束时间的平均值计算 QPS
-        valid_times = [t for t in thread_query_end_times if t > 0]
-        if valid_times:
-            avg_query_end = sum(valid_times) / len(valid_times)
-            total_query_time = avg_query_end - total_query_start_time
-            # 打印最快/最慢线程的 QPS
-            fastest_time = min(valid_times) - total_query_start_time
-            slowest_time = max(valid_times) - total_query_start_time
-            fastest_qps = self.num_queries / fastest_time if fastest_time > 0 else 0.0
-            slowest_qps = self.num_queries / slowest_time if slowest_time > 0 else 0.0
-            print(f"Fastest thread: {fastest_time:.4f}s, QPS={fastest_qps:.2f} | "
-                  f"Slowest thread: {slowest_time:.4f}s, QPS={slowest_qps:.2f} | "
-                  f"Gap: {slowest_time - fastest_time:.4f}s")
-        else:
-            total_query_time = time.time() - total_query_start_time
-        qps = self.num_queries * self.num_query_threads / total_query_time if total_query_time > 0 else 0.0
-
-        return thread_stats, total_query_time, qps
-
     def save_graph(self):
+        """保存已建好的 HNSW 图。分布式模式通过 SDK 在远端保存，单机模式本地保存。"""
         if not self.args.save:
             return
         save_dir = "./save"
@@ -1464,18 +1014,12 @@ class VectorRetrieveRunner:
         if self.args.distributed:
             base = (f"{save_dir}/hnsw-{self.data_name}-m{self.m}-"
                     f"efc{self.ef_construction}-ll{self.limited_level}")
-            cluster_path = f"{base}-cluster.json"
             hnsw_path = f"{base}.json"
 
             sdk_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
             if not sdk_client.connect():
                 raise RuntimeError("Failed to connect SDK to local node for save")
             try:
-                # print(f"Saving cluster state to {cluster_path}...")
-                # sdk_client.save_cluster(cluster_path)
-                # self.cluster_path = cluster_path
-                # print(f"Cluster saved: {os.path.abspath(cluster_path)}")
-
                 print(f"Saving local HNSW to {hnsw_path}...")
                 sdk_client.save_hnsw(hnsw_path)
                 self.graph_path = hnsw_path
@@ -1488,8 +1032,164 @@ class VectorRetrieveRunner:
             print(f"Saving graph state to {self.graph_path}...")
             self.hnsw.save(self.graph_path)
 
-    def save_results(self, thread_stats, total_query_time, qps, qps_runs=None):
-        # --- 计算并打印最终结果 ---
+    def orchestrate_distributed_query(self):
+        """
+        协调多台机器并行发 query。
+        通过 SSH 在 query_nodes 列表（来自 config.json）的每台机器上启动 query.py，
+        使用文件屏障保证同时开始，最后聚合每个 rank 的结果。
+        """
+        if not self.query_nodes:
+            print("No query_nodes in config.json, skipping distributed query orchestration")
+            return None
+
+        world_size = len(self.query_nodes)
+        # self.num_query_threads 是全局总线程数；每个 rank 平分
+        per_rank_threads = max(1, self.num_query_threads // world_size)
+        print(f"[orchestrate] Global query threads: {self.num_query_threads}, per-rank: {per_rank_threads}")
+
+        # 创建屏障目录 + 清理 tmp/query_results 旧文件
+        barrier_dir = os.path.abspath(os.path.join(project_root, "barrier"))
+        tmp_query_dir = os.path.abspath(os.path.join(project_root, "tmp", "query_results"))
+        import shutil
+        if os.path.exists(barrier_dir):
+            shutil.rmtree(barrier_dir)
+        os.makedirs(barrier_dir, exist_ok=True)
+        if os.path.exists(tmp_query_dir):
+            shutil.rmtree(tmp_query_dir)
+        os.makedirs(tmp_query_dir, exist_ok=True)
+
+        # 启动 query.py：默认 SSH，--slurm 时用 srun --overlap
+        use_slurm = bool(self.args.slurm)
+        ssh_procs = []
+        for rank, qnode in enumerate(self.query_nodes):
+            host = qnode["ip"]
+            srun_target = qnode.get("hostname") or host  # srun -w 优先用 hostname
+            user = qnode.get("user_name", self.host_user_name)
+            log_file = os.path.join(project_root, f"query_rank{rank}.log")
+            query_args = (
+                f"--data_name {self.data_name} "
+                f"--dtype {_active_dtype} "
+                f"--k {self.k} "
+                f"--ef_search {self.ef_search} "
+                f"--num_query_threads {per_rank_threads} "
+                f"--num_runs {self.args.num_runs} "
+                f"--query_rank {rank} "
+                f"--query_world_size {world_size} "
+                f"--comm_mode {self.comm_mode} "
+                f"--barrier_dir {barrier_dir} "
+            )
+
+            if use_slurm:
+                # srun --overlap：在 sbatch 已分配的节点上叠加 job step（被 SLURM 跟踪）
+                srun_cmd = [
+                    "srun", "-N1", "-n1",
+                    "--overlap",
+                    "--overcommit",
+                    "--export=ALL",
+                    "-w", srun_target,
+                    "-o", log_file,
+                    "-e", log_file,
+                    "bash", "-lc",
+                    f"cd {project_root} && eval \"$(conda shell.bash hook)\" && conda activate vector-retrieve && "
+                    f"python -u query.py {query_args}"
+                ]
+                print(f"[orchestrate] srun launch query.py on rank {rank} ({host})")
+                proc = subprocess.Popen(srun_cmd,
+                                        stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE)
+            else:
+                cmd_str = (
+                    f"cd {project_root} && conda activate vector-retrieve && "
+                    f"python -u query.py {query_args} > {log_file} 2>&1"
+                )
+                ssh_cmd = ["ssh", "-o", "BatchMode=yes",
+                           f"{user}@{host}", cmd_str]
+                print(f"[orchestrate] ssh launch query.py on rank {rank} ({host})")
+                proc = subprocess.Popen(ssh_cmd,
+                                        stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE)
+            ssh_procs.append((rank, host, proc, log_file))
+
+        # 多轮文件屏障协议：
+        #   1. 等所有 rank 写 ready_<rank>_<run>
+        #   2. 写 go_<run>（含 3s 后的 scheduled_start 时间戳）
+        #   3. 各 rank 同时读到 go 文件，等待到 scheduled_start 之后开始并发查询
+        # 进程死亡或超时写 abort 文件通知其他 rank 终止。
+        num_runs = self.args.num_runs
+        first_round_scheduled_start = None
+        last_round_scheduled_start = None
+        for run_idx in range(num_runs):
+            print(f"[orchestrate] Round {run_idx+1}/{num_runs}: waiting for {world_size} ready files...")
+            ready_timeout = 600 if run_idx == 0 else 300
+            wait_start = time.time()
+            while True:
+                ready_count = sum(1 for r in range(world_size)
+                                  if os.path.exists(os.path.join(barrier_dir, f"ready_{r}_{run_idx}")))
+                if ready_count >= world_size:
+                    print(f"[orchestrate]   round {run_idx+1}: all ready after {time.time()-wait_start:.2f}s")
+                    break
+                # 检查 SSH/srun 进程是否死亡
+                for rank, host, proc, log_file in ssh_procs:
+                    if proc.poll() is not None and proc.returncode != 0:
+                        try:
+                            stderr = proc.stderr.read().decode(errors='replace') if proc.stderr else ""
+                        except Exception:
+                            stderr = ""
+                        print(f"[orchestrate] ERROR: query rank {rank} on {host} died (rc={proc.returncode}). stderr: {stderr[:500]}")
+                        with open(os.path.join(barrier_dir, "abort"), "w") as f:
+                            f.write("aborted")
+                        return None
+                if time.time() - wait_start > ready_timeout:
+                    print(f"[orchestrate] TIMEOUT round {run_idx+1}: only {ready_count}/{world_size} ready after {ready_timeout}s")
+                    with open(os.path.join(barrier_dir, "abort"), "w") as f:
+                        f.write("timeout")
+                    return None
+                time.sleep(0.1)
+
+            # 写 go_<run_idx> 文件，3s 后让所有 rank 同步开始
+            go_file = os.path.join(barrier_dir, f"go_{run_idx}")
+            scheduled_start = time.time() + 3.0
+            if run_idx == 0:
+                first_round_scheduled_start = scheduled_start
+            last_round_scheduled_start = scheduled_start
+            with open(go_file + ".tmp", "w") as f:
+                f.write(f"{scheduled_start:.6f}\n")
+            os.replace(go_file + ".tmp", go_file)
+            print(f"[orchestrate]   round {run_idx+1}: GO sent, scheduled start at {time.strftime('%H:%M:%S', time.localtime(scheduled_start))}")
+
+        # 等所有 query.py 完成；记录每个 rank 的完成时刻
+        print(f"[orchestrate] Waiting for all query.py instances to finish...")
+        rank_finish_times = []
+        for rank, host, proc, log_file in ssh_procs:
+            try:
+                stdout, stderr = proc.communicate()
+                finish_t = time.time()
+                rank_finish_times.append(finish_t)
+                rc = proc.returncode
+                tail_log = ""
+                try:
+                    with open(log_file, "r") as f:
+                        lines = f.readlines()
+                        tail_log = "".join(lines[-15:])
+                except Exception:
+                    pass
+                print(f"[orchestrate] rank {rank} ({host}) finished at +{finish_t - first_round_scheduled_start:.2f}s, rc={rc}")
+                if tail_log:
+                    print(f"  log tail:\n{tail_log}")
+            except Exception as e:
+                print(f"[orchestrate] rank {rank} ({host}): error waiting: {e}")
+
+        # main.py 视角的 wall-clock：从第一轮 scheduled_start 到最后一个 rank 完成
+        # （含 num_runs 轮 + 各轮间的同步等待）
+        wallclock_total_time = (max(rank_finish_times) - first_round_scheduled_start) if rank_finish_times and first_round_scheduled_start else 0.0
+
+        # 聚合每个 rank 的结果（从 tmp 临时目录读取，聚合完后删除临时目录）
+        print(f"[orchestrate] Aggregating results from {world_size} ranks...")
+        tmp_dir = os.path.join(project_root, "tmp", "query_results")
+
+        # 合并 per-query 字典
         recall = {}
         remote_transfer_cnt = {}
         remote_transfer_data = {}
@@ -1497,43 +1197,100 @@ class VectorRetrieveRunner:
         pull_cnt = {}
         pull_data = {}
         backtrack_cnt = {}
-        for s in thread_stats:
-            if not s:
+        per_rank_qps = []
+        per_rank_qps_runs_all = []
+        per_rank_query_time = []
+        per_rank_assigned = []
+        per_rank_query_times_runs = []  # 每 rank 每轮的 query_time
+
+        for rank in range(world_size):
+            rpath = os.path.join(tmp_dir, f"rank{rank}-of{world_size}.json")
+            if not os.path.exists(rpath):
+                print(f"  rank {rank}: NO RESULTS FILE FOUND ({rpath})")
                 continue
-            recall.update(s["recall"])
-            remote_transfer_cnt.update(s["remote_transfer_cnt"])
-            remote_transfer_data.update(s["remote_transfer_data"])
-            distance_cnt.update(s["distance_cnt"])
-            pull_cnt.update(s.get("pull_cnt", {}))
-            pull_data.update(s.get("pull_data", {}))
-            backtrack_cnt.update(s.get("backtrack_cnt", {}))
+            with open(rpath) as f:
+                rj = json.load(f)
+            per_rank_qps.append(rj.get("qps", 0.0))
+            per_rank_assigned.append(rj.get("num_queries_assigned", 0))
+            per_rank_qps_runs_all.append(rj.get("qps_runs", []))
+            per_rank_query_time.append(rj.get("last_query_time", 0.0))
+            per_rank_query_times_runs.append(rj.get("query_times_runs", []))
+            # 合并字典（key 已是字符串，转回 int 以统一）
+            for k_str, v in rj.get("recall", {}).items():
+                recall[int(k_str)] = v
+            for k_str, v in rj.get("remote_transfer_cnt", {}).items():
+                remote_transfer_cnt[int(k_str)] = v
+            for k_str, v in rj.get("remote_transfer_data", {}).items():
+                remote_transfer_data[int(k_str)] = v
+            for k_str, v in rj.get("distance_cnt", {}).items():
+                distance_cnt[int(k_str)] = v
+            for k_str, v in rj.get("backtrack_cnt", {}).items():
+                backtrack_cnt[int(k_str)] = v
+            for k_str, v in rj.get("pull_cnt", {}).items():
+                pull_cnt[int(k_str)] = v
+            for k_str, v in rj.get("pull_data", {}).items():
+                pull_data[int(k_str)] = v
+            print(f"  rank {rank}: QPS={rj.get('qps', 0):.2f}, queries={rj.get('num_queries_assigned', 0)}")
 
-        avg_recall = sum(recall.values()) / self.num_queries
+        # num_queries 为聚合后的总数（所有 rank 的并集）
+        num_queries = len(recall)
+        if num_queries == 0:
+            print("[orchestrate] ERROR: no query results aggregated")
+            return None
+
+        avg_recall = sum(recall.values()) / num_queries
         all_remote_transfer_cnt = sum(remote_transfer_cnt.values())
-        avg_remote_transfer_cnt = all_remote_transfer_cnt / self.num_queries
+        avg_remote_transfer_cnt = all_remote_transfer_cnt / num_queries
         avg_remote_transfer_data_per_transfer = sum(remote_transfer_data.values()) / all_remote_transfer_cnt if all_remote_transfer_cnt > 0 else 0.0
-        avg_remote_transfer_data_per_query = sum(remote_transfer_data.values()) / self.num_queries
+        avg_remote_transfer_data_per_query = sum(remote_transfer_data.values()) / num_queries
         all_distance_cnt = sum(distance_cnt.values())
-        avg_distance_cnt = all_distance_cnt / self.num_queries
+        avg_distance_cnt = all_distance_cnt / num_queries
 
-        # 折返统计：backtrack_cnt 为 transfer 命中最近 max_track_num 窗口的次数，
-        # backtrack_ratio 以 remote_transfer_cnt 为分母，反映整体折返占比。
         all_backtrack_cnt = sum(backtrack_cnt.values()) if backtrack_cnt else 0
-        avg_backtrack_cnt = all_backtrack_cnt / self.num_queries if self.num_queries else 0.0
+        avg_backtrack_cnt = all_backtrack_cnt / num_queries if num_queries else 0.0
         backtrack_ratio = all_backtrack_cnt / all_remote_transfer_cnt if all_remote_transfer_cnt > 0 else 0.0
 
-        # global-pull 模式拉取统计
         all_pull_cnt = sum(pull_cnt.values()) if pull_cnt else 0
-        avg_pull_cnt = all_pull_cnt / self.num_queries if self.num_queries else 0.0
+        avg_pull_cnt = all_pull_cnt / num_queries if num_queries else 0.0
         all_pull_data = sum(pull_data.values()) if pull_data else 0
         avg_pull_data_per_pull = all_pull_data / all_pull_cnt if all_pull_cnt > 0 else 0.0
-        avg_pull_data_per_query = all_pull_data / self.num_queries if self.num_queries else 0.0
+        avg_pull_data_per_query = all_pull_data / num_queries if num_queries else 0.0
 
+        # 总 QPS 计算：
+        #   每轮 wall-clock = max(各 rank query_time)（文件屏障保证同步起始，最慢 rank 决定该轮耗时）
+        #   每轮总查询数 = Σ(per_rank_assigned) × per_rank_threads（所有 rank 线程并发处理不同 query）
+        #   总 wall-clock = Σ(每轮 wall-clock)，不包含轮间同步等待时间
+        max_runs = max((len(r) for r in per_rank_query_times_runs), default=0)
+        per_run_wallclock = []
+        per_run_total_queries_count = sum(per_rank_assigned) * per_rank_threads
+        qps_runs = []
+        for run_i in range(max_runs):
+            run_max_t = max(
+                (times[run_i] for times in per_rank_query_times_runs if run_i < len(times)),
+                default=0.0
+            )
+            per_run_wallclock.append(run_max_t)
+            qps_runs.append(per_run_total_queries_count / run_max_t if run_max_t > 0 else 0.0)
+
+        # 最终 QPS = 各轮平均（>=3 轮去最高最低）
+        if len(qps_runs) >= 3:
+            sorted_runs = sorted(qps_runs)
+            total_qps = sum(sorted_runs[1:-1]) / len(sorted_runs[1:-1])
+        elif qps_runs:
+            total_qps = sum(qps_runs) / len(qps_runs)
+        else:
+            total_qps = 0.0
+        total_query_time = sum(per_run_wallclock)
+
+        print("-" * 30)
+        print("Per-round breakdown (wallclock = max query_time across ranks):")
+        for i, (wc, q) in enumerate(zip(per_run_wallclock, qps_runs)):
+            print(f"  Round {i+1}: wallclock={wc:.4f}s, QPS={q:.2f}")
         print("-" * 30)
         print("Evaluation Results:")
         print(f"Recall@{self.k}: {avg_recall:.4f}")
-        print(f"QPS: {qps:.4f}")
-        print(f"Query Time Total: {total_query_time:.4f} seconds")
+        print(f"QPS: {total_qps:.4f} (mean of {len(qps_runs)} rounds{', extreme trimmed' if len(qps_runs) >= 3 else ''})")
+        print(f"Query Time Total: {total_query_time:.4f} seconds (sum of per-round wallclock)")
         print(f"Average Remote Transfer Count per Query: {avg_remote_transfer_cnt:.4f}")
         print(f"Average Remote Transfer Data per Transfer: {avg_remote_transfer_data_per_transfer:.0f} bits ({avg_remote_transfer_data_per_transfer/8:.0f} bytes)")
         print(f"Average Remote Transfer Data per Query: {avg_remote_transfer_data_per_query:.0f} bits ({avg_remote_transfer_data_per_query/8:.0f} bytes)")
@@ -1545,114 +1302,89 @@ class VectorRetrieveRunner:
             print(f"Average Pull Data per Query: {avg_pull_data_per_query:.0f} bits ({avg_pull_data_per_query/8:.0f} bytes)")
         print("-" * 30)
 
-        # --- 保存所有结果 ---
-        print("-" * 30)
+        # ----- 通过 SDK 获取 hnsw / cluster 参数（与原 save_results 保持一致） -----
+        sdk_idx = max(0, self.host_id)
+        info_ip = '127.0.0.1' if self.host_is_node else self.node_ips[0]
+        info_port = self.node_ports[sdk_idx]
+        info_client = ClusterSDKClient(ip=info_ip, port=info_port, comm_mode=self.comm_mode)
+        if not info_client.connect():
+            raise RuntimeError("Failed to connect SDK for get_information")
+        try:
+            info = info_client.get_information()
+        finally:
+            info_client.disconnect()
 
-        # 构建统计参数
-        if self.args.distributed:
-            # 分布式模式：通过 SDK 获取与非分布式一致的参数
-            info_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
-            if not info_client.connect():
-                raise RuntimeError("Failed to connect SDK to local node for get_information")
-            try:
-                info = info_client.get_information()
-            finally:
-                info_client.disconnect()
+        hnsw_info = info.get("hnsw") if isinstance(info, dict) else None
+        cluster_info = info.get("cluster") if isinstance(info, dict) else None
 
-            hnsw_info = info.get("hnsw") if isinstance(info, dict) else None
-            cluster_info = info.get("cluster") if isinstance(info, dict) else None
+        hnsw_params = {
+            "data_name": self.data_name,
+            "dim": hnsw_info.get("dim") if hnsw_info else None,
+            "m": hnsw_info.get("m") if hnsw_info else self.m,
+            "ef_construction": hnsw_info.get("ef_construction") if hnsw_info else self.ef_construction,
+            "ef_search": hnsw_info.get("ef_search") if hnsw_info else self.ef_search,
+            "limited_level": hnsw_info.get("limited_level") if hnsw_info else self.limited_level,
+            "max_level": hnsw_info.get("max_level") if hnsw_info else self.limited_level,
+        }
+        cluster_params = {
+            "node_num": cluster_info.get("node_num") if cluster_info else self.node_num,
+            "partition_mode": cluster_info.get("partition_mode") if cluster_info else self.partition_mode,
+            "replication_level": cluster_info.get("replication_level") if cluster_info else self.replication,
+            "replication_num": cluster_info.get("replication_num") if cluster_info else 0,
+            "bandwidth": cluster_info.get("bandwidth") if cluster_info else 0,
+            "is_distributed": cluster_info.get("is_distributed") if cluster_info else True,
+            "is_shard": cluster_info.get("is_shard") if cluster_info else self.args.shard,
+            "is_global_pull": cluster_info.get("is_global_pull") if cluster_info else self.args.is_global_pull,
+            "max_track_num": self.max_track_num,
+        }
+        if cluster_params["partition_mode"] == "layer":
+            cluster_params["layer_partition_mode"] = self.partition_mode
+            cluster_params["layer_config"] = cluster_info.get("layer_config") if cluster_info else self.layer_config
+            cluster_params["layer_replicate_flags"] = cluster_info.get("layer_replicate_flags") if cluster_info else self.layer_replicate_flags
 
-            hnsw_params = {
-                "data_name": self.data_name,
-                "dim": hnsw_info.get("dim") if hnsw_info else None,
-                "m": hnsw_info.get("m") if hnsw_info else self.m,
-                "ef_construction": hnsw_info.get("ef_construction") if hnsw_info else self.ef_construction,
-                "ef_search": hnsw_info.get("ef_search") if hnsw_info else self.ef_search,
-                "limited_level": hnsw_info.get("limited_level") if hnsw_info else self.limited_level,
-                "max_level": hnsw_info.get("max_level") if hnsw_info else self.limited_level
-            }
-            cluster_params = {
-                "node_num": cluster_info.get("node_num") if cluster_info else self.node_num,
-                "partition_mode": cluster_info.get("partition_mode") if cluster_info else self.partition_mode,
-                "replication_level": cluster_info.get("replication_level") if cluster_info else self.replication,
-                "replication_num": cluster_info.get("replication_num") if cluster_info else 0,
-                "bandwidth": cluster_info.get("bandwidth") if cluster_info else 0,
-                "is_distributed": cluster_info.get("is_distributed") if cluster_info else True,
-                "is_shard": cluster_info.get("is_shard") if cluster_info else self.args.shard,
-                "is_global_pull": cluster_info.get("is_global_pull") if cluster_info else self.args.is_global_pull,
-                "max_track_num": self.max_track_num,
-            }
-
-            if cluster_params["partition_mode"] == "layer":
-                cluster_params["layer_partition_mode"] = self.partition_mode
-                cluster_params["layer_config"] = cluster_info.get("layer_config") if cluster_info else self.layer_config
-        else:
-            # 非分布式模式：保存完整的hnsw和cluster参数
-            hnsw_params = {
-                "data_name": self.data_name,
-                "dim": self.hnsw.dim,
-                "m": self.hnsw.m,
-                "ef_construction": self.hnsw.ef_construction,
-                "ef_search": self.hnsw.ef_search,
-                "limited_level": self.hnsw.limited_level,
-                "max_level": self.hnsw.max_level
-            }
-            cluster_params = {
-                "node_num": self.cluster.node_num,
-                "partition_mode": self.cluster.partition_mode,
-                "replication_level": self.cluster.replication_level,
-                "replication_num": self.cluster.replication_num,
-                "bandwidth": self.cluster.bandwidth,
-                "is_distributed": self.cluster.is_distributed,
-                "is_shard": self.cluster.is_shard,
-                "is_global_pull": self.cluster.is_global_pull,
-                "max_track_num": self.max_track_num,
-            }
-
-            if self.cluster.partition_mode == "layer":
-                cluster_params["layer_partition_mode"] = self.partition_mode
-                cluster_params["layer_config"] = self.layer_config
+        # self.num_query_threads 已经是全局总数
+        total_query_threads = self.num_query_threads
 
         stats = {
             "hnsw_params": hnsw_params,
             "cluster_params": cluster_params,
-            "num_queries": self.num_queries,
-            "num_query_threads": self.num_query_threads,
+            "num_queries": num_queries,
+            "num_query_threads": total_query_threads,
             "num_threads": self.num_threads,
             "k": self.k,
-            "qps": qps,
-            "qps_runs": qps_runs if qps_runs else [qps],
+            "qps": total_qps,
+            "qps_runs": qps_runs if qps_runs else [total_qps],
             f"avg_recall@{self.k}": avg_recall,
             "avg_remote_transfer_cnt": avg_remote_transfer_cnt,
             "avg_remote_transfer_data_per_transfer": avg_remote_transfer_data_per_transfer,
             "avg_remote_transfer_data_per_query": avg_remote_transfer_data_per_query,
             "avg_distance_cnt": avg_distance_cnt,
-            "avg_pull_cnt": avg_pull_cnt,
-            "avg_pull_data_per_pull": avg_pull_data_per_pull,
-            "avg_pull_data_per_query": avg_pull_data_per_query,
             "avg_backtrack_cnt": avg_backtrack_cnt,
             "backtrack_ratio": backtrack_ratio,
             "recall": recall,
             "remote_transfer_cnt": remote_transfer_cnt,
             "remote_transfer_data": remote_transfer_data,
             "distance_cnt": distance_cnt,
-            "pull_cnt": pull_cnt,
-            "pull_data": pull_data,
             "backtrack_cnt": backtrack_cnt,
         }
-        if self.use_cpp:
-            results_dir = "./results/cpp"
-        else:
-            results_dir = "./results/python"
+        if self.args.is_global_pull:
+            stats["avg_pull_cnt"] = avg_pull_cnt
+            stats["avg_pull_data_per_pull"] = avg_pull_data_per_pull
+            stats["avg_pull_data_per_query"] = avg_pull_data_per_query
+            stats["pull_cnt"] = pull_cnt
+            stats["pull_data"] = pull_data
+
+        # 与原 save_results 文件名格式完全一致
+        results_dir = "./results/cpp" if self.use_cpp else "./results/python"
         os.makedirs(results_dir, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
         distributed_suffix = "-distributed" if self.args.distributed else ""
         cpu_suffix = f"-cpus{self.args.num_cpu}" if self.args.distributed and self.args.num_cpu != 0 else ""
         shard_suffix = "-shard" if self.args.shard else ""
         global_pull_suffix = "-global_pull" if self.args.is_global_pull else ""
         layer_suffix = "-layer" if self.use_layer else ""
+        # 文件名里的 query_threads 用全局总数（各 rank 之和）
+        qt_suffix = f"-query_threads{total_query_threads}"
 
-        qt_suffix = f"-query_threads{self.num_query_threads}"
         if self.args.shard:
             results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
                             f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
@@ -1672,21 +1404,24 @@ class VectorRetrieveRunner:
         with open(results_path, 'w') as f:
             json.dump(stats, f, indent=4)
 
-        # Print all saved paths
         print("\n" + "=" * 50)
         print(f"Results: {os.path.abspath(results_path)}")
-        if not self.args.distributed and self.graph_path:
-            print(f"Graph: {os.path.abspath(self.graph_path)}")
-        if not self.args.distributed and self.cluster_path:
-            print(f"Cluster: {os.path.abspath(self.cluster_path)}")
         if self.args.distributed:
             print("Distributed mode: Graph and Cluster managed by worker nodes")
         print("=" * 50 + "\n")
 
+        # 删除临时文件
+        try:
+            import shutil
+            shutil.rmtree(tmp_dir)
+            print(f"[orchestrate] Removed tmp dir: {tmp_dir}")
+        except Exception as e:
+            print(f"[orchestrate] Warning: failed to remove tmp dir: {e}")
+
         return results_path
 
     def cleanup_workers(self, force=False):
-        if not force and self.args.no_cleanup:
+        """清理所有节点上的 worker 进程。两阶段：本地进程句柄 → 本地 PID → 远程 SSH。"""
             print("Skipping worker cleanup (--no_cleanup)")
             return
         # 终止查询 worker 进程（避免成为孤儿进程继续尝试连接已关闭的节点）
@@ -1778,8 +1513,6 @@ if __name__ == "__main__":
     parser.add_argument("--node_num", type=int, default=6, help="Number of cluster nodes")
     parser.add_argument("--partition_mode", type=str, default="k-means", help="Data partition mode across nodes")
     parser.add_argument("--layer", action='store_true', default=False, help="Enable layer-based partitioning")
-    parser.add_argument("--layer_config", type=str, default="{}", help="Layer configuration in JSON format")
-    parser.add_argument("--layer_replicate_flags", type=str, default="[]", help="Layer replicate flags in JSON list; default behavior is [false,false,true,...] based on limited_level")
     parser.add_argument("--replication", type=int, default=2, help="Replication level for data replication across nodes")
     parser.add_argument("--distributed", default=False, action='store_true', help="Enable distributed mode")
     parser.add_argument("--shard", default=False, action='store_true', help="Enable shard mode (independent graphs per node)")
@@ -1798,6 +1531,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_runs", type=int, default=1, help="Number of query runs (>=3: trim max/min then average QPS)")
     parser.add_argument("--skip_prepare", action='store_true', default=False, help="Skip graph loading and partitioning (assume servers are already prepared)")
     parser.add_argument("--no_cleanup", action='store_true', default=False, help="Do not cleanup worker processes on exit")
+    parser.add_argument("--skip_queries", action='store_true', default=False, help="Skip the query phase (only build/partition/save). Use when queries run on separate machines via query.py.")
+    parser.add_argument("--slurm", action='store_true', default=False, help="Use srun (SLURM) instead of ssh to launch query.py on each query node. Default: ssh.")
 
     args = parser.parse_args(rest)
 
@@ -1872,43 +1607,17 @@ if __name__ == "__main__":
                 except Exception as e:
                     print(f"  Node {i} ({ip}): error: {e}")
 
-        if num_runs <= 1:
-            # 单次运行
-            thread_stats, total_query_time, qps = runner.run_queries()
-            runner.save_results(thread_stats, total_query_time, qps)
+        if args.skip_queries:
+            print("\n[skip_queries] Skipping query phase entirely (build/partition/save only).")
+        elif runner.query_nodes:
+            # 多机分布式查询模式：通过 SSH 在每台 query 主机上启动 query.py，文件屏障同步
+            print(f"\n{'='*60}\n  Distributed Query Mode (query_nodes from config.json)\n{'='*60}")
+            runner.orchestrate_distributed_query()
         else:
-            # 多次运行取 QPS 均值
-            qps_list = []
-            last_thread_stats = None
-            last_total_query_time = None
-            for run_idx in range(num_runs):
-                print(f"\n{'='*60}")
-                print(f"  Query Run {run_idx + 1}/{num_runs}")
-                print(f"{'='*60}")
-                if run_idx > 0:
-                    # 等待上一轮 worker 进程完全退出，让服务端 msg_pool_ 排空
-                    time.sleep(3)
-                thread_stats, total_query_time, qps = runner.run_queries()
-                qps_list.append(qps)
-                last_thread_stats = thread_stats
-                last_total_query_time = total_query_time
-                print(f"  Run {run_idx + 1}/{num_runs} QPS: {qps:.2f}")
-
-            # 去掉最高最低取均值
-            if len(qps_list) >= 3:
-                sorted_qps = sorted(qps_list)
-                trimmed = sorted_qps[1:-1]
-                avg_qps = sum(trimmed) / len(trimmed)
-            else:
-                avg_qps = sum(qps_list) / len(qps_list)
-
-            print(f"\n{'='*60}")
-            print(f"  QPS runs: {[round(q, 2) for q in qps_list]}")
-            print(f"  QPS avg (trimmed): {avg_qps:.2f}")
-            print(f"{'='*60}")
-
-            # 用最后一次的 thread_stats 保存结果，QPS 用均值
-            runner.save_results(last_thread_stats, last_total_query_time, avg_qps, qps_runs=qps_list)
+            print("\n[main.py] No query_nodes in config.json and --skip_queries not set.")
+            print("  main.py only orchestrates: workers + build + partition + save.")
+            print("  To run queries, either add 'query_nodes' to config.json (multi-machine via query.py)")
+            print("  or run query.py manually on each query machine.")
     except (QueryStallError, RuntimeError) as e:
         if os.environ.get('NO_RESTART'):
             print(f"[NO_RESTART] {type(e).__name__}: {e}. Skipping auto-restart for debugging.")
@@ -1916,12 +1625,13 @@ if __name__ == "__main__":
             sys.exit(2)
         print(f"[RESTART] {type(e).__name__}: {e}. Cleaning up and restarting main.py...")
         runner.cleanup_workers(force=True)
-        # 重启时去掉 --skip_prepare，重新启动服务；保留 --no_cleanup 以维持 batch 的服务复用逻辑
+        # 重启策略：
+        #   1. 去掉 --skip_prepare（需重新启动 worker 服务）
+        #   2. 保留 --no_cleanup（batch 模式复用已启动的服务）
+        #   3. 若已有保存的图，自动加 --graph_path 跳过重建
         restart_argv = [a for a in sys.argv if a != '--skip_prepare']
-        # 如果有已保存的图，加上 --graph_path 避免重新建图
         graph_path = runner.graph_path
         if not graph_path:
-            # 根据参数推算默认保存路径
             graph_path = f"./save/hnsw-{runner.data_name}-m{runner.m}-efc{runner.ef_construction}-ll{runner.limited_level}.json"
         if graph_path and os.path.exists(graph_path):
             if '--graph_path' not in restart_argv:

@@ -19,7 +19,7 @@ _CONFIG_PATH = os.path.join(project_root, "config.json")
 with open(_CONFIG_PATH, "r") as _f:
     _CLUSTER_CONFIG = json.load(_f)
 # IP -> port 映射（任一参与过集群的节点都必须在 config.json 的 nodes 列表里）
-_IP_TO_PORT = {nd["ip"]: int(nd["port"]) for nd in _CLUSTER_CONFIG["nodes"]}
+_IP_TO_PORT = {nd["ip"]: int(nd["port"]) for nd in _CLUSTER_CONFIG["work_nodes"]}
 
 if os.path.isdir(build_dir):
     os.environ['PYTHONPATH'] = f"{build_dir}:{os.environ.get('PYTHONPATH','')}"
