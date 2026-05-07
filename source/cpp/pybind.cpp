@@ -553,6 +553,10 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def("query_batch", &ClusterSDKClient<float>::query_batch,
              py::arg("query_ids"), py::arg("query_vectors"), py::arg("payloads"), py::arg("k") = 10,
              py::call_guard<py::gil_scoped_release>())
+        .def("save_cluster_all", &ClusterSDKClient<float>::save_cluster_all,
+             py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
+        .def("load_cluster_all", &ClusterSDKClient<float>::load_cluster_all,
+             py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<float>::partition,
              py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
@@ -605,6 +609,10 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def("query_batch", &ClusterSDKClient<double>::query_batch,
              py::arg("query_ids"), py::arg("query_vectors"), py::arg("payloads"), py::arg("k") = 10,
              py::call_guard<py::gil_scoped_release>())
+        .def("save_cluster_all", &ClusterSDKClient<double>::save_cluster_all,
+             py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
+        .def("load_cluster_all", &ClusterSDKClient<double>::load_cluster_all,
+             py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<double>::partition,
              py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
@@ -657,6 +665,10 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def("query_batch", &ClusterSDKClient<int32_t>::query_batch,
              py::arg("query_ids"), py::arg("query_vectors"), py::arg("payloads"), py::arg("k") = 10,
              py::call_guard<py::gil_scoped_release>())
+        .def("save_cluster_all", &ClusterSDKClient<int32_t>::save_cluster_all,
+             py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
+        .def("load_cluster_all", &ClusterSDKClient<int32_t>::load_cluster_all,
+             py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<int32_t>::partition,
              py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
@@ -709,6 +721,10 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def("query_batch", &ClusterSDKClient<uint32_t>::query_batch,
              py::arg("query_ids"), py::arg("query_vectors"), py::arg("payloads"), py::arg("k") = 10,
              py::call_guard<py::gil_scoped_release>())
+        .def("save_cluster_all", &ClusterSDKClient<uint32_t>::save_cluster_all,
+             py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
+        .def("load_cluster_all", &ClusterSDKClient<uint32_t>::load_cluster_all,
+             py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<uint32_t>::partition,
              py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
@@ -871,6 +887,10 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def("query_batch", &ClusterSDKClient<uint8_t>::query_batch,
              py::arg("query_ids"), py::arg("query_vectors"), py::arg("payloads"), py::arg("k") = 10,
              py::call_guard<py::gil_scoped_release>())
+        .def("save_cluster_all", &ClusterSDKClient<uint8_t>::save_cluster_all,
+             py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
+        .def("load_cluster_all", &ClusterSDKClient<uint8_t>::load_cluster_all,
+             py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<uint8_t>::partition,
              py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},

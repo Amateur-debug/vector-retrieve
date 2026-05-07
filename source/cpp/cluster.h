@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sys/file.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -658,11 +659,17 @@ HNSWGraph<T> *deserialize_hnsw_subset(Buffer &buf, bool do_compact = true)
 
     LOG_DEBUG_STREAM("Deserialized HNSW subset: " << cur_count << " elements, " << hnsw->local_vids_.size() << " local vids.");
 
-    if (do_compact)
+    if (do_compact && hnsw->local_vids_.size() < cur_count)
     {
         // 紧凑重排：仅保留本地持有的向量，远程邻居以负数编码 -(vid+1) 表示
         hnsw->compact();
         LOG_DEBUG_STREAM("Compacted HNSW subset: " << hnsw->get_cur_element_count() << " local elements, max_elements=" << hnsw->max_elements_);
+    }
+    else if (do_compact)
+    {
+        // 所有元素都是本地向量，图已经是紧凑格式，无需 compact
+        hnsw->is_global_pull_mode_ = false;
+        LOG_DEBUG_STREAM("Skipped compact (already compacted): " << cur_count << " local elements.");
     }
     else
     {
@@ -2168,129 +2175,88 @@ public:
     }
 
     // 保存 cluster 状态到文件
+    // 保存当前节点的分区子图 + routing（二进制紧凑格式）
     bool save(const string &filepath)
     {
         try
         {
-            json j;
-            j["node_num"] = node_num;
-            j["bandwidth"] = bandwidth;
-            j["partition_mode"] = partition_mode;
-            j["outer_ring_max_iterations"] = outer_ring_max_iterations;
-            j["replication_level"] = replication_level;
-            j["replication_num"] = replication_num;
-            j["is_distributed"] = is_distributed;
-            j["is_shard"] = is_shard;
-            j["is_global_pull"] = is_global_pull;
-            j["add_round_robin_counter"] = add_round_robin_counter.load();
-
-            if (partition_mode == "layer")
-            {
-                j["layer_config"] = layer_config;
-                j["layer_replicate_flags"] = layer_replicate_flags;
+            json routing_json_obj;
+            routing_json_obj["vector_node_map"] = json::array();
+            for (const auto &level_map : vector_node_map) {
+                json level_json = json::object();
+                for (const auto &kv : level_map)
+                    level_json[std::to_string(kv.first)] = kv.second;
+                routing_json_obj["vector_node_map"].push_back(std::move(level_json));
             }
+            string routing_json_string = routing_json_obj.dump();
 
-            // 保存 vector_node_map（layer: 多层；非 layer: 仅第0层）
-            if (partition_mode == "layer")
-            {
-                json jmaps = json::array();
-                for (const auto &level_map : vector_node_map)
-                {
-                    json jmap = json::object();
-                    for (const auto &kv : level_map)
-                    {
-                        jmap[std::to_string(kv.first)] = kv.second;
-                    }
-                    jmaps.push_back(std::move(jmap));
+            Buffer subset_buf;
+            for (int i = 0; i < node_num; i++) {
+                if (!nodes[i].is_remote_node && nodes[i].local_hnsw) {
+                    serialize_hnsw_subset(subset_buf, nodes[i].local_hnsw,
+                                           nodes[i].local_hnsw->local_vids_);
+                    break;
                 }
-                j["vector_node_map"] = std::move(jmaps);
-            }
-            else
-            {
-                json jmap = json::object();
-                if (!vector_node_map.empty())
-                {
-                    for (const auto &kv : vector_node_map[0])
-                    {
-                        if (!kv.second.empty())
-                            jmap[std::to_string(kv.first)] = kv.second[0];
-                    }
-                }
-                j["vector_node_map"] = std::move(jmap);
             }
 
-            // 保存主 HNSW 图
-            string hnsw_path = filepath + ".hnsw.bin";
-            if (hnsw)
-            {
-                hnsw->save(hnsw_path);
-                j["hnsw_path"] = hnsw_path;
-            }
-            else
-            {
-                j["hnsw_path"] = "";
-            }
-
-            // 保存每个节点的 local_hnsw（如果存在）
-            json jnodes = json::array();
-            for (int i = 0; i < node_num; i++)
-            {
-                json jnode;
-                jnode["node_id"] = nodes[i].node_id;
-                jnode["num_queries"] = nodes[i].num_queries;
-                jnode["is_remote_node"] = nodes[i].is_remote_node;
-                jnode["ip_addr"] = nodes[i].ip_addr;
-                jnode["port"] = nodes[i].port;
-
-                if (nodes[i].local_hnsw && nodes[i].local_hnsw != hnsw)
-                {
-                    string local_hnsw_path = filepath + ".node" + std::to_string(i) + ".bin";
-                    nodes[i].local_hnsw->save(local_hnsw_path);
-                    jnode["local_hnsw_path"] = local_hnsw_path;
-                }
-                else
-                {
-                    jnode["local_hnsw_path"] = "";
-                }
-                jnodes.push_back(std::move(jnode));
-            }
-            j["nodes"] = std::move(jnodes);
-
-            std::string out = j.dump(4);
-            int fd = ::open(filepath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd == -1)
-                return false;
-
-            if (flock(fd, LOCK_EX | LOCK_NB) == -1)
-            {
-                ::close(fd);
-                return false;
-            }
-
-            const char *buf = out.data();
-            std::size_t total = out.size();
-            std::size_t written = 0;
-            while (written < total)
-            {
-                ssize_t w = ::write(fd, buf + written, total - written);
-                if (w <= 0)
-                {
-                    flock(fd, LOCK_UN);
-                    ::close(fd);
-                    return false;
-                }
-                written += (std::size_t)w;
-            }
-
-            ::fsync(fd);
-            flock(fd, LOCK_UN);
-            ::close(fd);
+            std::ofstream output_file(filepath, std::ios::binary);
+            uint64_t routing_json_length = routing_json_string.size();
+            output_file.write((char*)&routing_json_length, sizeof(uint64_t));
+            output_file.write(routing_json_string.data(), routing_json_length);
+            output_file.write(subset_buf.data.data(), subset_buf.data.size());
             return true;
         }
-        catch (...)
+        catch (...) { return false; }
+    }
+
+    bool load_local(const string &filepath)
+    {
+        try
         {
+            LOG_INFO_STREAM("[load_local] Opening file: " << filepath);
+            std::ifstream input_file(filepath, std::ios::binary);
+            if (!input_file) { LOG_INFO_STREAM("[load_local] Failed to open file"); return false; }
+
+            uint64_t routing_json_length = 0;
+            input_file.read((char*)&routing_json_length, sizeof(uint64_t));
+            std::string routing_json_string(routing_json_length, '\0');
+            input_file.read(&routing_json_string[0], routing_json_length);
+            json routing_json_obj = json::parse(routing_json_string);
+            if (routing_json_obj.contains("vector_node_map") && routing_json_obj["vector_node_map"].is_array())
+            {
+                vector_node_map.clear();
+                vector_node_map.resize(routing_json_obj["vector_node_map"].size());
+                for (size_t level = 0; level < routing_json_obj["vector_node_map"].size(); level++)
+                    for (auto const &kv : routing_json_obj["vector_node_map"][level].items())
+                        vector_node_map[level][std::stoi(kv.key())] = kv.value().get<std::vector<int>>();
+            }
+
+            input_file.seekg(0, std::ios::end);
+            size_t total_size = input_file.tellg();
+            size_t subset_offset = sizeof(uint64_t) + routing_json_length;
+            size_t subset_size = total_size - subset_offset;
+            input_file.seekg(subset_offset);
+            std::vector<char> subset_data(subset_size);
+            input_file.read(subset_data.data(), subset_size);
+            input_file.close();
+            LOG_INFO_STREAM("[load_local] File read complete: " << subset_size << " bytes, deserializing...");
+
+            Buffer subset_buf; subset_buf.data = std::move(subset_data);
+            HNSWGraph<T> *loaded_graph = deserialize_hnsw_subset<T>(subset_buf, /*do_compact=*/true);
+            LOG_INFO_STREAM("[load_local] Deserialized, elements=" << loaded_graph->get_cur_element_count() << ", assigning to node...");
+            for (int i = 0; i < node_num; i++)
+            {
+                if (!nodes[i].is_remote_node)
+                {
+                    if (nodes[i].local_hnsw) delete nodes[i].local_hnsw;
+                    nodes[i].local_hnsw = loaded_graph;
+                    return true;
+                }
+            }
+            delete loaded_graph;
             return false;
         }
+        catch (...) { return false; }
     }
 
     // 从文件加载 cluster 状态
@@ -2710,22 +2676,109 @@ template <typename T>
 void Node<T>::tcp_server_loop()
 {
     int node_port = port + NODE_PORT_OFFSET;
-    LOG_INFO_STREAM("Node " << node_id << " node-to-node server loop started on port " << node_port);
+    LOG_INFO_STREAM("Node " << node_id << " poll server loop on port " << node_port);
 
-    while (!stop_server.load())
-    {
-        int conn_id = cluster->transport->accept_client();
-        if (conn_id < 0)
-        {
-            if (stop_server.load())
-                break;
-            LOG_DEBUG_STREAM("[Node " << node_id << "] tcp_server_loop: accept_client returned " << conn_id);
-            continue;
+    constexpr int MAX_FDS = 64;
+    struct pollfd pfds[MAX_FDS];
+    int nfds = 0;
+    pfds[nfds].fd = sockfd; pfds[nfds].events = POLLIN; nfds++;
+
+    while (!stop_server.load()) {
+        int ret = poll(pfds, nfds, 100);
+        if (ret < 0) { if (stop_server.load()) break; continue; }
+        for (int i = 0; i < nfds; i++) {
+            if (!(pfds[i].revents & (POLLIN | POLLERR | POLLHUP))) continue;
+            int fd = pfds[i].fd;
+            if (fd == sockfd) {
+                struct sockaddr_in addr; socklen_t len = sizeof(addr);
+                int cfd = accept(sockfd, (struct sockaddr*)&addr, &len);
+                if (cfd < 0) continue;
+                int flag = 1; setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+                if (nfds < MAX_FDS) { pfds[nfds].fd = cfd; pfds[nfds].events = POLLIN; nfds++; }
+                else close(cfd);
+                continue;
+            }
+            if (pfds[i].revents & (POLLERR | POLLHUP)) { close(fd); pfds[i]=pfds[--nfds]; continue; }
+
+            uint64_t msg_size = 0;
+            try { cluster->transport->recv_raw(fd, &msg_size, sizeof(uint64_t)); }
+            catch (...) { close(fd); pfds[i]=pfds[--nfds]; continue; }
+            if (msg_size == 0) { close(fd); pfds[i]=pfds[--nfds]; continue; }
+
+            auto buf = std::make_shared<Buffer>();
+            buf->data.resize(msg_size);
+            try { cluster->transport->recv_raw(fd, buf->data.data(), msg_size); }
+            catch (...) { close(fd); pfds[i]=pfds[--nfds]; continue; }
+            buf->read_pos = 0;
+            int msg_type = buf->read_val<int>();
+
+            if (msg_type == MSG_INIT_GRAPH) {
+                bool remote_global = buf->read_val<bool>();
+                cluster->is_global_pull = remote_global;
+                deserialize_routing(*buf, cluster->vector_node_map);
+                if (local_hnsw) delete local_hnsw;
+                local_hnsw = deserialize_hnsw_subset<T>(*buf, /*do_compact=*/!remote_global);
+                if (remote_global && local_hnsw) {
+                    Cluster<T>* cl = cluster;
+                    local_hnsw->pull_fetcher_ = [cl](int vid){ return cl->fetch_remote_vector(vid); };
+                }
+                char ack = 1; cluster->transport->send_raw(fd, &ack, 1);
+                close(fd); pfds[i]=pfds[--nfds]; continue;
+            }
+
+            // SEARCH_RESULT → 内联
+            if (msg_type == MSG_SEARCH_RESULT) {
+                int qid = buf->read_val<int>();
+                std::vector<int> rs = buf->read_vec<int>();
+                Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
+                std::shared_ptr<SDKCompletionQueue<T>> cq;
+                { std::lock_guard<std::mutex> lk(sdk_cq_map_mu_);
+                  auto it = sdk_cq_map_.find(qid);
+                  if (it != sdk_cq_map_.end()) { cq = it->second; sdk_cq_map_.erase(it); } }
+                if (cq) cq->push({qid, std::move(rs), std::move(pl)});
+                continue;
+            }
+
+            // SHARD_RESULT → 内联
+            if (msg_type == MSG_SHARD_RESULT) {
+                int qid = buf->read_val<int>();
+                int cnt = buf->read_val<int>();
+                std::vector<std::pair<DistT,int>> rs; rs.reserve(cnt);
+                for (int j=0;j<cnt;j++) rs.push_back({buf->read_val<DistT>(), buf->read_val<int>()});
+                Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
+                std::shared_ptr<ReduceQueryAccumulator<T>> acc;
+                { std::lock_guard<std::mutex> lk(reduce_accum_mu_);
+                  auto it = reduce_accum_map_.find(qid);
+                  if (it != reduce_accum_map_.end()) acc = it->second; }
+                if (acc) acc->add_node_results(rs, pl);
+                continue;
+            }
+
+            // MSG_SEARCH → msg_pool_
+            if (msg_type == MSG_SEARCH)
+                msg_pool_->submit([this, buf]() {
+                    int qid = buf->read_val<int>(); int k = buf->read_val<int>();
+                    std::vector<T> qv = buf->read_vec<T>();
+                    Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
+                    this->query(qid, qv, pl, k);
+                });
+            else if (msg_type == MSG_ADD_VECTOR_LOCAL) {
+                int vid = buf->read_val<int>(); std::vector<T> vec = buf->read_vec<T>();
+                char ack = 1;
+                try {
+                    if (!local_hnsw && cluster && cluster->is_shard) {
+                        std::lock_guard<std::mutex> lk(local_hnsw_mutex);
+                        if (!local_hnsw) local_hnsw = new HNSWGraph<T>(cluster->hnsw->dim, cluster->hnsw->m,
+                            cluster->hnsw->ef_construction, cluster->hnsw->ef_search,
+                            cluster->hnsw->limited_level, 100000, cluster->hnsw->seed);
+                    }
+                    if (local_hnsw) local_hnsw->add_vector(vid, vec);
+                } catch (...) { ack = 0; }
+                cluster->transport->send_raw(fd, &ack, 1);
+            }
         }
-
-        LOG_DEBUG_STREAM("[Node " << node_id << "] tcp_server_loop: accepted connection, conn_id=" << conn_id);
-        std::thread(&Node<T>::handle_node_client, this, conn_id).detach();
     }
+    for (int i = 1; i < nfds; i++) close(pfds[i].fd);
 }
 
 // SDK 通信 accept 循环（纯 TCP 端口，不走传输层抽象）
@@ -3296,50 +3349,16 @@ void Node<T>::handle_sdk_client(int client_fd)
             else if (msg_type == MSG_LOAD_CLUSTER)
             {
                 std::string filepath = buf.read_string();
-                bool ok = false;
-                if (cluster)
-                {
-                    Cluster<T> *loaded = nullptr;
-                    try { loaded = Cluster<T>::load(filepath); }
-                    catch (...) { loaded = nullptr; }
-
-                    if (loaded && loaded->node_num == cluster->node_num)
-                    {
-                        cluster->bandwidth = loaded->bandwidth;
-                        cluster->partition_mode = loaded->partition_mode;
-                        cluster->outer_ring_max_iterations = loaded->outer_ring_max_iterations;
-                        cluster->replication_level = loaded->replication_level;
-                        cluster->replication_num = loaded->replication_num;
-                        cluster->is_distributed = loaded->is_distributed;
-                        cluster->is_shard = loaded->is_shard;
-                        cluster->add_round_robin_counter.store(loaded->add_round_robin_counter.load());
-                        cluster->vector_node_map = std::move(loaded->vector_node_map);
-                        cluster->layer_config = std::move(loaded->layer_config);
-                        cluster->layer_replicate_flags = std::move(loaded->layer_replicate_flags);
-
-                        if (cluster->hnsw && cluster->hnsw != loaded->hnsw)
-                            delete cluster->hnsw;
-                        cluster->hnsw = loaded->hnsw;
-                        loaded->hnsw = nullptr;
-
-                        for (int i = 0; i < cluster->node_num && i < (int)loaded->nodes.size(); i++)
-                        {
-                            cluster->nodes[i].num_queries = loaded->nodes[i].num_queries;
-                            cluster->nodes[i].is_remote_node = loaded->nodes[i].is_remote_node;
-                            cluster->nodes[i].ip_addr = loaded->nodes[i].ip_addr;
-                            cluster->nodes[i].port = loaded->nodes[i].port;
-
-                            if (cluster->nodes[i].local_hnsw != nullptr && cluster->nodes[i].local_hnsw != cluster->hnsw)
-                                delete cluster->nodes[i].local_hnsw;
-                            cluster->nodes[i].local_hnsw = loaded->nodes[i].local_hnsw;
-                            loaded->nodes[i].local_hnsw = nullptr;
-                        }
-                        ok = true;
-                    }
-                    if (loaded) delete loaded;
-                }
+                LOG_INFO_STREAM("[Node " << node_id << "] MSG_LOAD_CLUSTER: " << filepath);
+                auto t0 = std::chrono::steady_clock::now();
+                bool ok = cluster ? cluster->load_local(filepath) : false;
+                auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+                LOG_INFO_STREAM("[Node " << node_id << "] load_local " << (ok ? "OK" : "FAILED")
+                               << " in " << dt << "ms, sending ACK");
                 char ack = ok ? 1 : 0;
                 send_all(client_fd, &ack, 1);
+                LOG_INFO_STREAM("[Node " << node_id << "] MSG_LOAD_CLUSTER ACK sent");
                 break;
             }
             else if (msg_type == MSG_LOAD_HNSW)
@@ -3525,7 +3544,7 @@ void Node<T>::handle_sdk_client(int client_fd)
         }
         catch (const std::exception &e)
         {
-            LOG_DEBUG_STREAM("[Node " << node_id << "] Error in handle_sdk_client: " << e.what());
+            LOG_INFO_STREAM("[Node " << node_id << "] Error in handle_sdk_client (fd=" << client_fd << "): " << e.what());
             break;
         }
         catch (...)

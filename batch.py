@@ -6,7 +6,7 @@ import argparse
 import concurrent.futures
 
 SCRIPT_PATH = "main.py"
-DATASET_ROOT = "/home/CONNECT/xchen740/workspace/vector-retrieve/dataset"
+DATASET_ROOT = "/hpc2hdd/home/xchen740/workspace/vector-retrieve/dataset"
 
 # ============================================================
 # 数据集配置
@@ -35,25 +35,33 @@ DATASETS = [
 # ============================================================
 # 参数网格 (将运行所有笛卡尔积组合)
 # ============================================================
+def _get_query_threads(node_num, num_threads):
+    """query 线程数 = node_num × num_threads"""
+    return node_num * num_threads
+
+
 PARAM_GRID = {
-    "node_num":           [5],
+    "node_num":           [8, 16],
     "partition_mode":     ["k-means"],
-    "replication":        [2, 1, 0],
+    "replication":        [2],
     "m":                  [10, 15, 20, 25, 30, 35, 40],
     "ef_construction":    [200],
     "ef_search":          [15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
     "limited_level":      [5],
     "k":                  [10],
-    "num_query_threads":  [40],      # 客户端查询进程数
+    "num_query_threads":  None,      # 由 node_num × num_threads 推导（8→64, 16→128）
     "num_threads":        [8],       # 服务端每 node 搜索线程数
-    "shard":              [False, True],
-    "global_pull":        [False, True],
+    "shard":              [False],
+    "global_pull":        [False],
     "distributed":        [True],
     "layer":              [True, False],
-    "comm_mode":          ["tcp"],  # 通信模式："tcp" 或 "rdma"
-    "num_cpu":            [0],       # CPU 核心数
-    "dtype":              ["float", "uint8"],  # 向量元素类型；uint8 仅适用于 .u8bin 数据集
+    "comm_mode":          ["tcp"],
+    "num_cpu":            [0],
+    "dtype":              ["uint8"],
 }
+
+# 全 (m, ef_search) 网格（与 5-node sift100m float 完整 sweep 对齐）
+ALLOWED_M_EFS = set()
 
 # uint8 模式下 data_name 追加的后缀，保证 graph/results 文件名与 float 不冲突
 DTYPE_NAME_SUFFIX = {"uint8": "-u8"}
@@ -100,7 +108,23 @@ def effective_data_name(dataset, params):
     return dataset['name'] + DTYPE_NAME_SUFFIX.get(params.get('dtype'), "")
 
 
-def build_command(dataset, params, skip_prepare=False, no_cleanup=False):
+def resolve_query_threads(params):
+    """解析 num_query_threads：若为 None 则从 node_num * num_threads 推导"""
+    qt = params.get('num_query_threads')
+    if qt is not None:
+        return qt
+    return _get_query_threads(params['node_num'], params['num_threads'])
+
+
+def resolve_query_nodes(node_num):
+    """根据 worker 节点数推导 query 节点数：8→2, 16→4"""
+    if node_num <= 8:
+        return 2
+    else:
+        return 4
+
+
+def build_command(dataset, params, skip_prepare=False, no_cleanup=False, use_slurm=False):
     """构建命令行参数"""
     data_name = effective_data_name(dataset, params)
     data_path = os.path.join(DATASET_ROOT, dataset['base'])
@@ -118,9 +142,10 @@ def build_command(dataset, params, skip_prepare=False, no_cleanup=False):
         "--ef_construction", str(params['ef_construction']),
         "--ef_search", str(params['ef_search']),
         "--limited_level", str(params['limited_level']),
-        "--num_query_threads", str(params['num_query_threads']),
+        "--num_query_threads", str(resolve_query_threads(params)),
         "--num_threads", str(params['num_threads']),
         "--node_num", str(params['node_num']),
+        "--num_query_nodes", str(resolve_query_nodes(params['node_num'])),
         "--partition_mode", params['partition_mode'],
         "--replication", str(params['replication']),
     ]
@@ -144,6 +169,8 @@ def build_command(dataset, params, skip_prepare=False, no_cleanup=False):
         cmd.append('--skip_prepare')
     if no_cleanup:
         cmd.append('--no_cleanup')
+    if use_slurm:
+        cmd.append('--slurm')
 
     return cmd
 
@@ -161,7 +188,7 @@ def get_result_path(dataset, params):
     distributed_suffix = "-distributed" if params.get('distributed') else ""
     cpus = params.get('num_cpu', 0)
     cpu_suffix = f"-cpus{cpus}" if params.get('distributed') and cpus != 0 else ""
-    qt_suffix = f"-query_threads{params['num_query_threads']}"
+    qt_suffix = f"-query_threads{resolve_query_threads(params)}"
 
     if params.get('shard'):
         filename = (f"results-{data_name}-m{params['m']}-efc{params['ef_construction']}-"
@@ -200,7 +227,7 @@ def get_group_key(dataset_name, params):
         params.get('distributed', False),
         params.get('comm_mode', 'tcp'),
         params.get('num_threads', 8),
-        params.get('num_query_threads', 40),
+        resolve_query_threads(params),
         params.get('num_cpu', 0),
         params.get('dtype', 'float'),
     )
@@ -211,10 +238,13 @@ def run_batch():
     parser = argparse.ArgumentParser()
     parser.add_argument('--skip', action='store_true', help='跳过已有结果文件的任务')
     parser.add_argument('--offset', type=int, default=0, help='跳过前N个任务')
+    parser.add_argument('--slurm', action='store_true', help='传递 --slurm 给 main.py（用 srun 代替 ssh）')
     batch_args = parser.parse_args()
 
-    keys = list(PARAM_GRID.keys())
-    combinations = list(itertools.product(*[PARAM_GRID[k] for k in keys]))
+    # 过滤掉值为 None 的 key（其值由其他参数推导，不参与网格展开）
+    grid = {k: v for k, v in PARAM_GRID.items() if v is not None}
+    keys = list(grid.keys())
+    combinations = list(itertools.product(*grid.values()))
 
     # 按分组键聚合任务
     from collections import OrderedDict
@@ -236,6 +266,12 @@ def run_batch():
                 continue
             # global_pull 模式下 replication 和 layer 无意义（图骨架完整，无需冗余/分层），仅保留 replication=0、layer=False 的组合
             if params.get('global_pull') and (params.get('replication', 0) != 0 or params.get('layer')):
+                continue
+            # shard 模式 result 文件名不含 partition_mode/rep/layer，仅保留 replication=0、layer=False 的组合避免重复
+            if params.get('shard') and (params.get('replication', 0) != 0 or params.get('layer')):
+                continue
+            # 仅保留显式允许的 (m, ef_search) 组合
+            if ALLOWED_M_EFS and (params['m'], params['ef_search']) not in ALLOWED_M_EFS:
                 continue
 
             if batch_args.skip and os.path.exists(get_result_path(dataset, params)):
@@ -272,7 +308,8 @@ def run_batch():
 
             cmd = build_command(dataset, params,
                                 skip_prepare=not is_first,
-                                no_cleanup=not is_last)
+                                no_cleanup=not is_last,
+                                use_slurm=batch_args.slurm)
 
             # 组内首个实际运行的任务处理 graph 加载/构建
             if is_first:

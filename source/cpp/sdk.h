@@ -1,8 +1,11 @@
 #pragma once
 
 #include "cluster.h"
-#include <thread>
 #include <chrono>
+#include <future>
+#include <sys/time.h>
+#include <thread>
+#include <vector>
 
 // SDK Client：通过通信中间层与远程集群进行交互的客户端。
 // 提供向量添加、K 近邻查询、分区、保存加载等远程操作接口，
@@ -24,6 +27,7 @@ private:
     int sockfd;
     bool connected;
     std::vector<QueryEndpoint> query_endpoints;
+    std::vector<QueryEndpoint> all_work_endpoints;  // 全部 worker 节点（save/load_cluster_all 用）
     size_t current_endpoint_idx;  // 当前已连接的查询端点索引，(size_t)-1 表示未连接任何端点
     size_t sticky_endpoint_idx;   // 绑定的 endpoint 索引，避免每条查询重连
 
@@ -146,6 +150,15 @@ public:
             }
 
             set_query_endpoints(ips, ports);
+
+            // 同时保存全部 worker 节点列表（sort by node_id 保证顺序）
+            all_work_endpoints.clear();
+            for (const auto &kv : node_addr) {
+                all_work_endpoints.push_back({kv.second.first, kv.second.second});
+            }
+            std::sort(all_work_endpoints.begin(), all_work_endpoints.end(),
+                [](const QueryEndpoint &a, const QueryEndpoint &b) { return a.port < b.port; });
+
             return true;
         } catch (...) {
             return false;
@@ -473,6 +486,48 @@ public:
             throw;
         }
         disconnect();
+    }
+
+    // 并行批量 save
+    void save_cluster_all(const std::string &basepath)
+    {
+        std::vector<std::future<void>> futures;
+        futures.reserve(all_work_endpoints.size());
+        for (size_t i = 0; i < all_work_endpoints.size(); i++)
+        {
+            futures.push_back(std::async(std::launch::async, [this, i, &basepath]() {
+                std::string node_path = basepath + "-" + std::to_string(i) + ".bin";
+                const auto &endpoint = all_work_endpoints[i];
+                ClusterSDKClient node_client(endpoint.ip, endpoint.port, transport_config.comm_mode);
+                if (!node_client.connect())
+                    throw std::runtime_error("Failed to connect to node " + std::to_string(i) + " for save");
+                try { node_client.save_cluster(node_path); }
+                catch (...) { node_client.disconnect(); throw; }
+                node_client.disconnect();
+            }));
+        }
+        for (auto &f : futures) f.get(); // wait all + propagate exceptions
+    }
+
+    // 并行批量 load
+    void load_cluster_all(const std::string &basepath)
+    {
+        std::vector<std::future<void>> futures;
+        futures.reserve(all_work_endpoints.size());
+        for (size_t i = 0; i < all_work_endpoints.size(); i++)
+        {
+            futures.push_back(std::async(std::launch::async, [this, i, &basepath]() {
+                std::string node_path = basepath + "-" + std::to_string(i) + ".bin";
+                const auto &endpoint = all_work_endpoints[i];
+                ClusterSDKClient node_client(endpoint.ip, endpoint.port, transport_config.comm_mode);
+                if (!node_client.connect())
+                    throw std::runtime_error("Failed to connect to node " + std::to_string(i) + " for load");
+                try { node_client.load_cluster(node_path); }
+                catch (...) { node_client.disconnect(); throw; }
+                node_client.disconnect();
+            }));
+        }
+        for (auto &f : futures) f.get();
     }
 
     void save_hnsw(const std::string &filepath)

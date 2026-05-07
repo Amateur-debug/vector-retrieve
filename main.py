@@ -249,6 +249,9 @@ class VectorRetrieveRunner:
         self.all_nodes = list(_CLUSTER_CONFIG["work_nodes"])
         # query_nodes：负责发查询的机器列表（可选，用于多机分布式 query）
         self.query_nodes = list(_CLUSTER_CONFIG.get("query_nodes", []))
+        # --num_query_nodes 截断：仅使用前 N 个 query 节点
+        num_query_nodes = getattr(args, 'num_query_nodes', 0) or len(self.query_nodes)
+        self.query_nodes = self.query_nodes[:num_query_nodes]
         for key in ("ip", "port", "user_name"):
             if key not in self.host_info:
                 raise ValueError(f"config.json: host_node 缺少字段 '{key}'")
@@ -389,6 +392,8 @@ class VectorRetrieveRunner:
         print("Cleaning up old worker processes...")
         use_slurm = bool(self.args.slurm)
 
+        # SLURM 模式：用 pkill 清理旧 worker（不依赖 scancel，避免误杀）
+
         def _kill_local_node_start():
             # Two-stage local kill: TERM, wait, then KILL if still present
             try:
@@ -423,7 +428,7 @@ class VectorRetrieveRunner:
             )
             if use_slurm:
                 hostname = self.node_hostnames[i]
-                cmd = ["srun", "-N1", "-n1", "--overlap", "--overcommit",
+                cmd = ["srun", "-N1", "-n1", f"--cpus-per-task={self.num_cpu if self.num_cpu and self.num_cpu > 0 else self.num_threads}", "--overlap", "--overcommit",
                        "-w", hostname, "bash", "-lc", kill_script]
             else:
                 cmd = [
@@ -505,7 +510,7 @@ class VectorRetrieveRunner:
                     # srun 方式启动远程 worker
                     hostname = self.node_hostnames[i]
                     srun_cmd = [
-                        "srun", "-N1", "-n1",
+                        "srun", "-N1", "-n1", f"--cpus-per-task={self.num_cpu if self.num_cpu and self.num_cpu > 0 else self.num_threads}",
                         "--overlap", "--overcommit",
                         "--export=ALL",
                         "-w", hostname,
@@ -704,6 +709,7 @@ class VectorRetrieveRunner:
           5. 非分布式 + 有 graph_path：本地加载图 → 分区
           6. 非分布式 + shard：轮询建各节点独立图
           7. 非分布式 + 传统：先建统一图 → 再分区"""
+        if self.args.skip_prepare:
             print("Skipping graph loading and partitioning (--skip_prepare)")
             if self.args.distributed:
                 self.cluster = None
@@ -730,7 +736,43 @@ class VectorRetrieveRunner:
                 'port': self.node_ports[sdk_idx]
             }
 
-            if self.graph_path is not None and os.path.exists(self.graph_path) and not self.args.shard:
+            all_saved = False
+            if not self.args.shard:
+                # 生成 cluster_path 和分区文件名
+                layer_sfx = "-layer" if self.use_layer else ""
+                if self.cluster_path:
+                    cluster_base = self.cluster_path
+                elif self.graph_path and os.path.isdir(self.graph_path):
+                    cluster_base = os.path.join(self.graph_path,
+                        f"m{self.m}-efc{self.ef_construction}-ll{self.limited_level}-"
+                        f"{self.partition_mode}-rep{self.replication}{layer_sfx}.bin")
+                else:
+                    cluster_base = (f"./save/{self.data_name}/node{self.node_num}/"
+                        f"m{self.m}-efc{self.ef_construction}-ll{self.limited_level}-"
+                        f"{self.partition_mode}-rep{self.replication}{layer_sfx}.bin")
+                self.cluster_path = cluster_base
+
+                # 检查是否已有分区文件（优先加载，跳过建图和分区）
+                all_saved = all(os.path.exists(f"{cluster_base}-{i}.bin") for i in range(self.node_num))
+
+            if all_saved:
+                # 已有分区文件：直接加载，无需加载完整 HNSW 图
+                print(f"Found partitioned graphs: {cluster_base}-*.bin, loading...")
+                route_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
+                route_client.init_routes()  # init_routes 内部会用临时连接获取路由，不需先 connect
+                route_client.load_cluster_all(cluster_base)
+                route_client.disconnect()
+                print("Partitioned graphs loaded, skipping partition.")
+                # 加载后更新所有节点的 ef_search（分区图可能用不同的 ef 构建）
+                print(f"Setting ef_search={self.ef_search} on all worker nodes...")
+                for i in range(len(self.node_ips)):
+                    connect_ip = "127.0.0.1" if i == self.host_id else self.node_ips[i]
+                    port = self.node_ports[i]
+                    ef_client = ClusterSDKClient(ip=connect_ip, port=port, comm_mode=self.comm_mode)
+                    if ef_client.connect():
+                        ef_client.set_hnsw_params(ef_search=self.ef_search)
+                        ef_client.disconnect()
+            elif self.graph_path is not None and os.path.exists(self.graph_path) and not self.args.shard:
                 # shard 模式需要每个节点独立建图，不能复用统一的 HNSW 图
                 print(f"Loading HNSW graph via SDK from {self.graph_path}...")
                 sdk_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
@@ -753,36 +795,37 @@ class VectorRetrieveRunner:
 
                 self.build_index(data=data, num_elements=num_elements)
 
-            if not self.args.shard:
-                # 通过 SDK 调用 partition
-                print("Partitioning data across cluster nodes via SDK...")
-                start_time = time.time()
-                # 创建 SDK 客户端连接到本机
+            if not self.args.shard and not all_saved:
+                # 需要分区：发送 partition 命令到 worker
                 partition_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
-                if not partition_client.connect():
-                    raise RuntimeError("Failed to connect SDK to local node for partition")
+                if not partition_client.connect(): raise RuntimeError("Failed to connect for partition")
                 try:
+                    print("Partitioning data across cluster nodes via SDK...")
+                    start_time = time.time()
                     if self.use_layer:
                         print(f"Partitioning in layer mode (replication={self.replication})...")
-                        partition_client.partition(
-                            mode="layer",
-                            replication=self.replication,
-                            layer_config=self.layer_config,
-                            layer_partition_mode=self.partition_mode,
+                        partition_client.partition(mode="layer", replication=self.replication,
+                            layer_config=self.layer_config, layer_partition_mode=self.partition_mode,
                             layer_replicate_flags=self.layer_replicate_flags,
-                            num_threads=self.num_construction_threads,
-                        )
+                            num_threads=self.num_construction_threads)
                     else:
                         print(f"Partitioning in {self.partition_mode} mode (replication={self.replication})...")
-                        partition_client.partition(
-                            mode=self.partition_mode,
-                            replication=self.replication,
-                            num_threads=self.num_construction_threads,
-                        )
-                    partition_time = time.time() - start_time
-                    print(f"Partitioning Time: {partition_time:.4f} seconds.")
+                        partition_client.partition(mode=self.partition_mode, replication=self.replication,
+                            num_threads=self.num_construction_threads)
+                    print(f"Partitioning Time: {time.time() - start_time:.4f} seconds.")
                 finally:
                     partition_client.disconnect()
+
+                if self.args.save:
+                    print(f"Saving partitioned graphs to {cluster_base}-*.bin...")
+                    save_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
+                    if not save_client.connect(): raise RuntimeError("Failed to connect for save")
+                    save_client.init_routes()
+                    try:
+                        save_client.save_cluster_all(cluster_base)
+                    finally:
+                        save_client.disconnect()
+                    print(f"Saved {self.node_num} node graphs.")
             return
 
         # 非分布式模式：传统的cluster和hnsw创建方式
@@ -1014,7 +1057,7 @@ class VectorRetrieveRunner:
         if self.args.distributed:
             base = (f"{save_dir}/hnsw-{self.data_name}-m{self.m}-"
                     f"efc{self.ef_construction}-ll{self.limited_level}")
-            hnsw_path = f"{base}.json"
+            hnsw_path = f"{base}.bin"
 
             sdk_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
             if not sdk_client.connect():
@@ -1028,7 +1071,7 @@ class VectorRetrieveRunner:
                 sdk_client.disconnect()
         elif self.graph_path is None:
             self.graph_path = (f"{save_dir}/hnsw-{self.data_name}-m{self.m}-"
-                               f"efc{self.ef_construction}-ll{self.limited_level}.json")
+                               f"efc{self.ef_construction}-ll{self.limited_level}.bin")
             print(f"Saving graph state to {self.graph_path}...")
             self.hnsw.save(self.graph_path)
 
@@ -1066,6 +1109,7 @@ class VectorRetrieveRunner:
             srun_target = qnode.get("hostname") or host  # srun -w 优先用 hostname
             user = qnode.get("user_name", self.host_user_name)
             log_file = os.path.join(project_root, f"query_rank{rank}.log")
+            ready_timeout_value = 7200
             query_args = (
                 f"--data_name {self.data_name} "
                 f"--dtype {_active_dtype} "
@@ -1077,12 +1121,15 @@ class VectorRetrieveRunner:
                 f"--query_world_size {world_size} "
                 f"--comm_mode {self.comm_mode} "
                 f"--barrier_dir {barrier_dir} "
+                f"--barrier_timeout {ready_timeout_value} "
+                f"--query_path {self.query_path} "
+                f"--groundtruth_path {self.groundtruth_path} "
             )
 
             if use_slurm:
                 # srun --overlap：在 sbatch 已分配的节点上叠加 job step（被 SLURM 跟踪）
                 srun_cmd = [
-                    "srun", "-N1", "-n1",
+                    "srun", "-N1", "-n1", f"--cpus-per-task={per_rank_threads}",
                     "--overlap",
                     "--overcommit",
                     "--export=ALL",
@@ -1122,7 +1169,7 @@ class VectorRetrieveRunner:
         last_round_scheduled_start = None
         for run_idx in range(num_runs):
             print(f"[orchestrate] Round {run_idx+1}/{num_runs}: waiting for {world_size} ready files...")
-            ready_timeout = 600 if run_idx == 0 else 300
+            ready_timeout = 7200
             wait_start = time.time()
             while True:
                 ready_count = sum(1 for r in range(world_size)
@@ -1272,14 +1319,33 @@ class VectorRetrieveRunner:
             per_run_wallclock.append(run_max_t)
             qps_runs.append(per_run_total_queries_count / run_max_t if run_max_t > 0 else 0.0)
 
-        # 最终 QPS = 各轮平均（>=3 轮去最高最低）
+        # 最终 QPS = 各轮平均（去除 MAD 离群值，至少保留 1 轮；若全离群则取所有轮均值）
+        def _trim_outliers(runs):
+            """基于 MAD (Median Absolute Deviation) 去除离群值。
+            modified Z-score = 0.6745 * |x - median| / MAD，> 3.5 视为离群。
+            若 MAD=0 或样本数 < 3，不去除。"""
+            if len(runs) < 3:
+                return list(runs)
+            sorted_r = sorted(runs)
+            n = len(sorted_r)
+            median = sorted_r[n // 2] if n % 2 == 1 else (sorted_r[n // 2 - 1] + sorted_r[n // 2]) / 2
+            abs_dev = sorted([abs(x - median) for x in runs])
+            mad = abs_dev[n // 2] if n % 2 == 1 else (abs_dev[n // 2 - 1] + abs_dev[n // 2]) / 2
+            if mad == 0:
+                return list(runs)
+            kept = [x for x in runs if 0.6745 * abs(x - median) / mad <= 3.5]
+            return kept if len(kept) >= 1 else list(runs)
+
         if len(qps_runs) >= 3:
-            sorted_runs = sorted(qps_runs)
-            total_qps = sum(sorted_runs[1:-1]) / len(sorted_runs[1:-1])
+            kept_runs = _trim_outliers(qps_runs)
+            total_qps = sum(kept_runs) / len(kept_runs)
+            trim_note = f", outliers removed: {len(qps_runs) - len(kept_runs)} of {len(qps_runs)}" if len(kept_runs) != len(qps_runs) else ""
         elif qps_runs:
             total_qps = sum(qps_runs) / len(qps_runs)
+            trim_note = ""
         else:
             total_qps = 0.0
+            trim_note = ""
         total_query_time = sum(per_run_wallclock)
 
         print("-" * 30)
@@ -1289,7 +1355,7 @@ class VectorRetrieveRunner:
         print("-" * 30)
         print("Evaluation Results:")
         print(f"Recall@{self.k}: {avg_recall:.4f}")
-        print(f"QPS: {total_qps:.4f} (mean of {len(qps_runs)} rounds{', extreme trimmed' if len(qps_runs) >= 3 else ''})")
+        print(f"QPS: {total_qps:.4f} (mean of {len(qps_runs)} rounds{trim_note})")
         print(f"Query Time Total: {total_query_time:.4f} seconds (sum of per-round wallclock)")
         print(f"Average Remote Transfer Count per Query: {avg_remote_transfer_cnt:.4f}")
         print(f"Average Remote Transfer Data per Transfer: {avg_remote_transfer_data_per_transfer:.0f} bits ({avg_remote_transfer_data_per_transfer/8:.0f} bytes)")
@@ -1385,21 +1451,23 @@ class VectorRetrieveRunner:
         # 文件名里的 query_threads 用全局总数（各 rank 之和）
         qt_suffix = f"-query_threads{total_query_threads}"
 
-        if self.args.shard:
+        if self.args.results_path:
+            results_path = self.args.results_path
+        elif self.args.shard:
             results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
                             f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
                             f"node{self.node_num}-"
-                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{shard_suffix}.json")
+                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{shard_suffix}.bin")
         elif self.args.is_global_pull:
             results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
                             f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
                             f"node{self.node_num}-{self.partition_mode}-rep{self.replication}-"
-                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{global_pull_suffix}.json")
+                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{global_pull_suffix}.bin")
         else:
             results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
                             f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
                             f"node{self.node_num}-{self.partition_mode}-rep{self.replication}-"
-                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{layer_suffix}.json")
+                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{layer_suffix}.bin")
 
         with open(results_path, 'w') as f:
             json.dump(stats, f, indent=4)
@@ -1422,6 +1490,7 @@ class VectorRetrieveRunner:
 
     def cleanup_workers(self, force=False):
         """清理所有节点上的 worker 进程。两阶段：本地进程句柄 → 本地 PID → 远程 SSH。"""
+        if self.args.no_cleanup:
             print("Skipping worker cleanup (--no_cleanup)")
             return
         # 终止查询 worker 进程（避免成为孤儿进程继续尝试连接已关闭的节点）
@@ -1505,6 +1574,7 @@ if __name__ == "__main__":
     parser.add_argument("--groundtruth_path", type=str, default=None, help="Path to groundtruth file (auto-resolved from --data_name if omitted)")
     parser.add_argument("--graph_path", type=str, default=None, help="Path to save/load the graph")
     parser.add_argument("--cluster_path", type=str, default=None, help="Path to save/load the cluster")
+    parser.add_argument("--results_path", type=str, default=None, help="Explicit path for results JSON (overrides auto-generated filename)")
     parser.add_argument("--k", type=int, default=10, help="Number of nearest neighbors to retrieve")
     parser.add_argument("--m", type=int, default=10, help="Max number of connections per element")
     parser.add_argument("--ef_construction", type=int, default=200, help="Size of the dynamic candidate list for construction")
@@ -1518,6 +1588,7 @@ if __name__ == "__main__":
     parser.add_argument("--shard", default=False, action='store_true', help="Enable shard mode (independent graphs per node)")
     parser.add_argument("--global-pull", dest="is_global_pull", default=False, action='store_true', help="Enable global-pull mode: every node holds the full graph skeleton, only vector data is partitioned; remote vectors are pulled on demand during search")
     parser.add_argument("--num_construction_threads", type=int, default=64, help="Number of threads for parallel graph construction (0=auto detect)")
+    parser.add_argument("--num_query_nodes", type=int, default=0, help="Number of query nodes to use (0=use all from config.json)")
     parser.add_argument("--num_query_threads", type=int, default=40, help="Number of client query processes (each process does all queries)")
     parser.add_argument("--num_threads", type=int, default=8, help="Number of server-side search threads per node (msg_pool_size)")
     parser.add_argument("--num_cpu", type=int, default=0, help="Limit CPU cores per node process (0=unlimited)")
@@ -1632,7 +1703,7 @@ if __name__ == "__main__":
         restart_argv = [a for a in sys.argv if a != '--skip_prepare']
         graph_path = runner.graph_path
         if not graph_path:
-            graph_path = f"./save/hnsw-{runner.data_name}-m{runner.m}-efc{runner.ef_construction}-ll{runner.limited_level}.json"
+            graph_path = f"./save/hnsw-{runner.data_name}-m{runner.m}-efc{runner.ef_construction}-ll{runner.limited_level}.bin"
         if graph_path and os.path.exists(graph_path):
             if '--graph_path' not in restart_argv:
                 restart_argv += ['--graph_path', graph_path]

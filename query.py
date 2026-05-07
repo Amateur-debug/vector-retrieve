@@ -65,13 +65,17 @@ _QUERIES = None
 _GROUNDTRUTH = None
 _MY_INDICES = None
 _NUM_QUERIES = None
-_CLIENT = None
 _PAYLOAD_CLS = None
+_SDK_CLS = None
+_SDK_IP = None
+_SDK_PORT = None
+_COMM_MODE = None
 
 def _pool_init(dtype, sdk_ip, sdk_port, comm_mode,
                query_path, groundtruth_path, query_rank, query_world_size):
-    """每个 pool worker 进程启动时调用一次：加载数据 + 建立 SDK 长连接。"""
-    global _CLIENT, _PAYLOAD_CLS, _QUERIES, _GROUNDTRUTH, _MY_INDICES, _NUM_QUERIES
+    """每个 pool worker 进程启动时调用一次：加载数据，准备好 Payload 类和 SDK 构造参数。"""
+    global _PAYLOAD_CLS, _QUERIES, _GROUNDTRUTH, _MY_INDICES, _NUM_QUERIES
+    global _SDK_CLS, _SDK_IP, _SDK_PORT, _COMM_MODE
 
     _QUERIES = read_vectors(query_path)
     _GROUNDTRUTH = read_groundtruth(groundtruth_path)
@@ -92,13 +96,10 @@ def _pool_init(dtype, sdk_ip, sdk_port, comm_mode,
     }
     payload_cls_name, sdk_cls_name = _DTYPE_CLASS_MAP[dtype]
     _PAYLOAD_CLS = getattr(_vr, payload_cls_name)
-    SdkCls = getattr(_vr, sdk_cls_name)
-    _CLIENT = SdkCls(ip=sdk_ip, port=sdk_port, comm_mode=comm_mode)
-    if not _CLIENT.connect():
-        raise RuntimeError(f"[pid={os.getpid()}] Failed to connect to SDK at {sdk_ip}:{sdk_port}")
-    if not _CLIENT.init_routes():
-        print(f"[pid={os.getpid()}] WARNING: init_routes failed, "
-              f"staying on initial endpoint {sdk_ip}:{sdk_port}", flush=True)
+    _SDK_CLS = getattr(_vr, sdk_cls_name)
+    _SDK_IP = sdk_ip
+    _SDK_PORT = sdk_port
+    _COMM_MODE = comm_mode
     print(f"[pid={os.getpid()}] pool worker initialized: queries={_NUM_QUERIES}, my_indices={len(_MY_INDICES)}", flush=True)
 
 def _warmup(_):
@@ -112,7 +113,14 @@ def _do_round(args_tuple):
     (run_idx, thread_id, scheduled_start, k, num_query_threads,
      query_rank, query_world_size) = args_tuple
 
-    global _CLIENT, _PAYLOAD_CLS, _QUERIES, _GROUNDTRUTH, _MY_INDICES, _NUM_QUERIES
+    global _PAYLOAD_CLS, _QUERIES, _GROUNDTRUTH, _MY_INDICES, _NUM_QUERIES
+    global _SDK_CLS, _SDK_IP, _SDK_PORT, _COMM_MODE
+
+    # 每轮创建新的 SDK 客户端（与老代码 query_worker_process 完全一致）
+    sdk_client = _SDK_CLS(ip=_SDK_IP, port=_SDK_PORT, comm_mode=_COMM_MODE)
+    if not sdk_client.init_routes():
+        if thread_id == 0:
+            print(f"[pid={os.getpid()}] WARNING: init_routes failed", flush=True)
 
     my_pid = os.getpid()
     print(f"[pid={my_pid}] _do_round run={run_idx} tid={thread_id} start, "
@@ -147,11 +155,11 @@ def _do_round(args_tuple):
         for idx, i in enumerate(proc_indices):
             payload = _PAYLOAD_CLS()
             qid = i + thread_id * _NUM_QUERIES + qid_base
-            _CLIENT.query_send(qid, _QUERIES[i], payload, k=k)
+            sdk_client.query_send(qid, _QUERIES[i], payload, k=k)
             pending[qid] = i
             sent += 1
             while sent - received >= PIPELINE_DEPTH:
-                ret_qid, results, ret_payload = _CLIENT.query_recv()
+                ret_qid, results, ret_payload = sdk_client.query_recv()
                 orig_idx = pending.pop(ret_qid)
                 recall_results[orig_idx] = results
                 remote_transfer_cnt[orig_idx] = ret_payload.remote_transfer_cnt
@@ -166,7 +174,7 @@ def _do_round(args_tuple):
                       f"sent={sent}/{len(proc_indices)} received={received}", flush=True)
 
         while received < sent:
-            ret_qid, results, ret_payload = _CLIENT.query_recv()
+            ret_qid, results, ret_payload = sdk_client.query_recv()
             orig_idx = pending.pop(ret_qid)
             recall_results[orig_idx] = results
             remote_transfer_cnt[orig_idx] = ret_payload.remote_transfer_cnt
@@ -266,7 +274,7 @@ if __name__ == '__main__':
 
     # 多进程池：每个进程独立 PID → SDK sticky endpoint 自然分布到所有 worker 入口
     # 使用 spawn 避免 fork + pybind11/numpy 线程死锁；每个子进程独立加载数据+SDK
-    ctx = mp.get_context('spawn')
+    ctx = mp.get_context('fork')
     pool = ctx.Pool(args.num_query_threads,
                     initializer=_pool_init,
                     initargs=(args.dtype, sdk_ip, sdk_port, args.comm_mode,
