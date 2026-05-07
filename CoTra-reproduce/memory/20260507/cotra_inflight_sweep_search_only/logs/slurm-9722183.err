@@ -1,0 +1,10 @@
+srun: error: cpu1-97: task 7: Segmentation fault (core dumped)
+srun: Terminating StepId=9722183.0
+srun: error: cpu1-91: task 1: Terminated
+srun: error: cpu1-92: task 2: Terminated
+srun: error: cpu1-96: task 6: Terminated
+srun: error: cpu1-95: task 5: Terminated
+srun: error: cpu1-90: task 0: Terminated
+srun: error: cpu1-94: task 4: Terminated
+srun: error: cpu1-93: task 3: Terminated
+srun: Force Terminated StepId=9722183.0

@@ -1,0 +1,85 @@
+error connecting to /tmp/tmux-204881/default (No such file or directory)
+Requested search/query-injection threads: 8
+Cpus_allowed_list:	9-16
+COTRA_EF_LIST=66,67 QUERY_COUNT=70000
+QUERY_PATH=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_batch_size_qsweep_ef67/data/queries_640k.u8bin GT_PATH=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_batch_size_qsweep_ef67/data/gt_100_640k_ids_only.bin
+Using RDMA device: mlx5_2
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+Local machine IP addr: 10.120.30.92
+Local machine ID: 2
+qp num per machine = 8
+Using meta_data_ratio: 0.01
+Local machine IP addr: 10.120.30.92
+Local machine ID: 2
+Local machine IP addr: 10.120.30.92
+Local machine ID: 2
+Set thread num = 8
+Run RDMA-ANNS machine number: 8
+This is follower machine 2, name: 10.120.30.92
+Loading Top index from /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index_top.index
+Read vec_num 1000609 hop_num 6
+Top index vec_num 1000609 hop_num 6
+Hop 0 cnt 1
+Hop 1 cnt 13
+Hop 2 cnt 234
+Hop 3 cnt 3664
+Hop 4 cnt 59060
+Hop 5 cnt 937637
+Last level bar 62972
+Loading GT from: /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_batch_size_qsweep_ef67/data/gt_100_640k_ids_only.bin
+Query number: 640000 K-NN: 100
+Loading queries from: /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_batch_size_qsweep_ef67/data/queries_640k.u8bin
+Query number: 640000 Dim: 128
+Parsing gt:
+qsize: 70000 gt_knn: 100 res_knn: 10
+Loaded gt
+ScalaGraph init ...
+ScalaGraph V3 loading index ...
+vec_size 100000000
+part_num 8
+12252360 13734198 9647685 13544797 11553876 12777752 12492925 13996407 
+Loading partition index 2 from /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index2_final_scala.index 
+partid 2 partnum 8 local_vec_num 9647685 local_ngh_ele_size 144 remote_ngh_num 50618190 enter_point 11036918
+read v3 index size 1591739400
+Loading partition 0 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index0_final_scala.data
+partid 0 partnum 8 part_vec_num 12252360 all_vec_num 100000000
+Loading partition 1 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index1_final_scala.data
+partid 1 partnum 8 part_vec_num 13734198 all_vec_num 100000000
+Loading partition 2 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index2_final_scala.data
+partid 2 partnum 8 part_vec_num 9647685 all_vec_num 100000000
+Loading partition 3 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index3_final_scala.data
+partid 3 partnum 8 part_vec_num 13544797 all_vec_num 100000000
+Loading partition 4 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index4_final_scala.data
+partid 4 partnum 8 part_vec_num 11553876 all_vec_num 100000000
+Loading partition 5 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index5_final_scala.data
+partid 5 partnum 8 part_vec_num 12777752 all_vec_num 100000000
+Loading partition 6 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index6_final_scala.data
+partid 6 partnum 8 part_vec_num 12492925 all_vec_num 100000000
+Loading partition 7 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index7_final_scala.data
+partid 7 partnum 8 part_vec_num 13996407 all_vec_num 100000000
+partition_ofs: 25986558
+ScalaGraph V3 Load Over
+max out read num: 16
+Create main mr success. length: 1312085160 align length: 1312085184
+Create main mr success. length: 1312085160 align length: 1312085184
+Create main mr success. length: 1312085160 align length: 1312085184
+Create main mr success. length: 1312085160 align length: 1312085184
+Create main mr success. length: 1312085160 align length: 1312085184
+Create main mr success. length: 1312085160 align length: 1312085184
+Create main mr success. length: 1312085160 align length: 1312085184
+Create main mr success. length: 1312085160 align length: 1312085184
+Switch metadata with remote machine..
+Establish eathnet connection ...
+Machine 0 1 2 3 4 5 6 7 
+Connect × × × × × × × × Connect × × √ × × × × × Connect × × √ × √ × × × Connect × × √ √ √ × × × Connect × × √ √ √ √ × × Connect × × √ √ √ √ √ × Connect √ × √ √ √ √ √ × Connect √ × √ √ √ √ √ √ Connect √ √ √ √ √ √ √ √ 
+RDMA communication init over. 
+Init over ...
+query size: 70000 vecsize: 128

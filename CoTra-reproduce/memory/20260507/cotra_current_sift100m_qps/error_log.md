@@ -1,0 +1,1 @@
+[2026-05-07T13:07:36+08:00] job 9724333 second srun hung during RDMA connect because memcached counters were not reset between sequential srun invocations; scanceled and will submit Q=80000 as separate job

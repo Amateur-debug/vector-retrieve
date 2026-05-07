@@ -1,0 +1,12 @@
+# Commands are appended by run scripts. Experiment intent: increase total query count beyond 80K on SIFT100M and sample per-node memory during each scala_anns run.
+[2026-05-07T13:50:22+08:00] job 9724367 hosts=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97 q=160000 per_node_q=20000 qg=16 ef_list=66,67,67,67,67,67 search_threads=8 timeout=900s mem_interval=1s
+[2026-05-07T13:50:23+08:00] srun scala_anns SIFT100M q=160000 per_node_q=20000 qg=16 ef_list=66,67,67,67,67,67 with per-node memory sampling
+[2026-05-07T13:51:36+08:00] job 9724368 hosts=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97 q=320000 per_node_q=40000 qg=16 ef_list=66,67,67,67,67,67 search_threads=8 timeout=1200s mem_interval=1s
+[2026-05-07T13:51:37+08:00] srun scala_anns SIFT100M q=320000 per_node_q=40000 qg=16 ef_list=66,67,67,67,67,67 with per-node memory sampling
+[2026-05-07T13:52:56+08:00] job 9724369 hosts=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97 q=640000 per_node_q=80000 qg=16 ef_list=66,67,67,67,67,67 search_threads=8 timeout=1800s mem_interval=1s
+[2026-05-07T13:52:56+08:00] srun scala_anns SIFT100M q=640000 per_node_q=80000 qg=16 ef_list=66,67,67,67,67,67 with per-node memory sampling
+[2026-05-07T13:56:00+08:00] python3 scripts/parse_qscale_mem.py memory/20260507/cotra_qscale_mem_sift100m
+[2026-05-07T13:56:00+08:00] sacct -j 9724367,9724368,9724369 --format=JobID,JobName,State,ExitCode,Elapsed,NNodes -P > results/sacct_status.tsv
+[2026-05-07T13:56:00+08:00] wrote report.md from qps_summary.tsv and per_node_memory.tsv
+[2026-05-07T15:11:45+08:00] Updated qscale parser/report so qps_mean is 5-run trimmed mean (drop max/min); qps_arithmetic_mean retained for audit.
+[2026-05-07T15:11:45+08:00] Updated previous current_sift100m_qps official summary/report to the same trimmed-mean convention.

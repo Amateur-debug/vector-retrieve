@@ -1,0 +1,3 @@
+query_count	per_node_query_count	query_group_size	ef	runs	recall_mean	recall_median	qps_mean	qps_arithmetic_mean	qps_median	qps_min	qps_max	qps_stdev	jobs
+10000	1250	16	67	5	0.900490	0.900600	81691.474	76876.413	81577.383	40089.480	99218.164	22102.410	9724339
+80000	10000	16	67	5	0.900630	0.900670	89591.831	87770.055	89691.227	69222.836	100851.945	12527.409	9724337

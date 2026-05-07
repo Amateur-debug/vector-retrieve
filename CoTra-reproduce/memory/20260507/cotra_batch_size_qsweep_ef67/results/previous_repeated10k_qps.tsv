@@ -1,0 +1,2 @@
+source	n	mean_qps	median_qps	min_qps	max_qps
+/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_integrated_640k_query_count_ef67/logs/anns_job9722153_cpu1-90_0.log	64	66281.916	59444.766	39688.996	100341.156

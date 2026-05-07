@@ -1,0 +1,3 @@
+
+- Restore note: `QUERY_GROUP_SIZE` was found at 16 after the search-only experiments. Per user request, only `include/anns/anns_config.h` was restored to `QUERY_GROUP_SIZE (4)` and `scala_anns` was rebuilt in the existing build directory while keeping the search-only instrumentation.
+- Non-fatal logging issue: `build_logs/rebuild_restore_qg4_keep_search_only.log` contains an `awk` quoting error in the informational echo for pre/post query-group value. The actual source verification is saved in `restore_qg4_keep_search_only_verification.txt` and shows `query_group_size=4`; the build itself completed successfully.

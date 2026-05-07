@@ -1,0 +1,11 @@
+srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
+slurmstepd: error: *** JOB 9724333 ON cpu1-90 CANCELLED AT 2026-05-07T13:07:34 ***
+srun: error: cpu1-92: task 2: Terminated
+srun: Terminating StepId=9724333.1
+srun: error: cpu1-95: task 5: Terminated
+srun: error: cpu1-96: task 6: Terminated
+srun: error: cpu1-97: task 7: Terminated
+srun: error: cpu1-93: task 3: Terminated
+srun: error: cpu1-94: task 4: Terminated
+srun: error: cpu1-91: task 1: Terminated
+srun: error: cpu1-90: task 0: Terminated

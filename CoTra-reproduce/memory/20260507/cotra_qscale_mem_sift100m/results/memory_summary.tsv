@@ -1,0 +1,4 @@
+query_count	per_node_query_count	nodes	jobs	proc_rss_gib_mean	proc_rss_gib_median	proc_rss_gib_min	proc_rss_gib_max	proc_hwm_gib_mean	proc_hwm_gib_max	program_actual_gib_mean	program_actual_gib_max	system_used_gib_mean	system_used_gib_max
+160000	20000	8	9724367	26.609	26.676	25.806	27.038	26.609	27.038	27.901	28.351	78.411	89.377
+320000	40000	8	9724368	46.880	46.944	46.055	47.330	46.880	47.330	49.157	49.627	148.250	179.633
+640000	80000	8	9724369	87.441	87.510	86.537	87.934	87.443	87.934	91.672	92.185	169.255	192.559

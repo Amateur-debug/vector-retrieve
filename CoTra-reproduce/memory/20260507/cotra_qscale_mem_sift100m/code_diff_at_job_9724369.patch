@@ -1,0 +1,1116 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2ddaf41..bf145c9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4,6 +4,9 @@ project(rdma-anns)
+ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
+ 
+ set(CMAKE_BUILD_TYPE "Release")
++set(COTRA_MACHINE_NUM "16" CACHE STRING "Compile-time RDMA machine count")
++option(COTRA_ENABLE_ASAN "Enable AddressSanitizer for CoTra memory debugging" OFF)
++option(COTRA_ENABLE_BREAKDOWN "Enable CoTra ANN performance breakdown instrumentation" OFF)
+ 
+ message(STATUS "Build CoroMem library")
+ 
+@@ -12,12 +15,26 @@ include(CheckCXXCompilerFlag)
+ 
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+-set(CMAKE_CXX_COMPILER /data/share/users/xyzhi/spack/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/gcc-11.4.0-dwr4wdspczmg4ssoib2ftvjodmdydhk2/bin/g++)
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
++add_definitions(-DMACHINE_NUM=${COTRA_MACHINE_NUM})
+ 
+-SET(CMAKE_CXX_FLAGS  "-Ofast -lrt -DHAVE_CXX0X -march=native -fpic -w -fopenmp -ftree-vectorize -ftree-vectorizer-verbose=0 -shared-libgcc -fcoroutines -fopenmp" )
++SET(CMAKE_CXX_FLAGS  "-Ofast -lrt -DHAVE_CXX0X -fpic -w -fopenmp -ftree-vectorize -ftree-vectorizer-verbose=0 -shared-libgcc -fcoroutines -fopenmp -msse2 -mavx2 -mfma" )
++
++if(COTRA_ENABLE_ASAN)
++  string(REPLACE "-Ofast" "-O1" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
++  string(APPEND CMAKE_C_FLAGS " -g -fno-omit-frame-pointer -fno-optimize-sibling-calls -fsanitize=address")
++  string(APPEND CMAKE_CXX_FLAGS " -g -fno-omit-frame-pointer -fno-optimize-sibling-calls -fsanitize=address")
++  string(APPEND CMAKE_EXE_LINKER_FLAGS " -fsanitize=address")
++  string(APPEND CMAKE_SHARED_LINKER_FLAGS " -fsanitize=address")
++  message(STATUS "COTRA_ENABLE_ASAN=ON")
++endif()
++
++if(COTRA_ENABLE_BREAKDOWN)
++  add_compile_definitions(PROFILER COMM_PROFILE PROF_COMPUTATION)
++  message(STATUS "COTRA_ENABLE_BREAKDOWN=ON")
++endif()
+ 
+ set(CMAKE_THREAD_LIBS_INIT "-lpthread")
+ 
+@@ -26,6 +43,10 @@ find_package(Boost 1.58.0 REQUIRED COMPONENTS serialization iostreams)
+ find_library(MEMCACHED_LIB memcached REQUIRED)
+ 
+ include_directories(./third_party)
++if(DEFINED ENV{CONDA_PREFIX} AND EXISTS "$ENV{CONDA_PREFIX}/include")
++  include_directories("$ENV{CONDA_PREFIX}/include")
++  link_directories("$ENV{CONDA_PREFIX}/lib" "$ENV{CONDA_PREFIX}/lib64")
++endif()
+ set(THIRD_PARTY_DIR ${CMAKE_SOURCE_DIR}/third_party)
+ add_subdirectory(${THIRD_PARTY_DIR})
+ 
+@@ -53,29 +74,41 @@ target_include_directories(rdma_anns PUBLIC
+ )
+ 
+ 
+-set(POSSIBLE_OMP_PATHS "/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/intel-oneapi-mkl-2024.0.0-a4e6uj4nsyq4llk43fbax6eobust7uug/compiler/latest/lib/libiomp5.so")
+-    
+-foreach(POSSIBLE_OMP_PATH ${POSSIBLE_OMP_PATHS})
+-    if (EXISTS ${POSSIBLE_OMP_PATH})
+-        get_filename_component(OMP_PATH ${POSSIBLE_OMP_PATH} DIRECTORY)
+-    endif()
+-endforeach()
++set(COTRA_LIB_HINTS
++    $ENV{CONDA_PREFIX}/lib
++    $ENV{CONDA_PREFIX}/lib64
++    /usr/lib/x86_64-linux-gnu
++    /usr/local/lib
++    /opt/intel/oneapi/compiler/2023.1.0/linux/compiler/lib/intel64_lin
++    /opt/intel/oneapi/mkl/2023.1.0/lib/intel64
++    /opt/intel/2024/oneapi/2024.0/lib
++    /opt/intel/2024/oneapi/mkl/2024.0/lib)
++set(COTRA_MKL_INCLUDE_HINTS
++    $ENV{CONDA_PREFIX}/include
++    /usr/include
++    /usr/local/include
++    /opt/intel/oneapi/mkl/2023.1.0/include
++    /opt/intel/2024/oneapi/2024.0/include
++    /opt/intel/2024/oneapi/mkl/2024.0/include)
++
++find_library(IOMP5_LIB iomp5 HINTS ${COTRA_LIB_HINTS})
++if(NOT IOMP5_LIB)
++    message(FATAL_ERROR "Could not find libiomp5; load an Intel OpenMP runtime or point CONDA_PREFIX to one.")
++endif()
++get_filename_component(OMP_PATH ${IOMP5_LIB} DIRECTORY)
+ link_directories(${OMP_PATH})
+ 
+-set(POSSIBLE_MKL_LIB_PATHS "/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/intel-oneapi-mkl-2024.0.0-a4e6uj4nsyq4llk43fbax6eobust7uug/mkl/latest/lib/intel64/libmkl_core.so")
+-
+-foreach(POSSIBLE_MKL_LIB_PATH ${POSSIBLE_MKL_LIB_PATHS})
+-    if (EXISTS ${POSSIBLE_MKL_LIB_PATH})
+-        get_filename_component(MKL_PATH ${POSSIBLE_MKL_LIB_PATH} DIRECTORY)
+-    endif()
+-endforeach()
+-set(POSSIBLE_MKL_INCLUDE_PATHS "/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/intel-oneapi-mkl-2024.0.0-a4e6uj4nsyq4llk43fbax6eobust7uug/mkl/latest/include")
+-foreach(POSSIBLE_MKL_INCLUDE_PATH ${POSSIBLE_MKL_INCLUDE_PATHS})
+-    if (EXISTS ${POSSIBLE_MKL_INCLUDE_PATH})
+-        set(MKL_INCLUDE_PATH ${POSSIBLE_MKL_INCLUDE_PATH})
+-    endif()
+-endforeach()
+-MESSAGE(STATUS "index MKL_PATH: ${MKL_PATH}")
++find_library(MKL_CORE_LIB mkl_core HINTS ${COTRA_LIB_HINTS})
++if(NOT MKL_CORE_LIB)
++    message(FATAL_ERROR "Could not find Intel MKL core library.")
++endif()
++get_filename_component(MKL_PATH ${MKL_CORE_LIB} DIRECTORY)
++
++find_path(MKL_INCLUDE_PATH mkl.h HINTS ${COTRA_MKL_INCLUDE_HINTS})
++if(NOT MKL_INCLUDE_PATH)
++    message(FATAL_ERROR "Could not find Intel MKL headers.")
++endif()
++message(STATUS "index MKL_PATH: ${MKL_PATH}")
+ link_directories(${MKL_PATH})
+ include_directories(${MKL_INCLUDE_PATH})
+ 
+@@ -94,5 +127,3 @@ target_include_directories(rdma_index PUBLIC
+ )
+ 
+ add_subdirectory(tests)
+-
+-
+diff --git a/coromem/include/hwtopo.h b/coromem/include/hwtopo.h
+index 0f65955..90b8a7e 100644
+--- a/coromem/include/hwtopo.h
++++ b/coromem/include/hwtopo.h
+@@ -30,14 +30,14 @@ struct HWTopoInfo {
+ 
+ struct cpuinfo {
+   // fields filled in from OS files
+-  unsigned proc;
+-  unsigned physid;
+-  unsigned sib;
+-  unsigned coreid;
+-  unsigned cpucores;
+-  unsigned numaNode;  // from libnuma
+-  bool valid;         // from cpuset
+-  bool smt;           // computed
++  unsigned proc = 0;
++  unsigned physid = 0;
++  unsigned sib = 0;
++  unsigned coreid = 0;
++  unsigned cpucores = 0;
++  unsigned numaNode = 0;  // from libnuma
++  bool valid = false;     // from cpuset
++  bool smt = false;       // computed
+ };
+ 
+ /**
+diff --git a/coromem/src/hwtopo.cpp b/coromem/src/hwtopo.cpp
+index b6553c7..ddce7ce 100644
+--- a/coromem/src/hwtopo.cpp
++++ b/coromem/src/hwtopo.cpp
+@@ -179,6 +179,28 @@ std::vector<int> parseCPUSet() {
+   return parseCPUList(line);
+ }
+ 
++static std::vector<cpuinfo> makeFallbackCPUInfoFromSet(
++    const std::vector<int> &cpuset) {
++  std::vector<int> allowed = cpuset;
++  std::sort(allowed.begin(), allowed.end());
++
++  std::vector<cpuinfo> info;
++  info.reserve(allowed.size());
++  for (size_t i = 0; i < allowed.size(); ++i) {
++    cpuinfo c;
++    c.proc = allowed[i];
++    c.physid = 0;
++    c.sib = allowed.size();
++    c.coreid = i;
++    c.cpucores = allowed.size();
++    c.valid = true;
++    c.smt = false;
++    c.numaNode = getNumaNode(c);
++    info.push_back(c);
++  }
++  return info;
++}
++
+ void markValid(std::vector<cpuinfo> &info) {
+   auto v = parseCPUSet();
+   if (v.empty()) {
+@@ -194,6 +216,7 @@ HWTopoInfo makeHWTopo() {
+   MachineTopoInfo retMTI;
+ 
+   auto info = parseCPUInfo();
++  const auto cpuset = parseCPUSet();
+   std::sort(info.begin(), info.end());
+   markSMT(info);
+   markValid(info);
+@@ -203,6 +226,13 @@ HWTopoInfo makeHWTopo() {
+           info.begin(), info.end(), [](const cpuinfo &c) { return c.valid; }),
+       info.end());
+ 
++  // Some Slurm/cgroup environments expose the allowed CPU list correctly in
++  // /proc/self/status but provide a truncated /proc/cpuinfo view. Fall back to
++  // the cpuset so the thread pool still matches the CPUs allocated to the task.
++  if (!cpuset.empty() && info.size() != cpuset.size()) {
++    info = makeFallbackCPUInfoFromSet(cpuset);
++  }
++
+   std::sort(info.begin(), info.end());
+   markSMT(info);
+   retMTI.maxSockets = countSockets(info);
+diff --git a/coromem/src/threadpool.cpp b/coromem/src/threadpool.cpp
+index 6388f35..b9d9de5 100644
+--- a/coromem/src/threadpool.cpp
++++ b/coromem/src/threadpool.cpp
+@@ -19,6 +19,15 @@ inline static void asmPause() {
+ #endif
+ }
+ 
++static void joinAllThreads(std::vector<std::thread> &threads) {
++  for (auto &t : threads) {
++    if (t.joinable()) {
++      t.join();
++    }
++  }
++  threads.clear();
++}
++
+ ThreadPool::ThreadPool()
+     : mi(getHWTopo().machineTopoInfo), hw_info(getHWTopo()) {
+   signals.resize(mi.maxThreads);
+@@ -38,17 +47,13 @@ ThreadPool::ThreadPool()
+ 
+ ThreadPool::~ThreadPool() {
+   destroyCommon();
+-  for (auto &t : threads) {
+-    t.join();
+-  }
++  joinAllThreads(threads);
+ }
+ 
+ void ThreadPool::poolPause() {
+   destroyCommon();
+   unbindThreadSelf();
+-  for (auto &t : threads) {
+-    t.join();
+-  }
++  joinAllThreads(threads);
+ }
+ 
+ void ThreadPool::poolContiue() {
+diff --git a/include/anns/anns_param.h b/include/anns/anns_param.h
+index 644cbdd..ffd140a 100644
+--- a/include/anns/anns_param.h
++++ b/include/anns/anns_param.h
+@@ -270,4 +270,27 @@ class AnnsParameter {
+     cout << "Loaded gt\n";
+     free(gt_ptr);
+   }
++
++  void load_query_only() {
++    query_ptr = (char *)malloc(qsize * vecsize);
++
++    printf("COTRA_SKIP_RECALL=1: skipping GT load and parsing.\n");
++    printf("Loading queries from: %s\n", query_path.c_str());
++    if(!std::filesystem::exists(query_path)){
++      std::cerr<<"Error: Query file does not exist.\n";
++      abort();
++    }
++    ifstream inputQ(query_path.c_str(), ios::binary);
++
++    uint32_t num_q, dim;
++    inputQ.read((char *)(&num_q), sizeof(uint32_t));
++    inputQ.read((char *)(&dim), sizeof(uint32_t));
++    printf("Query number: %d Dim: %d\n", num_q, dim);
++
++    for (size_t i = 0; i < qsize; i++) {
++      inputQ.read(query_ptr + i * vecsize, vecsize);
++    }
++    inputQ.close();
++    printf("Loaded queries without GT.\n");
++  }
+ };
+diff --git a/include/anns/exec_query.h b/include/anns/exec_query.h
+index 2024dcf..47512dc 100644
+--- a/include/anns/exec_query.h
++++ b/include/anns/exec_query.h
+@@ -6,6 +6,7 @@
+ #include <fstream>
+ #include <iostream>
+ #include <queue>
++#include <sstream>
+ #include <unordered_set>
+ #include <chrono>
+ 
+@@ -22,6 +23,41 @@ const int debug_id = 4;
+ using namespace std;
+ using namespace hnswlib;
+ 
++static vector<size_t> get_eval_efs() {
++  const char *ef_env = std::getenv("COTRA_EF_LIST");
++  if (ef_env == nullptr || ef_env[0] == '\0') {
++#ifdef DEBUG
++    return {30, 400};
++#else
++    return {3, 4, 5, 6, 8, 10, 15, 20, 30, 40, 50, 70, 100, 150, 200, 250,
++            300, 400, 500, 600, 700};
++#endif
++  }
++
++  vector<size_t> efs;
++  std::stringstream ss(ef_env);
++  std::string item;
++  while (std::getline(ss, item, ',')) {
++    if (item.empty()) {
++      continue;
++    }
++    efs.push_back(static_cast<size_t>(std::stoul(item)));
++  }
++  if (efs.empty()) {
++    throw std::runtime_error("COTRA_EF_LIST is set but contains no valid ef");
++  }
++  return efs;
++}
++
++static bool cotra_exec_env_flag_enabled(const char *name) {
++  const char *env = std::getenv(name);
++  if (env == nullptr || env[0] == '\0') {
++    return false;
++  }
++  std::string value(env);
++  return value != "0" && value != "false" && value != "False";
++}
++
+ template<typename dist_t>
+ static void test_vs_recall(
+     AnnsParameter &anns_param, ScalaSearch<dist_t> &appr_alg, 
+@@ -35,12 +71,7 @@ static void test_vs_recall(
+   //     anns_param.answers;
+   size_t k = anns_param.res_knn;
+ 
+-#ifdef DEBUG
+-  vector<size_t> efs = {30, 400};
+-#else
+-  // repeat first for warmup.
+-  vector<size_t> efs = {3, 4, 5, 6, 8, 10, 15, 20, 30, 40, 50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700};
+-#endif
++  vector<size_t> efs = get_eval_efs();
+ 
+ #if defined(PROF_Q_DISTRI) || defined(PROF_ALL_Q_DISTRI)
+   efs = {300};
+@@ -496,6 +527,13 @@ static void test_vs_recall(
+         RangeIterator all(query_load);
+         on_each(all);
+         std::atomic<size_t> load_cnt(0);
++        const bool skip_recall = cotra_exec_env_flag_enabled("COTRA_SKIP_RECALL");
++        const uint32_t runtime_query_group_size = get_runtime_query_group_size();
++        if (appr_alg.rdma_param.machine_id == 0) {
++          printf("COTRA_SEARCH_ONLY_CONFIG ef=%zu skip_recall=%u query_group_size=%u query_load_per_rank=%zu qsize=%zu\n",
++                 ef, skip_recall ? 1 : 0, runtime_query_group_size,
++                 query_load, qsize);
++        }
+ #ifdef LAT
+         // for latency record
+         std::chrono::high_resolution_clock::time_point start[qsize];
+@@ -512,6 +550,14 @@ static void test_vs_recall(
+ 
+         auto proc_res = [&](auto &result) {
+           for (auto &res : result) {
++            if (skip_recall) {
++#ifdef LAT
++              end[res->query_id] = std::chrono::high_resolution_clock::now();
++#endif
++              res->release_heavy_state_after_result();
++              load_cnt.fetch_add(1);
++              continue;
++            }
+ #ifdef PROFILER
+             // res->profiler.report();
+             auto *local_prof = appr_alg.all_profiler.getLocal();
+@@ -573,7 +619,7 @@ static void test_vs_recall(
+             res->profiler.report();
+ #endif
+ #endif
+-            delete res;
++            res->release_heavy_state_after_result();
+             load_cnt.fetch_add(1);
+             // printf("load_cnt ++: %u\n", load_cnt.load());
+           }
+@@ -626,6 +672,17 @@ static void test_vs_recall(
+               m_profiler.end("g_overall");
+ #endif
+               if (tid == 0) {
++                double search_only_us = stopw.getElapsedTimeMicro();
++                if (skip_recall) {
++                  double local_qps = search_only_us > 0.0
++                                         ? 1000000.0 * query_load / search_only_us
++                                         : 0.0;
++                  printf("SEARCH_ONLY\t%zu\t%d\t%zu\t%.3f\t%.3f\t%u\t%u\n",
++                         ef, appr_alg.rdma_param.machine_id, query_load,
++                         search_only_us, local_qps, runtime_query_group_size,
++                         skip_recall ? 1 : 0);
++                  fflush(stdout);
++                }
+                 double cumu_lat_us = 0.0;
+                 appr_alg.sendTerm(correct.load(), total.load(), query_load, cumu_lat_us);
+               }
+@@ -668,9 +725,9 @@ static void test_vs_recall(
+         });
+ #endif
+         if(appr_alg.rdma_param.machine_id != 0) {
+-          float recall = 1.0f * correct.load() / total.load();
+-          float time_us_per_query = exec_time / query_load;
+-          float qps = 1000000.0 * query_load / exec_time;
++          float recall = total.load() ? 1.0f * correct.load() / total.load() : 0.0f;
++          float time_us_per_query = query_load ? exec_time / query_load : 0.0f;
++          float qps = exec_time > 0 ? 1000000.0 * query_load / exec_time : 0.0f;
+           cout << ef << "\t" << recall << "\t" << time_us_per_query << " us\t"
+               << qps << " /s\n";
+         }
+@@ -729,6 +786,11 @@ static void test_vs_recall(
+         }
+ #endif
+ 
++        for (uint32_t q = 0; q < qsize; q++) {
++          delete appr_alg.global_query[q];
++          appr_alg.global_query[q] = nullptr;
++        }
++
+       } break;
+ 
+       default:
+diff --git a/include/anns/hash_table.h b/include/anns/hash_table.h
+index 2e570b7..5231389 100644
+--- a/include/anns/hash_table.h
++++ b/include/anns/hash_table.h
+@@ -60,6 +60,9 @@ class OptHashPosVector {
+   }
+ 
+   void clear() {
++    if (!m_hashTable) {
++      return;
++    }
+     if (!m_secondHash) {
+       // Clear first block.
+       memset(m_hashTable.get(), 0, sizeof(SizeType) * (m_poolSize + 1));
+@@ -70,6 +73,13 @@ class OptHashPosVector {
+     }
+   }
+ 
++  void release_storage() {
++    m_hashTable.reset();
++    m_secondHash = false;
++    m_exp = 0;
++    m_poolSize = -1;
++  }
++
+   inline int HashTableExponent() const { return m_exp; }
+ 
+   inline int MaxCheck() const {
+@@ -77,6 +87,11 @@ class OptHashPosVector {
+   }
+ 
+   inline bool CheckAndSet(SizeType idx) {
++    if (!m_hashTable) {
++      // Released queries should ignore any late duplicate work instead of
++      // touching freed query state.
++      return true;
++    }
+     // Inner Index is begin from 1
+     return _CheckAndSet(m_hashTable.get(), m_poolSize, true, idx + 1) == 0;
+   }
+@@ -126,4 +141,4 @@ class OptHashPosVector {
+     //     m_exp, m_poolSize);
+     return _CheckAndSet(m_hashTable.get(), m_poolSize, true, idx);
+   }
+-};
+\ No newline at end of file
++};
+diff --git a/include/anns/query_msg.h b/include/anns/query_msg.h
+index c368aa5..797e2b0 100644
+--- a/include/anns/query_msg.h
++++ b/include/anns/query_msg.h
+@@ -86,6 +86,7 @@ class QueryMsg {
+ 
+   // indicate whether new (has coro) for this machine, forbid serialize.
+   bool is_new{true};
++  bool heavy_state_released{false};
+ 
+   // group cand nghs
+   //   std::pair<dist_t, uint32_t> group_nodes[CAND_GROUP_SIZE];
+@@ -139,7 +140,7 @@ class QueryMsg {
+   std::priority_queue<std::pair<dist_t, size_t>> result;
+ 
+   QueryMsg() {}
+-  ~QueryMsg() {}
++  ~QueryMsg() { release_owned_storage(); }
+ 
+   QueryMsg(QueryState _state) : state(_state), origin_machine(0) {}
+ 
+@@ -151,6 +152,69 @@ class QueryMsg {
+     memset(is_core_machine, 0, sizeof(is_core_machine));
+   }
+ 
++  void release_owned_storage() {
++    if (vector != nullptr) {
++      free(vector);
++      vector = nullptr;
++    }
++    vector_size = 0;
++  }
++
++  template <typename T>
++  static void release_vector_storage(std::vector<T>& vec) {
++    std::vector<T>().swap(vec);
++  }
++
++  template <typename QueueT>
++  static void release_queue_storage(QueueT& queue) {
++    QueueT empty;
++    queue.swap(empty);
++  }
++
++  void release_sync_msg_storage() {
++    release_vector_storage(sync_msg.local_add_cand);
++    for (uint32_t i = 0; i < MACHINE_NUM; i++) {
++      release_vector_storage(sync_msg.core_micro_ngh[i]);
++      release_vector_storage(sync_msg.core_large_ngh[i]);
++    }
++  }
++
++  void release_heavy_state_after_result() {
++    if (heavy_state_released) {
++      return;
++    }
++
++    release_owned_storage();
++    visit_hash.release_storage();
++
++    release_vector_storage(core_machine);
++    for (uint32_t i = 0; i < MACHINE_NUM; i++) {
++      release_vector_storage(filterred[i]);
++    }
++    release_sync_msg_storage();
++
++    release_vector_storage(local_task);
++    release_vector_storage(local_micro_task);
++    release_vector_storage(local_res);
++    release_vector_storage(async_read_queue);
++    release_vector_storage(recv_async_read_queue);
++    // Keep the QueryMsg shell alive in global_query, but drain queued chunks.
++    while (con_task_queue.pop().has_value()) {
++    }
++
++    release_queue_storage(top_candidates);
++    release_queue_storage(candidate_set);
++    release_queue_storage(pre_top_cand);
++    release_queue_storage(pre_cand_set);
++    release_queue_storage(result);
++
++    cur_res = nullptr;
++    cur_cmp = nullptr;
++    cur_task = nullptr;
++    has_cur_res = has_cur_cmp = has_cur_task = has_cur_async = false;
++    heavy_state_released = true;
++  }
++
+   void print_msg() {
+     printf("ef %d\n", ef);
+     printf("query_id %d\n", query_id);
+@@ -167,6 +231,9 @@ class QueryMsg {
+   void update_sub_query(
+       uint32_t machine_id, SyncMsg<dist_t>* sync_msg,
+       BalanceQueue<ComputeTask<dist_t>>* ib) {
++    if (heavy_state_released) {
++      return;
++    }
+     if (sync_msg->update_term) {
+       // printf("q%u PROP update\n", sync_msg->qid);
+       has_token = sync_msg->has_token;
+@@ -203,6 +270,9 @@ class QueryMsg {
+    */
+   void update_sub_query_from_noncore(
+       uint32_t machine_id, NonCoreSyncMsg<dist_t>* sync_msg) {
++    if (heavy_state_released) {
++      return;
++    }
+     // printf("update sub query from noncore\n");
+     for (uint32_t& elem : sync_msg->core_micro_ngh) {
+       local_micro_task.emplace_back(elem);
+diff --git a/include/anns/scala_search.h b/include/anns/scala_search.h
+index a581881..9f45df0 100644
+--- a/include/anns/scala_search.h
++++ b/include/anns/scala_search.h
+@@ -29,6 +29,21 @@ namespace hnswlib {
+ typedef unsigned int tableint;
+ typedef unsigned int linklistsizeint;
+ 
++static inline uint32_t get_runtime_query_group_size() {
++  static uint32_t value = []() {
++    const char *env = getenv("COTRA_QUERY_GROUP_SIZE");
++    if (env != nullptr && env[0] != '\0') {
++      char *end = nullptr;
++      unsigned long parsed = strtoul(env, &end, 10);
++      if (end != env && *end == '\0' && parsed > 0) {
++        return static_cast<uint32_t>(parsed);
++      }
++    }
++    return static_cast<uint32_t>(QUERY_GROUP_SIZE);
++  }();
++  return value;
++}
++
+ // TODO: change name to lowercase name method.
+ template <typename dist_t>
+ class ScalaSearch : public AlgorithmInterface<dist_t> {
+@@ -344,6 +359,35 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+     visited_list_pool_.reset(nullptr);
+   }
+ 
++  uint32_t *checked_scala_v3_ngh_ptr(
++      uint64_t offset, uint32_t deg, uint32_t qid, uint32_t result_mid,
++      const char *stage, bool require_alignment = false) {
++    auto *scala_graph = graph_index.scala_graph;
++    const uint64_t deg_ngh_size = scala_graph->deg_ngh_size;
++    const uint64_t span = static_cast<uint64_t>(deg) * sizeof(uint32_t);
++    const bool bad_align =
++        require_alignment && ((offset % sizeof(uint32_t)) != 0);
++    const bool bad_offset = offset >= deg_ngh_size;
++    const bool bad_span =
++        !bad_offset && (span > (deg_ngh_size - offset));
++
++    if (bad_align || bad_offset || bad_span) {
++      printf(
++          "Error: invalid ScalaGraph V3 span at %s on machine %u for q%u "
++          "return_mid %u offset %llu deg %u span %llu deg_ngh_size %llu "
++          "partition_ofs %llu local_vec_num %u remote_ngh_num %llu\n",
++          stage, anns_param.machine_id, qid, result_mid,
++          (unsigned long long)offset, deg, (unsigned long long)span,
++          (unsigned long long)deg_ngh_size,
++          (unsigned long long)scala_graph->partition_ofs,
++          scala_graph->local_vec_num,
++          (unsigned long long)scala_graph->remote_ngh_num);
++      abort();
++    }
++
++    return scala_graph->scala_graph_v3_get_ngh_ptr(offset);
++  }
++
+   void read_test() {
+     printf("Read operation test\n");
+     srand(time(NULL));
+@@ -1587,11 +1631,11 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+ 
+ 
+   void printQueryBatchInfo(float time) {
+-    float recall = 1.0f * rdma_comm.correct / rdma_comm.total;
+-    float time_us_per_query = time / rdma_comm.query_load;
+-    float avg_lat = rdma_comm.query_lat_sum / rdma_comm.query_load;
++    float recall = rdma_comm.total ? 1.0f * rdma_comm.correct / rdma_comm.total : 0.0f;
++    float time_us_per_query = rdma_comm.query_load ? time / rdma_comm.query_load : 0.0f;
++    float avg_lat = rdma_comm.query_load ? rdma_comm.query_lat_sum / rdma_comm.query_load : 0.0f;
+     size_t all_comp_cnt = rdma_comm.all_computation_cnt;
+-    float qps = 1000000.0 * rdma_comm.query_load / time;
++    float qps = time > 0 ? 1000000.0 * rdma_comm.query_load / time : 0.0f;
+     // printf("-------------- Overall info --------------\n");
+     // printf(
+     //     "correct: %llu total: %llu query load: %llu\n", rdma_comm.correct,
+@@ -1610,10 +1654,10 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+   }
+ 
+   void printQueryBatchInfoSave(float time, std::ofstream &out) {
+-    float recall = 1.0f * rdma_comm.correct / rdma_comm.total;
+-    float time_us_per_query = time / rdma_comm.query_load;
+-    float avg_lat = rdma_comm.query_lat_sum / rdma_comm.query_load;
+-    float qps = 1000000.0 * rdma_comm.query_load / time;
++    float recall = rdma_comm.total ? 1.0f * rdma_comm.correct / rdma_comm.total : 0.0f;
++    float time_us_per_query = rdma_comm.query_load ? time / rdma_comm.query_load : 0.0f;
++    float avg_lat = rdma_comm.query_load ? rdma_comm.query_lat_sum / rdma_comm.query_load : 0.0f;
++    float qps = time > 0 ? 1000000.0 * rdma_comm.query_load / time : 0.0f;
+     printf("-------------- Overall info --------------\n");
+     printf(
+         "correct: %llu total: %llu query load: %llu\n", rdma_comm.correct,
+@@ -2057,15 +2101,20 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+     //     global_query[query_id]->local_task.size());
+     // printf("%llu %u \n", task.offset, task.deg);
+     uint32_t *ngh_arr =
+-        graph_index.scala_graph->scala_graph_v3_get_ngh_ptr(task.offset);
++        checked_scala_v3_ngh_ptr(
++            task.offset, task.deg, task.qid, anns_param.machine_id,
++            "do_task");
+     _mm_prefetch((char *)ngh_arr, _MM_HINT_T0);
+     _mm_prefetch(vec_ptr + ((*(ngh_arr)) - part_ofs) * data_label_size, _MM_HINT_T0);
+     _mm_prefetch((char *)(ngh_arr + 1), _MM_HINT_T0);
+     worklists::Chunk<std::pair<dist_t, uint32_t>, MAX_GRAPH_DEG> chunk(
+         task.is_count);
+     for (uint32_t d = 0; d < task.deg; d++) {
+-      _mm_prefetch(
+-          vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) * data_label_size, _MM_HINT_T0);
++      if (d + 1 < task.deg) {
++        _mm_prefetch(
++            vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) * data_label_size,
++            _MM_HINT_T0);
++      }
+       // printf("%u\n", *(ngh_arr + d));
+       // TODO: may have problem with concurrent
+       if (!global_query[task.qid]->visit_hash.CheckAndSet(*(ngh_arr + d))) {
+@@ -2283,7 +2332,9 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+ 
+       for (uint32_t m = 0; m < MACHINE_NUM; m++) {
+         float ratio_m = (float)global_query[query_id]->filter_num[m] / su_cnt;
+-        if (ratio_m > 1.0 / (MACHINE_NUM)) {  // core machine ratio bar.
++        // Always keep the elected leader as a core machine; otherwise an
++        // exactly even split can leave the query with no execution target.
++        if (ratio_m > 1.0 / (MACHINE_NUM) || m == mx_mid) {
+           global_query[query_id]->core_machine.emplace_back(m);
+           global_query[query_id]->is_core_machine[m] = 1;
+         } else {
+@@ -2485,16 +2536,20 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+             for (ComputeTask<dist_t> &task : global_query[query_id]->local_task) {
+               // printf("%llu %u \n", task.offset, task.deg);
+               uint32_t *ngh_arr =
+-                  graph_index.scala_graph->scala_graph_v3_get_ngh_ptr(
+-                      task.offset);
++                  checked_scala_v3_ngh_ptr(
++                      task.offset, task.deg, task.qid, anns_param.machine_id,
++                      "local_sync_task", true);
+               _mm_prefetch((char *)ngh_arr, _MM_HINT_T0);
+               _mm_prefetch(
+                   vec_ptr + ((*(ngh_arr)) - part_ofs) * data_label_size, _MM_HINT_T0);
+               _mm_prefetch((char *)(ngh_arr + 1), _MM_HINT_T0);
+               for (uint32_t d = 0; d < task.deg; d++) {
+-                _mm_prefetch(
+-                    vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) * data_label_size,
+-                    _MM_HINT_T0);
++                if (d + 1 < task.deg) {
++                  _mm_prefetch(
++                      vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) *
++                                    data_label_size,
++                      _MM_HINT_T0);
++                }
+                 // printf("%u\n", *(ngh_arr + d));
+                 if (!global_query[query_id]->visit_hash.CheckAndSet(
+                         *(ngh_arr + d))) {
+@@ -2554,14 +2609,18 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+               printf("proc qlocal micro task\n");
+             #endif 
+             // printf("proc local micro task\n");
+-            for (uint32_t i = 0;
+-                 i < global_query[query_id]->local_micro_task.size(); i++) {
++            const uint32_t local_micro_task_size =
++                global_query[query_id]->local_micro_task.size();
++            for (uint32_t i = 0; i < local_micro_task_size; i++) {
+               uint32_t &vid = global_query[query_id]->local_micro_task[i];
+-              _mm_prefetch(
+-                  vec_ptr + (global_query[query_id]->local_micro_task[i + 1] -
+-                             part_ofs) *
+-                                data_label_size,
+-                  _MM_HINT_T0);
++              if (i + 1 < local_micro_task_size) {
++                _mm_prefetch(
++                    vec_ptr +
++                        (global_query[query_id]->local_micro_task[i + 1] -
++                         part_ofs) *
++                            data_label_size,
++                    _MM_HINT_T0);
++              }
+               if (!global_query[query_id]->visit_hash.CheckAndSet(vid)) {
+ #ifdef PROF_COMPUTATION
+                 computation_cnt ++;
+@@ -2852,7 +2911,9 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+           //     task.offset, task.qid, task.deg, task.machine_id);
+           if(task.offset){
+             uint32_t *ngh_arr =
+-                graph_index.scala_graph->scala_graph_v3_get_ngh_ptr(task.offset);
++                checked_scala_v3_ngh_ptr(
++                    task.offset, task.deg, task.qid, task.machine_id,
++                    "node_task_local");
+             char *vec_ptr = graph_index.scala_graph->vector_ptr;
+             uint32_t part_ofs =
+                 graph_index.scala_graph->scala_graph_get_partition_ofs();
+@@ -2861,9 +2922,12 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+             _mm_prefetch(global_query[task.qid]->vector, _MM_HINT_T0);
+             _mm_prefetch((char *)(ngh_arr + 1), _MM_HINT_T0);
+             for (uint32_t d = 0; d < task.deg; d++) {
+-              _mm_prefetch(
+-                  vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) * data_label_size,
+-                  _MM_HINT_T0);
++              if (d + 1 < task.deg) {
++                _mm_prefetch(
++                    vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) *
++                                  data_label_size,
++                    _MM_HINT_T0);
++              }
+               if (!global_query[task.qid]->visit_hash.CheckAndSet(ngh_arr[d])) {
+ #ifdef PROF_COMPUTATION
+                 computation_cnt ++;
+@@ -2980,8 +3044,9 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+             // printf(
+             //     "task offset %llu qid %llu deg %llu machine_id %llu\n",
+             //     task.offset, task.qid, task.deg, task.machine_id);
+-            ngh_arr = graph_index.scala_graph->scala_graph_v3_get_ngh_ptr(
+-                task.offset);
++            ngh_arr = checked_scala_v3_ngh_ptr(
++                task.offset, task.deg, task.qid, task.machine_id,
++                "remote_task", true);
+           }
+ 
+           char *vec_ptr = graph_index.scala_graph->vector_ptr;
+@@ -2995,9 +3060,12 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+             // if (task.deg <= INLINE_DEG_BAR) {
+             //   printf("low deg d%d ngh%d\n", d, ngh_arr[d]);
+             // }
+-            _mm_prefetch(
+-                vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) * data_label_size,
+-                _MM_HINT_T0);
++            if (d + 1 < task.deg) {
++              _mm_prefetch(
++                  vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) *
++                                data_label_size,
++                  _MM_HINT_T0);
++            }
+             if (!global_query[task.qid]->visit_hash.CheckAndSet(ngh_arr[d])) {
+ #ifdef PROF_COMPUTATION
+               computation_cnt ++;
+@@ -3183,7 +3251,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+ 
+       if (!task_queue.size() && !result_queue.size() && !query_queue.size() &&
+           !async_queue.size() && !subquery_queue.size() && !node_queue.size()) {
+-        if (tman.cur_query_num < QUERY_GROUP_SIZE) {
++        if (tman.cur_query_num < get_runtime_query_group_size()) {
+ // all task is empty, add new query.
+ #ifdef PROFILER
+           m_profiler.end("g_overall");
+diff --git a/include/index/scala_graph.h b/include/index/scala_graph.h
+index b91cd70..39a5c0a 100644
+--- a/include/index/scala_graph.h
++++ b/include/index/scala_graph.h
+@@ -78,8 +78,10 @@ class ScalaGraphIndex {
+     partition_num = index_param.num_parts;
+     partition_id = index_param.machine_id;
+     partition_vec_num = (uint32_t *)malloc(sizeof(uint32_t) * partition_num);
++    // Inclusive prefix sums write indices [0, partition_num], so allocate
++    // partition_num + 1 entries rather than appending a single byte.
+     cumu_partition_num =
+-        (uint32_t *)malloc(sizeof(uint32_t) * partition_num + 1);
++        (uint32_t *)malloc(sizeof(uint32_t) * (partition_num + 1));
+     subset_size_milllions = index_param.subset_size_milllions;
+   }
+ 
+@@ -318,7 +320,7 @@ class ScalaGraphIndex {
+   }
+ 
+   inline uint32_t *scala_graph_v3_get_ngh_ptr(uint64_t offset) {
+-    if (offset > deg_ngh_size) {
++    if (offset >= deg_ngh_size) {
+       printf(
+           "Error: offset %llu exceed deg_ngh_size: %llu\n", offset,
+           deg_ngh_size);
+diff --git a/include/rdma/rdma_comm.h b/include/rdma/rdma_comm.h
+index 922f98a..6bc11dd 100644
+--- a/include/rdma/rdma_comm.h
++++ b/include/rdma/rdma_comm.h
+@@ -412,9 +412,6 @@ class RdmaCommunication {
+       if (m == tman.local_id) continue;
+       // Send remote task & node.
+       if (tman.task_queue[m].size() > 0 || tman.node_task_queue[m].size() > 0) {
+-#ifdef PROFILER
+-        profiler->count("task_push");
+-#endif
+         uint32_t buf_id = get_write_send_buf(m);
+         uint64_t offset = 0;
+         tman.serialize_task(m, buf->buffer[m][buf_id], offset);
+@@ -436,9 +433,6 @@ class RdmaCommunication {
+       if (m == tman.local_id) continue;
+       // Send remote task & node.
+       if (tman.task_queue[m].size() > 0 || tman.node_task_queue[m].size() > 0) {
+-#ifdef PROFILER
+-        profiler->count("task_push");
+-#endif
+         uint32_t buf_id = get_write_send_buf(m);
+         uint64_t offset = 0;
+         tman.serialize_task(m, buf->buffer[m][buf_id], offset);
+diff --git a/include/rdma/rdma_config.h b/include/rdma/rdma_config.h
+index e01e0de..7d6c903 100644
+--- a/include/rdma/rdma_config.h
++++ b/include/rdma/rdma_config.h
+@@ -8,7 +8,9 @@
+ 
+ // #define MACHINE_NUM (4)
+ // #define MACHINE_NUM (8)
++#ifndef MACHINE_NUM
+ #define MACHINE_NUM (16)
++#endif
+ #define MAX_THREAD_NUM (16)
+ #define GROUP_SIZE (16)
+ // NOTE: MAX_READ_NUM is the max read num one thread cand send to one machine
+diff --git a/src/index/index_param.cc b/src/index/index_param.cc
+index 69986c8..5320c53 100644
+--- a/src/index/index_param.cc
++++ b/src/index/index_param.cc
+@@ -95,6 +95,11 @@ AnnsParameter::AnnsParameter(int argc, char **argv, IndexParameter &index_param)
+   }
+   vecdim = index_param.dim;
+ 
++  // Reuse the already-parsed index thread setting for ANN so search and index
++  // runs stay consistent even when the ANN parser falls back to its default.
++  thd_num = index_param.thread_num;
++
++  omp_set_num_threads(thd_num);
+   auto numThreads = setActiveThreads(thd_num);
+   printf("Set thread num = %d\n", numThreads);
+   // kmeans_pnum = cmd.getOptionIntValue("-k", MACHINE_NUM);
+@@ -456,4 +461,4 @@ IndexParameter::IndexParameter(int argc, char **argv) {
+   }
+ 
+   b1_ele_size = (max_degree + 1)*sizeof(uint32_t) + vec_size + sizeof(uint64_t);
+-}
+\ No newline at end of file
++}
+diff --git a/src/rdma/rdma_comm.cc b/src/rdma/rdma_comm.cc
+index 46573d0..5378996 100644
+--- a/src/rdma/rdma_comm.cc
++++ b/src/rdma/rdma_comm.cc
+@@ -938,7 +938,10 @@ int RdmaCommunication::post_read(
+     ctx->wr[m][r].sg_list = &ctx->sge_list[vec.buffer_id];
+     ctx->wr[m][r].wr.rdma.remote_addr =
+         ctx->remote_mr_msg[m].read_vaddr + offset;
+-    ctx->wr[m][r].wr_id = (query_id << 16) | vec.buffer_id;
++    // Keep the query id in the high bits.  Without the cast, uint32_t
++    // query_id overflows once qid >= 65536 and large query batches hang.
++    ctx->wr[m][r].wr_id = (static_cast<uint64_t>(query_id) << 16) |
++                          static_cast<uint64_t>(vec.buffer_id);
+     ctx->wr[m][r].next = NULL;
+     if (r > 0) {
+       ctx->wr[m][r - 1].next = &ctx->wr[m][r];
+@@ -1457,4 +1460,4 @@ void RdmaCommunication::swap_scalagraph_remote_ngh(
+   }
+ 
+   return;
+-}
+\ No newline at end of file
++}
+diff --git a/tests/anns/CMakeLists.txt b/tests/anns/CMakeLists.txt
+index 00c0754..23b13bc 100644
+--- a/tests/anns/CMakeLists.txt
++++ b/tests/anns/CMakeLists.txt
+@@ -2,4 +2,5 @@
+ add_executable(test_hashmap test_hashmap.cc)
+ add_executable(test_querymsg test_querymsg.cc)
+ add_executable(log log.cc)
+-add_executable(test_bq test_bq.cc)
+\ No newline at end of file
++add_executable(test_bq test_bq.cc)
++add_executable(breakdown_microbench breakdown_microbench.cc)
+diff --git a/tests/scala_anns.cc b/tests/scala_anns.cc
+index 33fa8c9..bb9ff71 100644
+--- a/tests/scala_anns.cc
++++ b/tests/scala_anns.cc
+@@ -1,6 +1,14 @@
+ #include "anns/exec_query.h"
+ #include "index/graph_index.h"
+ 
++#include <cstdlib>
++
++static bool cotra_skip_recall_enabled() {
++  const char *env = std::getenv("COTRA_SKIP_RECALL");
++  return env != nullptr && env[0] != '\0' && std::string(env) != "0" &&
++         std::string(env) != "false" && std::string(env) != "False";
++}
++
+ // ../scripts/scala_anns.sh
+ int main(int argc, char **argv) {
+   SharedMem coromem;
+@@ -22,25 +30,41 @@ int main(int argc, char **argv) {
+ 
+   if(anns_param.dist_fn == std::string("l2")){
+     if(anns_param.data_type_str == std::string("uint8")){
+-      anns_param.load_query_gt(anns_param.int_answers);
++      if (cotra_skip_recall_enabled()) {
++        anns_param.load_query_only();
++      } else {
++        anns_param.load_query_gt(anns_param.int_answers);
++      }
+       ScalaSearch<int> appr_alg(anns_param, rdma_param, anns_param.l2_space_i, graph_index);
+       appr_alg.set_evaluation_save_path(anns_param.evaluation_save_path);
+       test_vs_recall<int>(anns_param, appr_alg, anns_param.int_answers);
+     }
+     else if(anns_param.data_type_str == std::string("int8")){
+-      anns_param.load_query_gt(anns_param.int_answers);
++      if (cotra_skip_recall_enabled()) {
++        anns_param.load_query_only();
++      } else {
++        anns_param.load_query_gt(anns_param.int_answers);
++      }
+       ScalaSearch<int> appr_alg(anns_param, rdma_param, anns_param.l2_space_ii, graph_index);
+       appr_alg.set_evaluation_save_path(anns_param.evaluation_save_path);
+       test_vs_recall<int>(anns_param, appr_alg, anns_param.int_answers);
+     }
+     else if(anns_param.data_type_str == std::string("float")){
+-      anns_param.load_query_gt(anns_param.float_answers);
++      if (cotra_skip_recall_enabled()) {
++        anns_param.load_query_only();
++      } else {
++        anns_param.load_query_gt(anns_param.float_answers);
++      }
+       ScalaSearch<float> appr_alg(anns_param, rdma_param, anns_param.l2_space, graph_index);
+       appr_alg.set_evaluation_save_path(anns_param.evaluation_save_path);
+       test_vs_recall<float>(anns_param, appr_alg, anns_param.float_answers);
+     }
+   }else if(anns_param.dist_fn == std::string("mips")){
+-    anns_param.load_query_gt(anns_param.float_answers);
++    if (cotra_skip_recall_enabled()) {
++      anns_param.load_query_only();
++    } else {
++      anns_param.load_query_gt(anns_param.float_answers);
++    }
+     ScalaSearch<float> appr_alg(anns_param, rdma_param, anns_param.ip_space, graph_index);
+     appr_alg.set_evaluation_save_path(anns_param.evaluation_save_path);
+     test_vs_recall<float>(anns_param, appr_alg, anns_param.float_answers);
+diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
+index ff2e879..44eabcf 100644
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -36,7 +36,31 @@ endif()
+ 
+ include_directories(/usr/local/include)
+ include_directories(./3rdparty/faiss)
+-link_libraries(/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/faiss-1.7.4-7lwxh7hvrens6htzefdgvibwohkv7pdh/lib/libfaiss.a)
++
++set(COTRA_THIRD_PARTY_LIB_HINTS
++    $ENV{CONDA_PREFIX}/lib
++    $ENV{CONDA_PREFIX}/lib64
++    /usr/lib/x86_64-linux-gnu
++    /usr/local/lib
++    /opt/intel/oneapi/compiler/2023.1.0/linux/compiler/lib/intel64_lin
++    /opt/intel/oneapi/mkl/2023.1.0/lib/intel64
++    /opt/intel/2024/oneapi/2024.0/lib
++    /opt/intel/2024/oneapi/mkl/2024.0/lib)
++set(COTRA_THIRD_PARTY_INCLUDE_HINTS
++    $ENV{CONDA_PREFIX}/include
++    /usr/include
++    /usr/local/include
++    /opt/intel/oneapi/mkl/2023.1.0/include
++    /opt/intel/2024/oneapi/2024.0/include
++    /opt/intel/2024/oneapi/mkl/2024.0/include)
++
++find_path(FAISS_INCLUDE_DIR faiss/Index.h HINTS ${COTRA_THIRD_PARTY_INCLUDE_HINTS})
++find_library(FAISS_LIB faiss HINTS ${COTRA_THIRD_PARTY_LIB_HINTS})
++if(NOT FAISS_INCLUDE_DIR OR NOT FAISS_LIB)
++    message(FATAL_ERROR "Could not find FAISS headers/libraries.")
++endif()
++include_directories(${FAISS_INCLUDE_DIR})
++link_libraries(${FAISS_LIB})
+ 
+ #OpenMP
+ # find_package(OpenMP)
+@@ -59,34 +83,18 @@ if (NOT Boost_FOUND)
+ endif()
+ 
+ include_directories(${Boost_INCLUDE_DIR})
+-set(POSSIBLE_OMP_PATHS "/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/intel-oneapi-mkl-2024.0.0-a4e6uj4nsyq4llk43fbax6eobust7uug/compiler/latest/lib/libiomp5.so")
+-    
+-foreach(POSSIBLE_OMP_PATH ${POSSIBLE_OMP_PATHS})
+-    if (EXISTS ${POSSIBLE_OMP_PATH})
+-        get_filename_component(OMP_PATH ${POSSIBLE_OMP_PATH} DIRECTORY)
+-    endif()
+-endforeach()
+-
+-if(NOT OMP_PATH)
+-    message(FATAL_ERROR "Could not find Intel OMP in standard locations; use -DOMP_PATH to specify the install location for your environment")
++find_library(IOMP5_LIB iomp5 HINTS ${COTRA_THIRD_PARTY_LIB_HINTS})
++if(NOT IOMP5_LIB)
++    message(FATAL_ERROR "Could not find libiomp5; load an Intel OpenMP runtime or point CONDA_PREFIX to one.")
+ endif()
++get_filename_component(OMP_PATH ${IOMP5_LIB} DIRECTORY)
+ link_directories(${OMP_PATH})
+ 
+-set(POSSIBLE_MKL_LIB_PATHS "/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/intel-oneapi-mkl-2024.0.0-a4e6uj4nsyq4llk43fbax6eobust7uug/mkl/latest/lib/intel64/libmkl_core.so")
+-
+-foreach(POSSIBLE_MKL_LIB_PATH ${POSSIBLE_MKL_LIB_PATHS})
+-    if (EXISTS ${POSSIBLE_MKL_LIB_PATH})
+-        get_filename_component(MKL_PATH ${POSSIBLE_MKL_LIB_PATH} DIRECTORY)
+-    endif()
+-endforeach()
+-
+-set(POSSIBLE_MKL_INCLUDE_PATHS "/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/intel-oneapi-mkl-2024.0.0-a4e6uj4nsyq4llk43fbax6eobust7uug/mkl/latest/include")
+-
+-foreach(POSSIBLE_MKL_INCLUDE_PATH ${POSSIBLE_MKL_INCLUDE_PATHS})
+-    if (EXISTS ${POSSIBLE_MKL_INCLUDE_PATH})
+-        set(MKL_INCLUDE_PATH ${POSSIBLE_MKL_INCLUDE_PATH})
+-    endif()
+-endforeach()
++find_library(MKL_CORE_LIB mkl_core HINTS ${COTRA_THIRD_PARTY_LIB_HINTS})
++if(MKL_CORE_LIB)
++    get_filename_component(MKL_PATH ${MKL_CORE_LIB} DIRECTORY)
++endif()
++find_path(MKL_INCLUDE_PATH mkl.h HINTS ${COTRA_THIRD_PARTY_INCLUDE_HINTS})
+ if(NOT MKL_PATH)
+     message(FATAL_ERROR "Could not find Intel MKL in standard locations; use -DMKL_PATH to specify the install location for your environment")
+ elseif(NOT MKL_INCLUDE_PATH)
+@@ -144,10 +152,10 @@ if (DISKANN_RELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS)
+ endif()
+ 
+ if (NOT MSVC)
+-    # set(DISKANN_ASYNC_LIB /home/xyzhi/spack-0.22.1/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/libaio-0.3.113-urdghmhnrglt3zw2z74jzsn5t2xd6c2p/lib/libaio.so)
+-    # include_directories(/home/xyzhi/spack-0.22.1/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/libaio-0.3.113-urdghmhnrglt3zw2z74jzsn5t2xd6c2p/include)
+-    set(DISKANN_ASYNC_LIB /data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/libaio-0.3.113-gk45wlx5vetueq7a43sa4di4uspbz3xb/lib/libaio.so)
+-    include_directories(/data/share/users/xyzhi/new-spack/spack-0.22.2/opt/spack/linux-debian9-skylake_avx512/gcc-8.2.0/libaio-0.3.113-gk45wlx5vetueq7a43sa4di4uspbz3xb/include)
++    find_library(DISKANN_ASYNC_LIB NAMES aio libaio.so.1 HINTS ${COTRA_THIRD_PARTY_LIB_HINTS} /usr/lib/x86_64-linux-gnu)
++    if(NOT DISKANN_ASYNC_LIB)
++        message(FATAL_ERROR "Could not find libaio.")
++    endif()
+ endif()
+ 
+ 
+@@ -172,5 +180,3 @@ include(diskann/clang-format.cmake)
+ if(PYBIND)
+     add_subdirectory(diskann/python)
+ endif()
+-
+-

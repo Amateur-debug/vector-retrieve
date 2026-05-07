@@ -1,0 +1,18 @@
+[2026-05-07T04:52:49+08:00] restore QUERY_GROUP_SIZE to 4 and rebuild existing build dir
+[ 45%] Built target coromem
+[ 48%] Building CXX object CMakeFiles/rdma_index.dir/src/index/index_param.cc.o
+[ 51%] Building CXX object CMakeFiles/rdma_index.dir/src/index/scala_build.cc.o
+[ 54%] Building CXX object CMakeFiles/rdma_anns.dir/src/rdma/rdma_comm.cc.o
+[ 57%] Building CXX object CMakeFiles/rdma_anns.dir/src/rdma/rdma_context.cc.o
+[ 60%] Building CXX object CMakeFiles/rdma_anns.dir/src/rdma/server_connect.cc.o
+[ 63%] Linking CXX static library librdma_anns.a
+[ 78%] Built target rdma_anns
+[ 81%] Linking CXX static library librdma_index.a
+[ 93%] Built target rdma_index
+[ 96%] Building CXX object tests/CMakeFiles/scala_anns.dir/scala_anns.cc.o
+[100%] Linking CXX executable scala_anns
+[100%] Built target scala_anns
+[2026-05-07T04:53:11+08:00] rebuild done
+3:#define QUERY_GROUP_SIZE (4)
+-rwxr-xr-x 1 rmeng603 xinyuchen_team 930K May  7 04:53 build/tests/scala_anns
+730f4763e4d5d12edf0ae9b6e3409782a3ae17cf936eda0e8950236d3c0d9c0e  build/tests/scala_anns

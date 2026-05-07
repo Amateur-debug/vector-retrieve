@@ -1,0 +1,27 @@
+#ifndef CORO_MEM_H
+#define CORO_MEM_H
+
+#include "config.h"
+#include "../runtime/mem.h"
+
+//! [PerIterAllocTy example]
+//! Base allocator for per-iteration allocator
+typedef runtime::BumpWithMallocHeap<runtime::FreeListHeap<runtime::SystemHeap>>
+    IterAllocBaseTy;
+
+//! Per-iteration allocator that conforms to STL allocator interface
+typedef runtime::ExternalHeapAllocator<char, IterAllocBaseTy> PerIterAllocTy;
+//! [PerIterAllocTy example]
+
+//! Scalable fixed-sized allocator for T that conforms to STL allocator
+//! interface but does not support variable sized allocations
+template <typename Ty>
+using FixedSizeAllocator = runtime::FixedSizeAllocator<Ty>;
+
+//! Scalable variable-sized allocator for T that allocates blocks of sizes in
+//! powers of 2 Useful for small and medium sized allocations, e.g. small or
+//! medium vectors, strings, deques
+template <typename T>
+using Pow_2_VarSizeAlloc = typename runtime::Pow_2_BlockAllocator<T>;
+
+#endif

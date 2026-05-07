@@ -1,0 +1,150 @@
+error connecting to /tmp/tmux-204881/default (No such file or directory)
+Requested search/query-injection threads: 8
+Cpus_allowed_list:	0-7
+COTRA_EF_LIST=66,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67
+Using RDMA device: mlx5_2
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+WARN: Failed to allocate huge pages. Falling back to normal pages.
+Local machine IP addr: 10.120.30.95
+Local machine ID: 5
+qp num per machine = 8
+Using meta_data_ratio: 0.01
+Local machine IP addr: 10.120.30.95
+Local machine ID: 5
+Local machine IP addr: 10.120.30.95
+Local machine ID: 5
+Set thread num = 8
+Run RDMA-ANNS machine number: 8
+This is follower machine 5, name: 10.120.30.95
+Loading Top index from /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index_top.index
+Read vec_num 1000609 hop_num 6
+Top index vec_num 1000609 hop_num 6
+Hop 0 cnt 1
+Hop 1 cnt 13
+Hop 2 cnt 234
+Hop 3 cnt 3664
+Hop 4 cnt 59060
+Hop 5 cnt 937637
+Last level bar 62972
+Loading GT from: /hpc2hdd/home/rmeng603/vectordb/sift/100M/sift100m/gt_100.bin
+Query number: 10000 K-NN: 100
+Loading queries from: /hpc2hdd/home/rmeng603/vectordb/sift/100M/sift100m/queries.u8bin
+Query number: 10000 Dim: 128
+Parsing gt:
+qsize: 10000 gt_knn: 100 res_knn: 10
+Loaded gt
+ScalaGraph init ...
+ScalaGraph V3 loading index ...
+vec_size 100000000
+part_num 8
+12252360 13734198 9647685 13544797 11553876 12777752 12492925 13996407 
+Loading partition index 5 from /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index5_final_scala.index 
+partid 5 partnum 8 local_vec_num 12777752 local_ngh_ele_size 144 remote_ngh_num 61249308 enter_point 81194768
+read v3 index size 2084993520
+Loading partition 0 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index0_final_scala.data
+partid 0 partnum 8 part_vec_num 12252360 all_vec_num 100000000
+Loading partition 1 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index1_final_scala.data
+partid 1 partnum 8 part_vec_num 13734198 all_vec_num 100000000
+Loading partition 2 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index2_final_scala.data
+partid 2 partnum 8 part_vec_num 9647685 all_vec_num 100000000
+Loading partition 3 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index3_final_scala.data
+partid 3 partnum 8 part_vec_num 13544797 all_vec_num 100000000
+Loading partition 4 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index4_final_scala.data
+partid 4 partnum 8 part_vec_num 11553876 all_vec_num 100000000
+Loading partition 5 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index5_final_scala.data
+partid 5 partnum 8 part_vec_num 12777752 all_vec_num 100000000
+Loading partition 6 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index6_final_scala.data
+partid 6 partnum 8 part_vec_num 12492925 all_vec_num 100000000
+Loading partition 7 meta data form /hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index7_final_scala.data
+partid 7 partnum 8 part_vec_num 13996407 all_vec_num 100000000
+partition_ofs: 60732916
+ScalaGraph V3 Load Over
+max out read num: 16
+Create main mr success. length: 1737774272 align length: 1737774272
+Create main mr success. length: 1737774272 align length: 1737774272
+Create main mr success. length: 1737774272 align length: 1737774272
+Create main mr success. length: 1737774272 align length: 1737774272
+Create main mr success. length: 1737774272 align length: 1737774272
+Create main mr success. length: 1737774272 align length: 1737774272
+Create main mr success. length: 1737774272 align length: 1737774272
+Create main mr success. length: 1737774272 align length: 1737774272
+Switch metadata with remote machine..
+Establish eathnet connection ...
+Machine 0 1 2 3 4 5 6 7 
+Connect × × × × × × × × Connect × × × × × √ × × Connect × × √ × × √ × × Connect × × √ √ × √ × × Connect × × √ √ √ √ × × Connect √ × √ √ √ √ × × Connect √ √ √ √ √ √ × × Connect √ √ √ √ √ √ √ × Connect √ √ √ √ √ √ √ √ 
+RDMA communication init over. 
+Init over ...
+query size: 10000 vecsize: 128
+66	0.8936	105.534 us	9475.58 /s
+67	0.89664	97.488 us	10257.7 /s
+67	0.89576	142.995 us	6993.24 /s
+67	0.898	168.59 us	5931.54 /s
+67	0.89712	97.9344 us	10210.9 /s
+67	0.89656	109.664 us	9118.76 /s
+67	0.8976	150.545 us	6642.54 /s
+67	0.89624	145.13 us	6890.39 /s
+67	0.89584	171.337 us	5836.46 /s
+67	0.89504	138.37 us	7226.98 /s
+67	0.8976	98.6192 us	10140 /s
+67	0.89704	99.8312 us	10016.9 /s
+67	0.8956	98.3944 us	10163.2 /s
+67	0.89648	89.428 us	11182.2 /s
+67	0.89656	89.8784 us	11126.1 /s
+67	0.89648	131.514 us	7603.73 /s
+67	0.8968	161.13 us	6206.15 /s
+67	0.89568	169.955 us	5883.9 /s
+67	0.898	170.315 us	5871.47 /s
+67	0.89528	128.297 us	7794.43 /s
+67	0.89752	82.464 us	12126.5 /s
+67	0.89576	81.5928 us	12256 /s
+67	0.89664	125.004 us	7999.74 /s
+67	0.89672	162.554 us	6151.82 /s
+67	0.89624	173.38 us	5767.68 /s
+67	0.89568	164.954 us	6062.31 /s
+67	0.89632	137.858 us	7253.86 /s
+67	0.89568	92.0216 us	10867 /s
+67	0.89528	97.8576 us	10218.9 /s
+67	0.89552	94.328 us	10601.3 /s
+67	0.89456	147.076 us	6799.21 /s
+67	0.896	145.674 us	6864.62 /s
+67	0.89584	154.696 us	6464.29 /s
+67	0.89832	156.949 us	6371.5 /s
+67	0.89736	162.744 us	6144.62 /s
+67	0.8964	162.038 us	6171.41 /s
+67	0.89664	160.389 us	6234.85 /s
+67	0.8944	118.439 us	8443.15 /s
+67	0.89904	80.932 us	12356.1 /s
+67	0.89584	82.2768 us	12154.1 /s
+67	0.89736	81.8648 us	12215.3 /s
+67	0.8964	82.3432 us	12144.3 /s
+67	0.89704	141.034 us	7090.51 /s
+67	0.89736	154.342 us	6479.1 /s
+67	0.89616	146.858 us	6809.32 /s
+67	0.8984	153.798 us	6502.02 /s
+67	0.89528	140.761 us	7104.25 /s
+67	0.89624	126.55 us	7901.99 /s
+67	0.89808	140.487 us	7118.09 /s
+67	0.89656	151.242 us	6611.9 /s
+67	0.89648	149.256 us	6699.9 /s
+67	0.898	160.884 us	6215.66 /s
+67	0.89712	158.301 us	6317.09 /s
+67	0.89592	141.966 us	7043.92 /s
+67	0.89704	135.016 us	7406.53 /s
+67	0.89648	142.955 us	6995.2 /s
+67	0.89808	139.78 us	7154.1 /s
+67	0.89616	103.465 us	9665.12 /s
+67	0.89544	90.9056 us	11000.4 /s
+67	0.89512	91.7064 us	10904.4 /s
+67	0.89832	80.7544 us	12383.2 /s
+67	0.89784	79.4544 us	12585.8 /s
+67	0.89736	80.8136 us	12374.2 /s
+67	0.89848	80.0792 us	12487.6 /s
+67	0.89816	121.259 us	8246.8 /s
+Actual memory usage: 8407 Mb 

@@ -1,0 +1,15 @@
+{
+  "case_name": "cotra_inflight_sweep_search_only",
+  "goal": "Increase CoTra effective in-flight queries beyond 1024 and measure search-only throughput, excluding query/index load and recall computation from the QPS timing.",
+  "repo": "/hpc2hdd/home/rmeng603/workspace/CoTra",
+  "build_dir": "/hpc2hdd/home/rmeng603/workspace/CoTra/build",
+  "index_prefix": "/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index",
+  "dataset": "sift100m uint8",
+  "nodes": 8,
+  "search_threads_per_node": 8,
+  "query_count": 10000,
+  "ef_list": "66,67,67,67",
+  "query_group_sizes": [4, 16, 32, 64, 128],
+  "estimated_inflight_formula": "nodes * search_threads_per_node * COTRA_QUERY_GROUP_SIZE",
+  "search_only_timing": "From immediately before ScalaANN_v3 query injection loop to the moment each rank has received all local retrieval results; recall and term/print aggregation are excluded. Cluster QPS is parsed offline as total_query_count / max(rank_search_us)."
+}

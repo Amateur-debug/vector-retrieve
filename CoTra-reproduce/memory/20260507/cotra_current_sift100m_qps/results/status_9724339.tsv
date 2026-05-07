@@ -1,0 +1,2 @@
+timestamp	query_count	per_node_query_count	query_group_size	ef_list	status	runtime_sec	log_glob
+2026-05-07T13:10:00+08:00	10000	1250	16	66,67,67,67,67,67	0	7	/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_current_sift100m_qps/logs/anns_q10000_qg16_job%j_%N_%t.log

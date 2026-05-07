@@ -1,0 +1,10 @@
+[2026-05-07T05:19:21+08:00] mkdir -p memory/20260507/cotra_pernode10k_qg16_ef67/{logs,results,scripts,data}
+[2026-05-07T05:19:21+08:00] ln -s amplified 640K query/GT files into memory/20260507/cotra_pernode10k_qg16_ef67/data
+[2026-05-07T05:19:21+08:00] set include/anns/anns_config.h QUERY_GROUP_SIZE=16
+[2026-05-07T05:19:21+08:00] cmake --build build --target scala_anns -j 8
+[2026-05-07T05:19:33+08:00] sbatch job_id=9722173 run_pernode10k_qg16_ef67.sbatch
+[2026-05-07T05:19:34+08:00] job 9722173 hosts=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97 config=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_pernode10k_qg16_ef67/scripts/slurm_9722173_ibs2.conf q=80000 per_node_q=10000 qg=16 ef_list=66,67 search_threads=8 timeout=900s
+[2026-05-07T05:19:35+08:00] srun scala_anns integrated q=80000 per_node_q=10000 qg=16 warmup=66 measure=67
+[2026-05-07T05:21:50+08:00] sbatch job 9722173: QUERY_COUNT=80000, per-node=10000, COTRA_QUERY_GROUP_SIZE=16, ef=66 warmup + ef=67 measure
+[2026-05-07T05:21:50+08:00] python3 memory/20260507/cotra_pernode10k_qg16_ef67/scripts/parse_pernode10k_result.py memory/20260507/cotra_pernode10k_qg16_ef67
+[2026-05-07T05:21:50+08:00] generated per_rank_metrics.tsv and derived_metrics.tsv from rank logs

@@ -1,0 +1,12 @@
+metric	value
+leader_global_qps	45830.277
+leader_global_recall	0.90090
+query_count	80000
+per_node_query_count	10000
+query_group_size	16
+worker_local_qps_mean	7019.656
+worker_local_qps_median	6041.760
+worker_local_qps_min	5492.800
+worker_local_qps_max	13428.700
+memory_mb_min	16906
+memory_mb_max	18207

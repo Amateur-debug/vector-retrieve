@@ -11,6 +11,8 @@
 !/weaviate/**
 !/CoTra/
 !/CoTra/**
+!/CoTra-reproduce/
+!/CoTra-reproduce/**
 !/results/
 !/results/**
 

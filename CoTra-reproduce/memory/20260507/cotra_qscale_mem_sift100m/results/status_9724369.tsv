@@ -1,0 +1,2 @@
+timestamp	job_id	query_count	per_node_query_count	query_group_size	ef_list	status	runtime_sec	log_glob	mem_dir
+2026-05-07T13:55:20+08:00	9724369	640000	80000	16	66,67,67,67,67,67	0	144	/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_qscale_mem_sift100m/logs/anns_q640000_qg16_job%j_%N_%t.log	/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_qscale_mem_sift100m/mem_samples/q640000_job9724369

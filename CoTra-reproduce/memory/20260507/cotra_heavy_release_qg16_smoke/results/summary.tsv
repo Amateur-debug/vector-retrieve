@@ -1,0 +1,4 @@
+query_count	job_id	ef	recall	avg_lat_reported	leader_qps	leader_log
+10000	9723418	67	0.89977	0.0	95250.797	memory/20260507/cotra_heavy_release_qg16_smoke/logs/anns_q10000_qg16_job9723418_cpu1-90_0.log
+80000	9723428	67	0.90083	0.0	95672.148	memory/20260507/cotra_heavy_release_qg16_smoke/logs/anns_q80000_qg16_job9723428_cpu1-90_0.log
+80000	9723552	67	0.90084	0.0	74638.078	memory/20260507/cotra_heavy_release_qg16_smoke/logs/anns_q80000_qg16_job9723552_cpu1-90_0.log

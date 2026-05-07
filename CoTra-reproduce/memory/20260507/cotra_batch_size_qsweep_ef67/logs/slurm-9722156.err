@@ -1,0 +1,14 @@
+srun: forcing job termination
+srun: got SIGCONT
+srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
+srun: error: cpu1-92: task 2: Killed
+srun: Terminating StepId=9722156.3
+srun: error: cpu1-91: task 1: Killed
+srun: error: cpu1-96: task 6: Killed
+srun: error: cpu1-95: task 5: Killed
+srun: error: cpu1-97: task 7: Killed
+srun: error: cpu1-93: task 3: Killed
+srun: error: cpu1-90: task 0: Killed
+srun: error: cpu1-94: task 4: Killed
+srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
+slurmstepd: error: *** JOB 9722156 ON cpu1-90 CANCELLED AT 2026-05-07T04:39:34 ***

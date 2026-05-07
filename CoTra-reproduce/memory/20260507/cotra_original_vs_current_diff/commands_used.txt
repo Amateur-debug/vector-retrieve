@@ -1,0 +1,11 @@
+CUR=/hpc2hdd/home/rmeng603/workspace/CoTra
+ORG=/hpc2hdd/home/rmeng603/workspace/vector-retrieve/CoTra/CoTra
+cd "$CUR" && git status --short && git rev-parse --short HEAD
+cd "$ORG" && git status --short && git rev-parse --short HEAD
+diff -qr -x .git -x build -x memory "$ORG" "$CUR"
+git diff --no-index -- "$ORG/include/anns/exec_query.h" "$CUR/include/anns/exec_query.h"
+git diff --no-index -- "$ORG/include/anns/scala_search.h" "$CUR/include/anns/scala_search.h"
+git diff --no-index -- "$ORG/src/rdma/rdma_comm.cc" "$CUR/src/rdma/rdma_comm.cc"
+git diff --no-index -- "$ORG/include/rdma/rdma_comm.h" "$CUR/include/rdma/rdma_comm.h"
+git diff --no-index -- selected build/runtime/source files
+nl -ba selected source regions for line references

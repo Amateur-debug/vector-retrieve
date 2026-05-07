@@ -1,0 +1,13 @@
+metric	value
+qps_count	5
+qps_mean	84663.87180000001
+qps_median	94203.648
+qps_min	67434.062
+qps_max	95301.633
+qps_stdev_sample	13876.243106037657
+recall_count	5
+recall_mean	0.900482
+recall_median	0.90066
+recall_min	0.89986
+recall_max	0.90101
+recall_stdev_sample	0.0005344810567269742

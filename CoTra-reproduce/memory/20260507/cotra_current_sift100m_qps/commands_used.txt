@@ -1,0 +1,15 @@
+[2026-05-07T13:03:38+08:00] prepared current SIFT100M QPS script
+[2026-05-07T13:03:57+08:00] job 9724333 hosts=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97 qcounts=10000,80000 qg=16 ef_list=66,67,67,67,67,67 search_threads=8 timeout=900s
+[2026-05-07T13:03:58+08:00] srun scala_anns SIFT100M q=10000 per_node_q=1250 qg=16 ef_list=66,67,67,67,67,67
+[2026-05-07T13:04:05+08:00] srun scala_anns SIFT100M q=80000 per_node_q=10000 qg=16 ef_list=66,67,67,67,67,67
+[2026-05-07T13:07:36+08:00] job 9724333 second srun hung during RDMA connect because memcached counters were not reset between sequential srun invocations; scanceled and will submit Q=80000 as separate job
+[2026-05-07T13:07:51+08:00] job 9724337 hosts=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97 qcounts=80000 qg=16 ef_list=66,67,67,67,67,67 search_threads=8 timeout=900s
+[2026-05-07T13:07:52+08:00] srun scala_anns SIFT100M q=80000 per_node_q=10000 qg=16 ef_list=66,67,67,67,67,67
+[2026-05-07T13:09:53+08:00] job 9724339 hosts=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97 qcounts=10000 qg=16 ef_list=66,67,67,67,67,67 search_threads=8 timeout=300s
+[2026-05-07T13:09:53+08:00] srun scala_anns SIFT100M q=10000 per_node_q=1250 qg=16 ef_list=66,67,67,67,67,67
+cmake --build build --target scala_anns -j 8
+COTRA_QUERY_GROUP_SIZE=16 COTRA_EF_LIST=66,67,67,67,67,67 QUERY_COUNTS_CSV=10000,80000 RUN_TIMEOUT=900 MEM_PORT=24907 sbatch run_current_sift100m_qps.sbatch  # job 9724333; Q=10000 completed, Q=80000 second srun hung due memcached counter reuse, canceled
+QUERY_COUNTS_CSV=80000 COTRA_QUERY_GROUP_SIZE=16 COTRA_EF_LIST=66,67,67,67,67,67 RUN_TIMEOUT=900 MEM_PORT=24908 sbatch run_current_sift100m_qps.sbatch  # job 9724337
+QUERY_COUNTS_CSV=10000 COTRA_QUERY_GROUP_SIZE=16 COTRA_EF_LIST=66,67,67,67,67,67 RUN_TIMEOUT=300 MEM_PORT=24909 sbatch run_current_sift100m_qps.sbatch  # job 9724339
+python3 parse logs into leader_ef67_runs_official.tsv, per_rank_all_ef_runs_official.tsv, qps_summary_official.tsv, derived_metrics_official.tsv
+sacct -j 9724333,9724337,9724339 --format=JobID,JobName,State,ExitCode,Elapsed,NNodes -P

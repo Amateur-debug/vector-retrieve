@@ -1,0 +1,19 @@
+timestamp=2026-05-07T05:10:57+08:00
+git_head=b2f4954dd2b6bf265384c944b827a464c507e9ca
+status:
+ M CMakeLists.txt
+ M coromem/include/hwtopo.h
+ M coromem/src/hwtopo.cpp
+ M coromem/src/threadpool.cpp
+ M include/anns/exec_query.h
+ M include/anns/scala_search.h
+ M include/index/scala_graph.h
+ M include/rdma/rdma_comm.h
+ M include/rdma/rdma_config.h
+ M src/index/index_param.cc
+ M src/rdma/rdma_comm.cc
+ M tests/anns/CMakeLists.txt
+ M third_party/CMakeLists.txt
+?? Guide.md
+?? memory/
+?? tests/anns/breakdown_microbench.cc

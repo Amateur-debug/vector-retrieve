@@ -1,0 +1,17 @@
+diff --git a/include/anns/anns_config.h b/include/anns/anns_config.h
+index c456ee7..f5e00d5 100644
+--- a/include/anns/anns_config.h
++++ b/include/anns/anns_config.h
+@@ -1,9 +1,9 @@
+ #pragma once
+ 
+-#define QUERY_GROUP_SIZE (4)
++#define QUERY_GROUP_SIZE (16)
+ #define CAND_GROUP_SIZE (4)
+ #define SYNC_BAR (4)
+ #define POST_RES_MERGE (20)
+ #define POST_NODESYNC_MERGE (20)
+ #define MAX_GRAPH_DEG (96)
+-#define B2_KMEANS_BATCH (16)
+\ No newline at end of file
++#define B2_KMEANS_BATCH (16)

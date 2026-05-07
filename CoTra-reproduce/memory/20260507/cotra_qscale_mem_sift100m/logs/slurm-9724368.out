@@ -1,0 +1,18 @@
+CASE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_qscale_mem_sift100m
+JOB_ID=9724368
+HOSTS=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97
+CONFIG_FILE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_qscale_mem_sift100m/scripts/slurm_9724368_ibs2.conf
+MEM_IP=10.120.30.90
+MEM_PORT=24918
+QUERY_COUNT=320000
+PER_NODE_QUERY_COUNT=40000
+EF_LIST=66,67,67,67,67,67
+COTRA_QUERY_GROUP_SIZE=16
+SEARCH_THREADS=8
+RUN_TIMEOUT=1200
+MEM_SAMPLE_INTERVAL=1
+QUERY_PATH=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_qscale_mem_sift100m/data/queries_640k.u8bin
+GT_PATH=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_qscale_mem_sift100m/data/gt_100_640k_ids_only.bin
+INDEX_PREFIX=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index
+[2026-05-07T13:51:36+08:00] job 9724368 hosts=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97 q=320000 per_node_q=40000 qg=16 ef_list=66,67,67,67,67,67 search_threads=8 timeout=1200s mem_interval=1s
+[2026-05-07T13:51:37+08:00] srun scala_anns SIFT100M q=320000 per_node_q=40000 qg=16 ef_list=66,67,67,67,67,67 with per-node memory sampling

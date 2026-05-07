@@ -1,0 +1,15 @@
+CASE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_inflight_sweep_search_only
+SLURM_JOB_ID=9722163
+HOSTS=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97
+CONFIG_FILE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_inflight_sweep_search_only/scripts/slurm_9722163_ibs2.conf
+MEM_IP=10.120.30.90
+MEM_PORT=24832
+QG_LIST=4,16,32,64,128
+EF_LIST=66,67,67,67
+SEARCH_THREADS=8
+QUERY_COUNT=10000
+COTRA_SKIP_RECALL=1
+SOURCE_DEFAULT_QUERY_GROUP_SIZE=4
+EST_INFLIGHT_FORMULA=8 * SEARCH_THREADS * COTRA_QUERY_GROUP_SIZE
+BINARY=-rwxr-xr-x 1 rmeng603 xinyuchen_team 935K May  7 05:12 /hpc2hdd/home/rmeng603/workspace/CoTra/build/tests/scala_anns
+BINARY_SHA256=b5998f9384f5be1863cc7fa369e092ed6379df9415d3ae6a1b26b6a2d3e27cd7

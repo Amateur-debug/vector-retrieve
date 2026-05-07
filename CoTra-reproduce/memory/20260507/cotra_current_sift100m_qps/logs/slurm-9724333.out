@@ -1,0 +1,16 @@
+CASE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_current_sift100m_qps
+HOSTS=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97
+CONFIG_FILE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_current_sift100m_qps/scripts/slurm_9724333_ibs2.conf
+MEM_IP=10.120.30.90
+MEM_PORT=24907
+QUERY_COUNTS_CSV=10000,80000
+EF_LIST=66,67,67,67,67,67
+COTRA_QUERY_GROUP_SIZE=16
+SEARCH_THREADS=8
+RUN_TIMEOUT=900
+QUERY_PATH=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_current_sift100m_qps/data/queries_640k.u8bin
+GT_PATH=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_current_sift100m_qps/data/gt_100_640k_ids_only.bin
+INDEX_PREFIX=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index
+[2026-05-07T13:03:57+08:00] job 9724333 hosts=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97 qcounts=10000,80000 qg=16 ef_list=66,67,67,67,67,67 search_threads=8 timeout=900s
+[2026-05-07T13:03:58+08:00] srun scala_anns SIFT100M q=10000 per_node_q=1250 qg=16 ef_list=66,67,67,67,67,67
+[2026-05-07T13:04:05+08:00] srun scala_anns SIFT100M q=80000 per_node_q=10000 qg=16 ef_list=66,67,67,67,67,67

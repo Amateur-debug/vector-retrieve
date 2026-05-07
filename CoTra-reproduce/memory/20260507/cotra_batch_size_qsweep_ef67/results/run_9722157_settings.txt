@@ -1,0 +1,13 @@
+CASE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_batch_size_qsweep_ef67
+HOSTS=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97
+CONFIG_FILE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_batch_size_qsweep_ef67/scripts/slurm_9722157_ibs2.conf
+MEM_IP=10.120.30.90
+MEM_PORT=24712
+WARMUP_EF=66 MEASURE_EF=67
+Q_LIST=50000
+PER_Q_TIMEOUT=180
+STOP_ON_TIMEOUT=1
+SEARCH_THREADS=8
+QUERY_PATH=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_batch_size_qsweep_ef67/data/queries_640k.u8bin
+GT_PATH=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_batch_size_qsweep_ef67/data/gt_100_640k_ids_only.bin
+INDEX_PREFIX=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index

@@ -1,0 +1,2 @@
+query_count	per_node_query_count	query_group_size	ef	recall	avg_lat_reported	qps	status	leader_log	raw
+80000	10000	16	67	0.9009	0.0	45830.277	OK	memory/20260507/cotra_pernode10k_qg16_ef67/logs/anns_q80000_qg16_job9722173_cpu1-90_0.log	67 	 0.90090 	 0.00 	 45830.277

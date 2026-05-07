@@ -1,0 +1,2 @@
+srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
+slurmstepd: error: *** JOB 9722148 ON cpu1-30 CANCELLED AT 2026-05-07T04:35:34 DUE TO TIME LIMIT ***

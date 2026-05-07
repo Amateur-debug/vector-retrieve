@@ -1,0 +1,488 @@
+diff --git a/include/anns/anns_param.h b/include/anns/anns_param.h
+index 644cbdd..ffd140a 100644
+--- a/include/anns/anns_param.h
++++ b/include/anns/anns_param.h
+@@ -270,4 +270,27 @@ class AnnsParameter {
+     cout << "Loaded gt\n";
+     free(gt_ptr);
+   }
++
++  void load_query_only() {
++    query_ptr = (char *)malloc(qsize * vecsize);
++
++    printf("COTRA_SKIP_RECALL=1: skipping GT load and parsing.\n");
++    printf("Loading queries from: %s\n", query_path.c_str());
++    if(!std::filesystem::exists(query_path)){
++      std::cerr<<"Error: Query file does not exist.\n";
++      abort();
++    }
++    ifstream inputQ(query_path.c_str(), ios::binary);
++
++    uint32_t num_q, dim;
++    inputQ.read((char *)(&num_q), sizeof(uint32_t));
++    inputQ.read((char *)(&dim), sizeof(uint32_t));
++    printf("Query number: %d Dim: %d\n", num_q, dim);
++
++    for (size_t i = 0; i < qsize; i++) {
++      inputQ.read(query_ptr + i * vecsize, vecsize);
++    }
++    inputQ.close();
++    printf("Loaded queries without GT.\n");
++  }
+ };
+diff --git a/include/anns/exec_query.h b/include/anns/exec_query.h
+index 2024dcf..c3524b2 100644
+--- a/include/anns/exec_query.h
++++ b/include/anns/exec_query.h
+@@ -6,6 +6,7 @@
+ #include <fstream>
+ #include <iostream>
+ #include <queue>
++#include <sstream>
+ #include <unordered_set>
+ #include <chrono>
+ 
+@@ -22,6 +23,41 @@ const int debug_id = 4;
+ using namespace std;
+ using namespace hnswlib;
+ 
++static vector<size_t> get_eval_efs() {
++  const char *ef_env = std::getenv("COTRA_EF_LIST");
++  if (ef_env == nullptr || ef_env[0] == '\0') {
++#ifdef DEBUG
++    return {30, 400};
++#else
++    return {3, 4, 5, 6, 8, 10, 15, 20, 30, 40, 50, 70, 100, 150, 200, 250,
++            300, 400, 500, 600, 700};
++#endif
++  }
++
++  vector<size_t> efs;
++  std::stringstream ss(ef_env);
++  std::string item;
++  while (std::getline(ss, item, ',')) {
++    if (item.empty()) {
++      continue;
++    }
++    efs.push_back(static_cast<size_t>(std::stoul(item)));
++  }
++  if (efs.empty()) {
++    throw std::runtime_error("COTRA_EF_LIST is set but contains no valid ef");
++  }
++  return efs;
++}
++
++static bool cotra_exec_env_flag_enabled(const char *name) {
++  const char *env = std::getenv(name);
++  if (env == nullptr || env[0] == '\0') {
++    return false;
++  }
++  std::string value(env);
++  return value != "0" && value != "false" && value != "False";
++}
++
+ template<typename dist_t>
+ static void test_vs_recall(
+     AnnsParameter &anns_param, ScalaSearch<dist_t> &appr_alg, 
+@@ -35,12 +71,7 @@ static void test_vs_recall(
+   //     anns_param.answers;
+   size_t k = anns_param.res_knn;
+ 
+-#ifdef DEBUG
+-  vector<size_t> efs = {30, 400};
+-#else
+-  // repeat first for warmup.
+-  vector<size_t> efs = {3, 4, 5, 6, 8, 10, 15, 20, 30, 40, 50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700};
+-#endif
++  vector<size_t> efs = get_eval_efs();
+ 
+ #if defined(PROF_Q_DISTRI) || defined(PROF_ALL_Q_DISTRI)
+   efs = {300};
+@@ -496,6 +527,13 @@ static void test_vs_recall(
+         RangeIterator all(query_load);
+         on_each(all);
+         std::atomic<size_t> load_cnt(0);
++        const bool skip_recall = cotra_exec_env_flag_enabled("COTRA_SKIP_RECALL");
++        const uint32_t runtime_query_group_size = get_runtime_query_group_size();
++        if (appr_alg.rdma_param.machine_id == 0) {
++          printf("COTRA_SEARCH_ONLY_CONFIG ef=%zu skip_recall=%u query_group_size=%u query_load_per_rank=%zu qsize=%zu\n",
++                 ef, skip_recall ? 1 : 0, runtime_query_group_size,
++                 query_load, qsize);
++        }
+ #ifdef LAT
+         // for latency record
+         std::chrono::high_resolution_clock::time_point start[qsize];
+@@ -512,6 +550,13 @@ static void test_vs_recall(
+ 
+         auto proc_res = [&](auto &result) {
+           for (auto &res : result) {
++            if (skip_recall) {
++#ifdef LAT
++              end[res->query_id] = std::chrono::high_resolution_clock::now();
++#endif
++              load_cnt.fetch_add(1);
++              continue;
++            }
+ #ifdef PROFILER
+             // res->profiler.report();
+             auto *local_prof = appr_alg.all_profiler.getLocal();
+@@ -573,7 +618,6 @@ static void test_vs_recall(
+             res->profiler.report();
+ #endif
+ #endif
+-            delete res;
+             load_cnt.fetch_add(1);
+             // printf("load_cnt ++: %u\n", load_cnt.load());
+           }
+@@ -626,6 +670,17 @@ static void test_vs_recall(
+               m_profiler.end("g_overall");
+ #endif
+               if (tid == 0) {
++                double search_only_us = stopw.getElapsedTimeMicro();
++                if (skip_recall) {
++                  double local_qps = search_only_us > 0.0
++                                         ? 1000000.0 * query_load / search_only_us
++                                         : 0.0;
++                  printf("SEARCH_ONLY\t%zu\t%d\t%zu\t%.3f\t%.3f\t%u\t%u\n",
++                         ef, appr_alg.rdma_param.machine_id, query_load,
++                         search_only_us, local_qps, runtime_query_group_size,
++                         skip_recall ? 1 : 0);
++                  fflush(stdout);
++                }
+                 double cumu_lat_us = 0.0;
+                 appr_alg.sendTerm(correct.load(), total.load(), query_load, cumu_lat_us);
+               }
+@@ -668,9 +723,9 @@ static void test_vs_recall(
+         });
+ #endif
+         if(appr_alg.rdma_param.machine_id != 0) {
+-          float recall = 1.0f * correct.load() / total.load();
+-          float time_us_per_query = exec_time / query_load;
+-          float qps = 1000000.0 * query_load / exec_time;
++          float recall = total.load() ? 1.0f * correct.load() / total.load() : 0.0f;
++          float time_us_per_query = query_load ? exec_time / query_load : 0.0f;
++          float qps = exec_time > 0 ? 1000000.0 * query_load / exec_time : 0.0f;
+           cout << ef << "\t" << recall << "\t" << time_us_per_query << " us\t"
+               << qps << " /s\n";
+         }
+@@ -729,6 +784,11 @@ static void test_vs_recall(
+         }
+ #endif
+ 
++        for (uint32_t q = 0; q < qsize; q++) {
++          delete appr_alg.global_query[q];
++          appr_alg.global_query[q] = nullptr;
++        }
++
+       } break;
+ 
+       default:
+diff --git a/include/anns/scala_search.h b/include/anns/scala_search.h
+index a581881..9f45df0 100644
+--- a/include/anns/scala_search.h
++++ b/include/anns/scala_search.h
+@@ -29,6 +29,21 @@ namespace hnswlib {
+ typedef unsigned int tableint;
+ typedef unsigned int linklistsizeint;
+ 
++static inline uint32_t get_runtime_query_group_size() {
++  static uint32_t value = []() {
++    const char *env = getenv("COTRA_QUERY_GROUP_SIZE");
++    if (env != nullptr && env[0] != '\0') {
++      char *end = nullptr;
++      unsigned long parsed = strtoul(env, &end, 10);
++      if (end != env && *end == '\0' && parsed > 0) {
++        return static_cast<uint32_t>(parsed);
++      }
++    }
++    return static_cast<uint32_t>(QUERY_GROUP_SIZE);
++  }();
++  return value;
++}
++
+ // TODO: change name to lowercase name method.
+ template <typename dist_t>
+ class ScalaSearch : public AlgorithmInterface<dist_t> {
+@@ -344,6 +359,35 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+     visited_list_pool_.reset(nullptr);
+   }
+ 
++  uint32_t *checked_scala_v3_ngh_ptr(
++      uint64_t offset, uint32_t deg, uint32_t qid, uint32_t result_mid,
++      const char *stage, bool require_alignment = false) {
++    auto *scala_graph = graph_index.scala_graph;
++    const uint64_t deg_ngh_size = scala_graph->deg_ngh_size;
++    const uint64_t span = static_cast<uint64_t>(deg) * sizeof(uint32_t);
++    const bool bad_align =
++        require_alignment && ((offset % sizeof(uint32_t)) != 0);
++    const bool bad_offset = offset >= deg_ngh_size;
++    const bool bad_span =
++        !bad_offset && (span > (deg_ngh_size - offset));
++
++    if (bad_align || bad_offset || bad_span) {
++      printf(
++          "Error: invalid ScalaGraph V3 span at %s on machine %u for q%u "
++          "return_mid %u offset %llu deg %u span %llu deg_ngh_size %llu "
++          "partition_ofs %llu local_vec_num %u remote_ngh_num %llu\n",
++          stage, anns_param.machine_id, qid, result_mid,
++          (unsigned long long)offset, deg, (unsigned long long)span,
++          (unsigned long long)deg_ngh_size,
++          (unsigned long long)scala_graph->partition_ofs,
++          scala_graph->local_vec_num,
++          (unsigned long long)scala_graph->remote_ngh_num);
++      abort();
++    }
++
++    return scala_graph->scala_graph_v3_get_ngh_ptr(offset);
++  }
++
+   void read_test() {
+     printf("Read operation test\n");
+     srand(time(NULL));
+@@ -1587,11 +1631,11 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+ 
+ 
+   void printQueryBatchInfo(float time) {
+-    float recall = 1.0f * rdma_comm.correct / rdma_comm.total;
+-    float time_us_per_query = time / rdma_comm.query_load;
+-    float avg_lat = rdma_comm.query_lat_sum / rdma_comm.query_load;
++    float recall = rdma_comm.total ? 1.0f * rdma_comm.correct / rdma_comm.total : 0.0f;
++    float time_us_per_query = rdma_comm.query_load ? time / rdma_comm.query_load : 0.0f;
++    float avg_lat = rdma_comm.query_load ? rdma_comm.query_lat_sum / rdma_comm.query_load : 0.0f;
+     size_t all_comp_cnt = rdma_comm.all_computation_cnt;
+-    float qps = 1000000.0 * rdma_comm.query_load / time;
++    float qps = time > 0 ? 1000000.0 * rdma_comm.query_load / time : 0.0f;
+     // printf("-------------- Overall info --------------\n");
+     // printf(
+     //     "correct: %llu total: %llu query load: %llu\n", rdma_comm.correct,
+@@ -1610,10 +1654,10 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+   }
+ 
+   void printQueryBatchInfoSave(float time, std::ofstream &out) {
+-    float recall = 1.0f * rdma_comm.correct / rdma_comm.total;
+-    float time_us_per_query = time / rdma_comm.query_load;
+-    float avg_lat = rdma_comm.query_lat_sum / rdma_comm.query_load;
+-    float qps = 1000000.0 * rdma_comm.query_load / time;
++    float recall = rdma_comm.total ? 1.0f * rdma_comm.correct / rdma_comm.total : 0.0f;
++    float time_us_per_query = rdma_comm.query_load ? time / rdma_comm.query_load : 0.0f;
++    float avg_lat = rdma_comm.query_load ? rdma_comm.query_lat_sum / rdma_comm.query_load : 0.0f;
++    float qps = time > 0 ? 1000000.0 * rdma_comm.query_load / time : 0.0f;
+     printf("-------------- Overall info --------------\n");
+     printf(
+         "correct: %llu total: %llu query load: %llu\n", rdma_comm.correct,
+@@ -2057,15 +2101,20 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+     //     global_query[query_id]->local_task.size());
+     // printf("%llu %u \n", task.offset, task.deg);
+     uint32_t *ngh_arr =
+-        graph_index.scala_graph->scala_graph_v3_get_ngh_ptr(task.offset);
++        checked_scala_v3_ngh_ptr(
++            task.offset, task.deg, task.qid, anns_param.machine_id,
++            "do_task");
+     _mm_prefetch((char *)ngh_arr, _MM_HINT_T0);
+     _mm_prefetch(vec_ptr + ((*(ngh_arr)) - part_ofs) * data_label_size, _MM_HINT_T0);
+     _mm_prefetch((char *)(ngh_arr + 1), _MM_HINT_T0);
+     worklists::Chunk<std::pair<dist_t, uint32_t>, MAX_GRAPH_DEG> chunk(
+         task.is_count);
+     for (uint32_t d = 0; d < task.deg; d++) {
+-      _mm_prefetch(
+-          vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) * data_label_size, _MM_HINT_T0);
++      if (d + 1 < task.deg) {
++        _mm_prefetch(
++            vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) * data_label_size,
++            _MM_HINT_T0);
++      }
+       // printf("%u\n", *(ngh_arr + d));
+       // TODO: may have problem with concurrent
+       if (!global_query[task.qid]->visit_hash.CheckAndSet(*(ngh_arr + d))) {
+@@ -2283,7 +2332,9 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+ 
+       for (uint32_t m = 0; m < MACHINE_NUM; m++) {
+         float ratio_m = (float)global_query[query_id]->filter_num[m] / su_cnt;
+-        if (ratio_m > 1.0 / (MACHINE_NUM)) {  // core machine ratio bar.
++        // Always keep the elected leader as a core machine; otherwise an
++        // exactly even split can leave the query with no execution target.
++        if (ratio_m > 1.0 / (MACHINE_NUM) || m == mx_mid) {
+           global_query[query_id]->core_machine.emplace_back(m);
+           global_query[query_id]->is_core_machine[m] = 1;
+         } else {
+@@ -2485,16 +2536,20 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+             for (ComputeTask<dist_t> &task : global_query[query_id]->local_task) {
+               // printf("%llu %u \n", task.offset, task.deg);
+               uint32_t *ngh_arr =
+-                  graph_index.scala_graph->scala_graph_v3_get_ngh_ptr(
+-                      task.offset);
++                  checked_scala_v3_ngh_ptr(
++                      task.offset, task.deg, task.qid, anns_param.machine_id,
++                      "local_sync_task", true);
+               _mm_prefetch((char *)ngh_arr, _MM_HINT_T0);
+               _mm_prefetch(
+                   vec_ptr + ((*(ngh_arr)) - part_ofs) * data_label_size, _MM_HINT_T0);
+               _mm_prefetch((char *)(ngh_arr + 1), _MM_HINT_T0);
+               for (uint32_t d = 0; d < task.deg; d++) {
+-                _mm_prefetch(
+-                    vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) * data_label_size,
+-                    _MM_HINT_T0);
++                if (d + 1 < task.deg) {
++                  _mm_prefetch(
++                      vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) *
++                                    data_label_size,
++                      _MM_HINT_T0);
++                }
+                 // printf("%u\n", *(ngh_arr + d));
+                 if (!global_query[query_id]->visit_hash.CheckAndSet(
+                         *(ngh_arr + d))) {
+@@ -2554,14 +2609,18 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+               printf("proc qlocal micro task\n");
+             #endif 
+             // printf("proc local micro task\n");
+-            for (uint32_t i = 0;
+-                 i < global_query[query_id]->local_micro_task.size(); i++) {
++            const uint32_t local_micro_task_size =
++                global_query[query_id]->local_micro_task.size();
++            for (uint32_t i = 0; i < local_micro_task_size; i++) {
+               uint32_t &vid = global_query[query_id]->local_micro_task[i];
+-              _mm_prefetch(
+-                  vec_ptr + (global_query[query_id]->local_micro_task[i + 1] -
+-                             part_ofs) *
+-                                data_label_size,
+-                  _MM_HINT_T0);
++              if (i + 1 < local_micro_task_size) {
++                _mm_prefetch(
++                    vec_ptr +
++                        (global_query[query_id]->local_micro_task[i + 1] -
++                         part_ofs) *
++                            data_label_size,
++                    _MM_HINT_T0);
++              }
+               if (!global_query[query_id]->visit_hash.CheckAndSet(vid)) {
+ #ifdef PROF_COMPUTATION
+                 computation_cnt ++;
+@@ -2852,7 +2911,9 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+           //     task.offset, task.qid, task.deg, task.machine_id);
+           if(task.offset){
+             uint32_t *ngh_arr =
+-                graph_index.scala_graph->scala_graph_v3_get_ngh_ptr(task.offset);
++                checked_scala_v3_ngh_ptr(
++                    task.offset, task.deg, task.qid, task.machine_id,
++                    "node_task_local");
+             char *vec_ptr = graph_index.scala_graph->vector_ptr;
+             uint32_t part_ofs =
+                 graph_index.scala_graph->scala_graph_get_partition_ofs();
+@@ -2861,9 +2922,12 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+             _mm_prefetch(global_query[task.qid]->vector, _MM_HINT_T0);
+             _mm_prefetch((char *)(ngh_arr + 1), _MM_HINT_T0);
+             for (uint32_t d = 0; d < task.deg; d++) {
+-              _mm_prefetch(
+-                  vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) * data_label_size,
+-                  _MM_HINT_T0);
++              if (d + 1 < task.deg) {
++                _mm_prefetch(
++                    vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) *
++                                  data_label_size,
++                    _MM_HINT_T0);
++              }
+               if (!global_query[task.qid]->visit_hash.CheckAndSet(ngh_arr[d])) {
+ #ifdef PROF_COMPUTATION
+                 computation_cnt ++;
+@@ -2980,8 +3044,9 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+             // printf(
+             //     "task offset %llu qid %llu deg %llu machine_id %llu\n",
+             //     task.offset, task.qid, task.deg, task.machine_id);
+-            ngh_arr = graph_index.scala_graph->scala_graph_v3_get_ngh_ptr(
+-                task.offset);
++            ngh_arr = checked_scala_v3_ngh_ptr(
++                task.offset, task.deg, task.qid, task.machine_id,
++                "remote_task", true);
+           }
+ 
+           char *vec_ptr = graph_index.scala_graph->vector_ptr;
+@@ -2995,9 +3060,12 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+             // if (task.deg <= INLINE_DEG_BAR) {
+             //   printf("low deg d%d ngh%d\n", d, ngh_arr[d]);
+             // }
+-            _mm_prefetch(
+-                vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) * data_label_size,
+-                _MM_HINT_T0);
++            if (d + 1 < task.deg) {
++              _mm_prefetch(
++                  vec_ptr + ((*(ngh_arr + d + 1)) - part_ofs) *
++                                data_label_size,
++                  _MM_HINT_T0);
++            }
+             if (!global_query[task.qid]->visit_hash.CheckAndSet(ngh_arr[d])) {
+ #ifdef PROF_COMPUTATION
+               computation_cnt ++;
+@@ -3183,7 +3251,7 @@ class ScalaSearch : public AlgorithmInterface<dist_t> {
+ 
+       if (!task_queue.size() && !result_queue.size() && !query_queue.size() &&
+           !async_queue.size() && !subquery_queue.size() && !node_queue.size()) {
+-        if (tman.cur_query_num < QUERY_GROUP_SIZE) {
++        if (tman.cur_query_num < get_runtime_query_group_size()) {
+ // all task is empty, add new query.
+ #ifdef PROFILER
+           m_profiler.end("g_overall");
+diff --git a/tests/scala_anns.cc b/tests/scala_anns.cc
+index 33fa8c9..bb9ff71 100644
+--- a/tests/scala_anns.cc
++++ b/tests/scala_anns.cc
+@@ -1,6 +1,14 @@
+ #include "anns/exec_query.h"
+ #include "index/graph_index.h"
+ 
++#include <cstdlib>
++
++static bool cotra_skip_recall_enabled() {
++  const char *env = std::getenv("COTRA_SKIP_RECALL");
++  return env != nullptr && env[0] != '\0' && std::string(env) != "0" &&
++         std::string(env) != "false" && std::string(env) != "False";
++}
++
+ // ../scripts/scala_anns.sh
+ int main(int argc, char **argv) {
+   SharedMem coromem;
+@@ -22,25 +30,41 @@ int main(int argc, char **argv) {
+ 
+   if(anns_param.dist_fn == std::string("l2")){
+     if(anns_param.data_type_str == std::string("uint8")){
+-      anns_param.load_query_gt(anns_param.int_answers);
++      if (cotra_skip_recall_enabled()) {
++        anns_param.load_query_only();
++      } else {
++        anns_param.load_query_gt(anns_param.int_answers);
++      }
+       ScalaSearch<int> appr_alg(anns_param, rdma_param, anns_param.l2_space_i, graph_index);
+       appr_alg.set_evaluation_save_path(anns_param.evaluation_save_path);
+       test_vs_recall<int>(anns_param, appr_alg, anns_param.int_answers);
+     }
+     else if(anns_param.data_type_str == std::string("int8")){
+-      anns_param.load_query_gt(anns_param.int_answers);
++      if (cotra_skip_recall_enabled()) {
++        anns_param.load_query_only();
++      } else {
++        anns_param.load_query_gt(anns_param.int_answers);
++      }
+       ScalaSearch<int> appr_alg(anns_param, rdma_param, anns_param.l2_space_ii, graph_index);
+       appr_alg.set_evaluation_save_path(anns_param.evaluation_save_path);
+       test_vs_recall<int>(anns_param, appr_alg, anns_param.int_answers);
+     }
+     else if(anns_param.data_type_str == std::string("float")){
+-      anns_param.load_query_gt(anns_param.float_answers);
++      if (cotra_skip_recall_enabled()) {
++        anns_param.load_query_only();
++      } else {
++        anns_param.load_query_gt(anns_param.float_answers);
++      }
+       ScalaSearch<float> appr_alg(anns_param, rdma_param, anns_param.l2_space, graph_index);
+       appr_alg.set_evaluation_save_path(anns_param.evaluation_save_path);
+       test_vs_recall<float>(anns_param, appr_alg, anns_param.float_answers);
+     }
+   }else if(anns_param.dist_fn == std::string("mips")){
+-    anns_param.load_query_gt(anns_param.float_answers);
++    if (cotra_skip_recall_enabled()) {
++      anns_param.load_query_only();
++    } else {
++      anns_param.load_query_gt(anns_param.float_answers);
++    }
+     ScalaSearch<float> appr_alg(anns_param, rdma_param, anns_param.ip_space, graph_index);
+     appr_alg.set_evaluation_save_path(anns_param.evaluation_save_path);
+     test_vs_recall<float>(anns_param, appr_alg, anns_param.float_answers);

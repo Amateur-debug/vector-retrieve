@@ -1,0 +1,6 @@
+metric	value
+q80000_runs	2
+q80000_leader_qps_min	74638.078
+q80000_leader_qps_max	95672.148
+q80000_leader_qps_mean	85155.113
+q80000_leader_qps_median	85155.113

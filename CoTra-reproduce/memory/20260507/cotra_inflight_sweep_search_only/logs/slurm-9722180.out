@@ -1,0 +1,21 @@
+CASE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_inflight_sweep_search_only
+SLURM_JOB_ID=9722180
+QG=16
+EST_INFLIGHT_CLUSTER=1024
+HOSTS=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97
+CONFIG_FILE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_inflight_sweep_search_only/scripts/slurm_9722180_qg16_ibs2.conf
+MEM_IP=10.120.30.90
+MEM_PORT=25104
+EF_LIST=66,67,67,67
+SEARCH_THREADS=8
+QUERY_COUNT=40000
+COTRA_SKIP_RECALL=1
+SOURCE_DEFAULT_QUERY_GROUP_SIZE=16
+BINARY=-rwxr-xr-x 1 rmeng603 xinyuchen_team 935K May  7 05:18 /hpc2hdd/home/rmeng603/workspace/CoTra/build/tests/scala_anns
+BINARY_SHA256=a4bc66d70834a05d5b26d51429f77d0dcbf1531dfacfa3d9368b00e166b13086
+[2026-05-07T05:22:37+08:00] job 9722180 single-qg search-only qg=16 estimated_inflight_cluster=1024 ef_list=66,67,67,67 query_count=40000 skip_recall=1 timeout=300s
+STORED
+STORED
+MEMCACHED_INIT=OK
+9722180	16	1024	OK	0	2026-05-07T05:22:38+08:00	2026-05-07T05:22:51+08:00
+[2026-05-07T05:22:51+08:00] job 9722180 qg=16 finished status=OK exit_code=0

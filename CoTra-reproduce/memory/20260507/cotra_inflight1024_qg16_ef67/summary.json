@@ -1,0 +1,483 @@
+{
+  "case_name": "cotra_inflight1024_qg16_ef67",
+  "created_at_cst": "2026-05-07T04:52:09.849180+08:00",
+  "repo": "/hpc2hdd/home/rmeng603/workspace/CoTra",
+  "git_head": "b2f4954dd2b6bf265384c944b827a464c507e9ca",
+  "goal": "Measure CoTra QPS at effective in-flight queries = 1024.",
+  "inflight_calculation": {
+    "nodes": 8,
+    "search_threads_per_node": 8,
+    "query_group_size": 16,
+    "estimated_inflight_per_node": 128,
+    "estimated_inflight_cluster": 1024,
+    "formula": "nodes * search_threads_per_node * QUERY_GROUP_SIZE"
+  },
+  "source_change_for_test": {
+    "file": "include/anns/anns_config.h",
+    "change": "#define QUERY_GROUP_SIZE (4) -> (16)",
+    "patch": "query_group_size_16.patch"
+  },
+  "job": {
+    "jobid": 9722160,
+    "state": "COMPLETED",
+    "exit_code": "0:0",
+    "elapsed": "00:00:07",
+    "alloc_cpus": 64,
+    "nodes": 8,
+    "hosts": [
+      "cpu1-90",
+      "cpu1-91",
+      "cpu1-92",
+      "cpu1-93",
+      "cpu1-94",
+      "cpu1-95",
+      "cpu1-96",
+      "cpu1-97"
+    ]
+  },
+  "run_config": {
+    "app_type": "scala_v3",
+    "graph_type": "scalagraph_v3",
+    "dataset": "sift100m uint8",
+    "query_count_total": 10000,
+    "query_count_per_rank": 1250,
+    "search_threads_per_rank": 8,
+    "ef_sequence": [
+      "66 warmup",
+      "67",
+      "67",
+      "67",
+      "67",
+      "67"
+    ],
+    "index_prefix": "/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index",
+    "binary_snapshot": "results/scala_anns_QUERY_GROUP_SIZE16_snapshot"
+  },
+  "leader_rank_cluster_results": {
+    "warmup_ef66": [
+      {
+        "ef": 66,
+        "recall": 0.89832,
+        "avg_or_time_us": 0.0,
+        "qps": 36362.844,
+        "raw": "66 \t 0.89832 \t 0.00 \t 36362.844"
+      }
+    ],
+    "target_ef67_runs": [
+      {
+        "ef": 67,
+        "recall": 0.89997,
+        "avg_or_time_us": 0.0,
+        "qps": 94203.648,
+        "raw": "67 \t 0.89997 \t 0.00 \t 94203.648"
+      },
+      {
+        "ef": 67,
+        "recall": 0.90066,
+        "avg_or_time_us": 0.0,
+        "qps": 71683.047,
+        "raw": "67 \t 0.90066 \t 0.00 \t 71683.047"
+      },
+      {
+        "ef": 67,
+        "recall": 0.90091,
+        "avg_or_time_us": 0.0,
+        "qps": 95301.633,
+        "raw": "67 \t 0.90091 \t 0.00 \t 95301.633"
+      },
+      {
+        "ef": 67,
+        "recall": 0.90101,
+        "avg_or_time_us": 0.0,
+        "qps": 94696.969,
+        "raw": "67 \t 0.90101 \t 0.00 \t 94696.969"
+      },
+      {
+        "ef": 67,
+        "recall": 0.89986,
+        "avg_or_time_us": 0.0,
+        "qps": 67434.062,
+        "raw": "67 \t 0.89986 \t 0.00 \t 67434.062"
+      }
+    ],
+    "qps_stats": {
+      "count": 5,
+      "mean": 84663.87180000001,
+      "median": 94203.648,
+      "min": 67434.062,
+      "max": 95301.633,
+      "stdev_sample": 13876.243106037657
+    },
+    "recall_stats": {
+      "count": 5,
+      "mean": 0.900482,
+      "median": 0.90066,
+      "min": 0.89986,
+      "max": 0.90101,
+      "stdev_sample": 0.0005344810567269742
+    }
+  },
+  "aux_worker_local_results": {
+    "note": "Worker logs print local per-rank latency/QPS; leader rank log is used for cluster QPS comparison.",
+    "ranks": {
+      "1": [
+        {
+          "ef": 66,
+          "recall": 0.90352,
+          "lat_us": 216.554,
+          "local_qps": 4617.78,
+          "raw": "66\t0.90352\t216.554 us\t4617.78 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.9076,
+          "lat_us": 86.8136,
+          "local_qps": 11518.9,
+          "raw": "67\t0.9076\t86.8136 us\t11518.9 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.90784,
+          "lat_us": 119.914,
+          "local_qps": 8339.28,
+          "raw": "67\t0.90784\t119.914 us\t8339.28 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.90712,
+          "lat_us": 124.941,
+          "local_qps": 8003.79,
+          "raw": "67\t0.90712\t124.941 us\t8003.79 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.90656,
+          "lat_us": 83.128,
+          "local_qps": 12029.6,
+          "raw": "67\t0.90656\t83.128 us\t12029.6 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.90832,
+          "lat_us": 113.093,
+          "local_qps": 8842.3,
+          "raw": "67\t0.90832\t113.093 us\t8842.3 /s"
+        }
+      ],
+      "2": [
+        {
+          "ef": 66,
+          "recall": 0.89576,
+          "lat_us": 224.48,
+          "local_qps": 4454.74,
+          "raw": "66\t0.89576\t224.48 us\t4454.74 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89496,
+          "lat_us": 89.512,
+          "local_qps": 11171.7,
+          "raw": "67\t0.89496\t89.512 us\t11171.7 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89824,
+          "lat_us": 114.59,
+          "local_qps": 8726.8,
+          "raw": "67\t0.89824\t114.59 us\t8726.8 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89488,
+          "lat_us": 159.569,
+          "local_qps": 6266.89,
+          "raw": "67\t0.89488\t159.569 us\t6266.89 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89624,
+          "lat_us": 200.131,
+          "local_qps": 4996.72,
+          "raw": "67\t0.89624\t200.131 us\t4996.72 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89488,
+          "lat_us": 141.118,
+          "local_qps": 7086.29,
+          "raw": "67\t0.89488\t141.118 us\t7086.29 /s"
+        }
+      ],
+      "3": [
+        {
+          "ef": 66,
+          "recall": 0.89616,
+          "lat_us": 222.75,
+          "local_qps": 4489.35,
+          "raw": "66\t0.89616\t222.75 us\t4489.35 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89664,
+          "lat_us": 87.4552,
+          "local_qps": 11434.4,
+          "raw": "67\t0.89664\t87.4552 us\t11434.4 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89936,
+          "lat_us": 111.95,
+          "local_qps": 8932.59,
+          "raw": "67\t0.89936\t111.95 us\t8932.59 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89952,
+          "lat_us": 80.8656,
+          "local_qps": 12366.2,
+          "raw": "67\t0.89952\t80.8656 us\t12366.2 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.902,
+          "lat_us": 86.8056,
+          "local_qps": 11520.0,
+          "raw": "67\t0.902\t86.8056 us\t11520 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89936,
+          "lat_us": 118.871,
+          "local_qps": 8412.47,
+          "raw": "67\t0.89936\t118.871 us\t8412.47 /s"
+        }
+      ],
+      "4": [
+        {
+          "ef": 66,
+          "recall": 0.89448,
+          "lat_us": 218.282,
+          "local_qps": 4581.24,
+          "raw": "66\t0.89448\t218.282 us\t4581.24 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89776,
+          "lat_us": 89.0472,
+          "local_qps": 11230.0,
+          "raw": "67\t0.89776\t89.0472 us\t11230 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89832,
+          "lat_us": 74.0784,
+          "local_qps": 13499.2,
+          "raw": "67\t0.89832\t74.0784 us\t13499.2 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.898,
+          "lat_us": 75.6368,
+          "local_qps": 13221.1,
+          "raw": "67\t0.898\t75.6368 us\t13221.1 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.8968,
+          "lat_us": 122.782,
+          "local_qps": 8144.49,
+          "raw": "67\t0.8968\t122.782 us\t8144.49 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89728,
+          "lat_us": 140.821,
+          "local_qps": 7101.22,
+          "raw": "67\t0.89728\t140.821 us\t7101.22 /s"
+        }
+      ],
+      "5": [
+        {
+          "ef": 66,
+          "recall": 0.89144,
+          "lat_us": 214.596,
+          "local_qps": 4659.92,
+          "raw": "66\t0.89144\t214.596 us\t4659.92 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89456,
+          "lat_us": 92.2312,
+          "local_qps": 10842.3,
+          "raw": "67\t0.89456\t92.2312 us\t10842.3 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.894,
+          "lat_us": 117.88,
+          "local_qps": 8483.2,
+          "raw": "67\t0.894\t117.88 us\t8483.2 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89616,
+          "lat_us": 86.8672,
+          "local_qps": 11511.8,
+          "raw": "67\t0.89616\t86.8672 us\t11511.8 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.8964,
+          "lat_us": 98.9528,
+          "local_qps": 10105.8,
+          "raw": "67\t0.8964\t98.9528 us\t10105.8 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.89456,
+          "lat_us": 127.479,
+          "local_qps": 7844.42,
+          "raw": "67\t0.89456\t127.479 us\t7844.42 /s"
+        }
+      ],
+      "6": [
+        {
+          "ef": 66,
+          "recall": 0.90488,
+          "lat_us": 214.9,
+          "local_qps": 4653.33,
+          "raw": "66\t0.90488\t214.9 us\t4653.33 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.90544,
+          "lat_us": 93.484,
+          "local_qps": 10697.0,
+          "raw": "67\t0.90544\t93.484 us\t10697 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.90448,
+          "lat_us": 118.813,
+          "local_qps": 8416.6,
+          "raw": "67\t0.90448\t118.813 us\t8416.6 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.9064,
+          "lat_us": 103.534,
+          "local_qps": 9658.7,
+          "raw": "67\t0.9064\t103.534 us\t9658.7 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.90608,
+          "lat_us": 89.4568,
+          "local_qps": 11178.6,
+          "raw": "67\t0.90608\t89.4568 us\t11178.6 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.90672,
+          "lat_us": 123.566,
+          "local_qps": 8092.81,
+          "raw": "67\t0.90672\t123.566 us\t8092.81 /s"
+        }
+      ],
+      "7": [
+        {
+          "ef": 66,
+          "recall": 0.90344,
+          "lat_us": 212.198,
+          "local_qps": 4712.57,
+          "raw": "66\t0.90344\t212.198 us\t4712.57 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.90256,
+          "lat_us": 94.6584,
+          "local_qps": 10564.3,
+          "raw": "67\t0.90256\t94.6584 us\t10564.3 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.9044,
+          "lat_us": 118.195,
+          "local_qps": 8460.58,
+          "raw": "67\t0.9044\t118.195 us\t8460.58 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.90576,
+          "lat_us": 136.518,
+          "local_qps": 7325.06,
+          "raw": "67\t0.90576\t136.518 us\t7325.06 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.90464,
+          "lat_us": 93.9896,
+          "local_qps": 10639.5,
+          "raw": "67\t0.90464\t93.9896 us\t10639.5 /s"
+        },
+        {
+          "ef": 67,
+          "recall": 0.90264,
+          "lat_us": 88.6016,
+          "local_qps": 11286.5,
+          "raw": "67\t0.90264\t88.6016 us\t11286.5 /s"
+        }
+      ]
+    }
+  },
+  "baselines": [
+    {
+      "name": "QG4 batch-size sweep, Q=10000, EF=67",
+      "path": "/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_batch_size_qsweep_ef67/results/batch_size_summary.tsv",
+      "query_group_size": 4,
+      "estimated_inflight_cluster": 256,
+      "qps": 82116.641,
+      "recall": 0.90066,
+      "qg16_mean_qps_delta_pct": 3.101966628177122,
+      "qg16_median_qps_delta_pct": 14.71931493154961,
+      "qg16_best_qps_delta_pct": 16.05641906370718,
+      "qg16_worst_qps_delta_pct": -17.880150504451343
+    },
+    {
+      "name": "QG4 warmup EF66->EF67 reproduction",
+      "path": "/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260505/cotra_revert_to_integrated_qps83k/summary.json",
+      "query_group_size": 4,
+      "estimated_inflight_cluster": 256,
+      "qps": 83479.422,
+      "recall": 0.89996,
+      "qg16_mean_qps_delta_pct": 1.4188524208996078,
+      "qg16_median_qps_delta_pct": 12.846550375013365,
+      "qg16_best_qps_delta_pct": 14.161826611592975,
+      "qg16_worst_qps_delta_pct": -19.22073681823049
+    }
+  ],
+  "interpretation": {
+    "primary_qps_to_report": "median EF67 cluster QPS = 94203.648; mean EF67 cluster QPS = 84663.872",
+    "caveat": "The five EF67 repeats are high-variance (67.4K-95.3K QPS), so median/best improves clearly while mean improves only mildly over QG4 baselines."
+  },
+  "artifacts": {
+    "slurm_stdout": "logs/slurm-9722160.out",
+    "slurm_stderr": "logs/slurm-9722160.err",
+    "leader_log": "logs/anns_job9722160_cpu1-90_0.log",
+    "build_log": "build_logs/build_qg16.log",
+    "run_script": "scripts/run_cotra_inflight1024_qg16_ef67.sbatch",
+    "job_info": "logs/job_info_9722160.txt",
+    "sacct": "logs/sacct_9722160.txt",
+    "squeue_after_test": "logs/squeue_after_test.txt"
+  },
+  "post_test_restoration": {
+    "restored_source_query_group_size": 4,
+    "restored_file": "include/anns/anns_config.h",
+    "restored_to": "#define QUERY_GROUP_SIZE (4)",
+    "existing_build_dir_rebuilt": true,
+    "build_log": "build_logs/rebuild_restore_qg4.log",
+    "current_binary_sha256_after_restore": "730f4763e4d5d12edf0ae9b6e3409782a3ae17cf936eda0e8950236d3c0d9c0e",
+    "note": "The QG16 test binary was snapshotted before restore at results/scala_anns_QUERY_GROUP_SIZE16_snapshot; current build/tests/scala_anns is back to QG4 for future experiments."
+  },
+  "updated_at_cst": "2026-05-07T04:54:00.769779+08:00"
+}

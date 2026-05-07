@@ -1,0 +1,10 @@
+CASE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_integrated_640k_query_count_ef67
+HOSTS=cpu1-30 cpu1-31 cpu1-32 cpu1-33 cpu1-34 cpu1-35 cpu1-36 cpu1-37
+CONFIG_FILE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_integrated_640k_query_count_ef67/scripts/slurm_9722151_ibs2.conf
+MEM_IP=10.120.30.30
+MEM_PORT=24670
+WARMUP_EF=66 MEASURE_EF=67 MEASURE_REPEATS=64
+EF_LIST=66,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67
+SEARCH_THREADS=8
+QUERY_COUNT=10000
+[2026-05-07T03:57:39+08:00] job 9722151 hosts=cpu1-30 cpu1-31 cpu1-32 cpu1-33 cpu1-34 cpu1-35 cpu1-36 cpu1-37 config=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_integrated_640k_query_count_ef67/scripts/slurm_9722151_ibs2.conf ef_list=66,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67 search_threads=8 query_count=10000

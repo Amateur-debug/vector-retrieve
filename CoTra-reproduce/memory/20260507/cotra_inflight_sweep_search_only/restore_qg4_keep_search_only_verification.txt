@@ -1,0 +1,18 @@
+timestamp=2026-05-07T09:03:07+08:00
+query_group_size=4
+binary_sha256=b5998f9384f5be1863cc7fa369e092ed6379df9415d3ae6a1b26b6a2d3e27cd7
+snapshot_sha256=b5998f9384f5be1863cc7fa369e092ed6379df9415d3ae6a1b26b6a2d3e27cd7
+anns_config_diff_begin
+anns_config_diff_end
+search_only_markers
+tests/scala_anns.cc:7:  const char *env = std::getenv("COTRA_SKIP_RECALL");
+include/anns/anns_param.h:277:    printf("COTRA_SKIP_RECALL=1: skipping GT load and parsing.\n");
+include/anns/exec_query.h:530:        const bool skip_recall = cotra_exec_env_flag_enabled("COTRA_SKIP_RECALL");
+include/anns/exec_query.h:531:        const uint32_t runtime_query_group_size = get_runtime_query_group_size();
+include/anns/exec_query.h:533:          printf("COTRA_SEARCH_ONLY_CONFIG ef=%zu skip_recall=%u query_group_size=%u query_load_per_rank=%zu qsize=%zu\n",
+include/anns/exec_query.h:678:                  printf("SEARCH_ONLY\t%zu\t%d\t%zu\t%.3f\t%.3f\t%u\t%u\n",
+include/anns/scala_search.h:32:static inline uint32_t get_runtime_query_group_size() {
+include/anns/scala_search.h:34:    const char *env = getenv("COTRA_QUERY_GROUP_SIZE");
+include/anns/scala_search.h:3254:        if (tman.cur_query_num < get_runtime_query_group_size()) {
+active_jobs
+             JOBID PARTITION                     NAME     USER ST       TIME  NODES NODELIST(REASON)

@@ -1,0 +1,4 @@
+pwd && ls -la && cd /hpc2hdd/home/rmeng603/workspace/CoTra && git status --short && rg -n "QUERY_GROUP_SIZE|scala_search_init|CAND_GROUP_SIZE|SYNC_BAR|POST_RES_MERGE|POST_NODESYNC_MERGE|poll_task_result|wr_id|COTRA_SKIP_RECALL|proc_res|query_load" include src tests -S
+cd /hpc2hdd/home/rmeng603/workspace/CoTra && sed/nl selected source regions in include/anns/anns_config.h, include/anns/exec_query.h, include/anns/scala_search.h, include/anns/query_msg.h, include/rdma/rdma_comm.h, src/rdma/rdma_comm.cc
+cd /hpc2hdd/home/rmeng603/workspace/CoTra && read selected prior memory reports and summary TSV files
+cd /hpc2hdd/home/rmeng603/workspace/CoTra && git diff --stat && git diff -- selected source files

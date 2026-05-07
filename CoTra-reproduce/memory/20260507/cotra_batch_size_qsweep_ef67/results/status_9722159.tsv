@@ -1,0 +1,3 @@
+timestamp	q	status	runtime_sec	log_glob
+2026-05-07T04:46:09+08:00	64000	0	10	/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q64000_job%j_%N_%t.log
+2026-05-07T04:49:14+08:00	66000	124	181	/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q66000_job%j_%N_%t.log

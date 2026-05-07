@@ -1,0 +1,15 @@
+{
+  "case_name": "cotra_inflight1024_qg16_ef67",
+  "goal": "Run CoTra ScalaANN_v3 with effective in-flight queries equal to XY's 1024 by setting QUERY_GROUP_SIZE from 4 to 16 while keeping 8 nodes x 8 search threads.",
+  "repo": "/hpc2hdd/home/rmeng603/workspace/CoTra",
+  "build_dir": "/hpc2hdd/home/rmeng603/workspace/CoTra/build",
+  "index_prefix": "/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260424/sift100m_8node_experiment/results/index/merged_index",
+  "dataset": "sift100m uint8",
+  "nodes": 8,
+  "search_threads_per_node": 8,
+  "query_group_size": 16,
+  "estimated_inflight_cluster": 1024,
+  "ef_list": "66,67,67,67,67,67",
+  "query_count": 10000,
+  "note": "Actual run used one EF=66 warmup followed by five EF=67 repeats."
+}

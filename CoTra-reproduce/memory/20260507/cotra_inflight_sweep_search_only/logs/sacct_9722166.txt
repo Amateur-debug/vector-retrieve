@@ -1,0 +1,5 @@
+JobID|JobName|State|ExitCode|Elapsed|AllocCPUS|NNodes
+9722166|cotra_if1|COMPLETED|0:0|00:00:09|64|8
+9722166.batch|batch|COMPLETED|0:0|00:00:09|8|1
+9722166.extern|extern|COMPLETED|0:0|00:00:09|64|8
+9722166.0|bash|COMPLETED|0:0|00:00:05|64|8

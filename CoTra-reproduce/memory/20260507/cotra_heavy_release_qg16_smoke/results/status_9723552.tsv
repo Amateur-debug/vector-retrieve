@@ -1,0 +1,2 @@
+timestamp	query_count	per_node_query_count	query_group_size	status	runtime_sec	log_glob
+2026-05-07T11:32:51+08:00	80000	10000	16	0	13	/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_heavy_release_qg16_smoke/logs/anns_q80000_qg16_job%j_%N_%t.log

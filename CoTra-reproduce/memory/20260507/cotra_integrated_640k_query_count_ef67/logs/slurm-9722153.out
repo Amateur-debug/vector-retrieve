@@ -1,0 +1,15 @@
+CASE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_integrated_640k_query_count_ef67
+HOSTS=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97
+CONFIG_FILE=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_integrated_640k_query_count_ef67/scripts/slurm_9722153_ibs2.conf
+MEM_IP=10.120.30.90
+MEM_PORT=24671
+WARMUP_EF=66 MEASURE_EF=67 MEASURE_REPEATS=64
+EF_LIST=66,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67
+SEARCH_THREADS=8
+QUERY_COUNT=10000
+[2026-05-07T04:00:30+08:00] job 9722153 hosts=cpu1-90 cpu1-91 cpu1-92 cpu1-93 cpu1-94 cpu1-95 cpu1-96 cpu1-97 config=/hpc2hdd/home/rmeng603/workspace/CoTra/memory/20260507/cotra_integrated_640k_query_count_ef67/scripts/slurm_9722153_ibs2.conf ef_list=66,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67,67 search_threads=8 query_count=10000
+STORED
+STORED
+MEMCACHED_INIT=OK
+[2026-05-07T04:00:31+08:00] srun scala_anns integrated query warmup+64x67
+ANN_STATUS=0

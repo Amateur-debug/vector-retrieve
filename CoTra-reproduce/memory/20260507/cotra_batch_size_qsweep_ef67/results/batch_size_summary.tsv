@@ -1,0 +1,13 @@
+q	per_rank_q	ef	recall	avg_or_time_us	qps	status	job_status	runtime_sec	leader_log	raw
+10000	1250	67	0.90066	0.0	82116.641	OK	0	6	memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q10000_job9722156_cpu1-90_0.log	67 	 0.90066 	 0.00 	 82116.641
+20000	2500	67	0.90079	0.0	65018.449	OK	0	7	memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q20000_job9722156_cpu1-90_0.log	67 	 0.90079 	 0.00 	 65018.449
+40000	5000	67	0.9007	0.0	63488.637	OK	0	9	memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q40000_job9722156_cpu1-90_0.log	67 	 0.90070 	 0.00 	 63488.637
+50000	6250	67	0.90088	0.0	81962.109	OK	0	10	memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q50000_job9722157_cpu1-90_0.log	67 	 0.90088 	 0.00 	 81962.109
+60000	7500	67	0.90069	0.0	84431.531	OK	0	11	memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q60000_job9722158_cpu1-90_0.log	67 	 0.90069 	 0.00 	 84431.531
+64000	8000	67	0.90052	0.0	80691.016	OK	0	10	memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q64000_job9722159_cpu1-90_0.log	67 	 0.90052 	 0.00 	 80691.016
+65000	8125	67	0.9007	0.0	79817.18	OK	0	11	memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q65000_job9722161_cpu1-90_0.log	67 	 0.90070 	 0.00 	 79817.180
+65536	8192	67	0.90077	0.0	78435.125	OK	0	11	memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q65536_job9722161_cpu1-90_0.log	67 	 0.90077 	 0.00 	 78435.125
+66000	8250					NO_RESULT	124	181	memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q66000_job9722159_cpu1-90_0.log	
+70000	8750					NO_RESULT	124	181	memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q70000_job9722158_cpu1-90_0.log	
+80000	10000					NO_RESULT	124	422	memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q80000_job9722156_cpu1-90_0.log	
+160000	20000					NO_RESULT			memory/20260507/cotra_batch_size_qsweep_ef67/logs/anns_q160000_job9722156_cpu1-90_0.log	
