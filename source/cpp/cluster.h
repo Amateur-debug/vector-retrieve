@@ -5,6 +5,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #include <algorithm>
 #include <chrono>
@@ -51,12 +53,12 @@ using namespace std;
 // 注意：TcpConnectionPool 已迁移到 tcp_transport.h 中统一管理
 // g_connection_pool 全局变量已被 Cluster::transport 成员变量替代
 
-// 消息处理线程池：固定大小 + 支持紧急任务绕过队列直接启动新线程
+// 消息处理线程池：固定大小 + FIFO 任务队列
 class MessageThreadPool
 {
 public:
     explicit MessageThreadPool(size_t pool_size)
-        : stop_(false), urgent_count_(0)
+        : stop_(false)
     {
         for (size_t i = 0; i < pool_size; i++)
         {
@@ -76,11 +78,6 @@ public:
             if (w.joinable())
                 w.join();
         }
-        // 等待所有 urgent 线程完成
-        while (urgent_count_.load() > 0)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
     }
 
     // 提交普通任务到线程池队列
@@ -91,16 +88,6 @@ public:
             tasks_.push(std::move(task));
         }
         cv_.notify_one();
-    }
-
-    // 提交紧急任务：无论线程池是否满都立即启动新线程执行（用于 MSG_SEARCH_RESULT 等）
-    void submit_urgent(std::function<void()> task)
-    {
-        urgent_count_++;
-        std::thread([this, t = std::move(task)]() {
-            t();
-            urgent_count_--;
-        }).detach();
     }
 
     MessageThreadPool(const MessageThreadPool &) = delete;
@@ -125,7 +112,6 @@ private:
     }
 
     bool stop_;
-    std::atomic<int> urgent_count_;
     std::mutex mu_;
     std::condition_variable cv_;
     std::queue<std::function<void()>> tasks_;
@@ -2672,62 +2658,77 @@ void Node<T>::start_server()
 }
 
 // 节点间通信 accept 循环（transport 端口）
+//
+// 设计：单 poll 线程 + 非阻塞 socket + per-fd 状态机
+//   - listen socket 阻塞，仅在 POLLIN 时 accept
+//   - 已连接 socket 设 O_NONBLOCK
+//   - 每个 fd 维护 ConnState（READING_HEADER / READING_BODY，部分接收的进度）
+//   - 收到完整一条消息后立刻 dispatch，状态重置继续读下一条（drain 直到 EAGAIN）
+//   - 重消息处理（query / 反序列化）一律走 msg_pool_，poll 线程不做 CPU 重活
 template <typename T>
 void Node<T>::tcp_server_loop()
 {
     int node_port = port + NODE_PORT_OFFSET;
     LOG_INFO_STREAM("Node " << node_id << " poll server loop on port " << node_port);
 
-    constexpr int MAX_FDS = 64;
-    struct pollfd pfds[MAX_FDS];
-    int nfds = 0;
-    pfds[nfds].fd = sockfd; pfds[nfds].events = POLLIN; nfds++;
+    struct ConnState {
+        int fd = -1;
+        enum Phase { READING_HEADER, READING_BODY };
+        Phase phase = READING_HEADER;
+        char header_buf[8] = {0};
+        size_t header_recv = 0;
+        uint64_t msg_size = 0;
+        std::shared_ptr<Buffer> body;
+        size_t body_recv = 0;
+    };
 
-    while (!stop_server.load()) {
-        int ret = poll(pfds, nfds, 100);
-        if (ret < 0) { if (stop_server.load()) break; continue; }
-        for (int i = 0; i < nfds; i++) {
-            if (!(pfds[i].revents & (POLLIN | POLLERR | POLLHUP))) continue;
-            int fd = pfds[i].fd;
-            if (fd == sockfd) {
-                struct sockaddr_in addr; socklen_t len = sizeof(addr);
-                int cfd = accept(sockfd, (struct sockaddr*)&addr, &len);
-                if (cfd < 0) continue;
-                int flag = 1; setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-                if (nfds < MAX_FDS) { pfds[nfds].fd = cfd; pfds[nfds].events = POLLIN; nfds++; }
-                else close(cfd);
+    std::vector<struct pollfd> pfds;
+    std::vector<ConnState> conns; // conns[i] 对应 pfds[i+1]
+    pfds.push_back({sockfd, POLLIN, 0});
+
+    auto drop_at = [&](size_t i) {
+        // i 是 pfds 索引（>=1），删掉对应 fd 与 ConnState
+        ::close(pfds[i].fd);
+        pfds[i] = pfds.back(); pfds.pop_back();
+        conns[i - 1] = conns.back(); conns.pop_back();
+    };
+
+    auto try_send_ack = [](int fd, char ack) {
+        // 1 字节 ack。fd 非阻塞，正常情况下立刻成功；EAGAIN 时短暂 poll 再试。
+        for (int retries = 0; retries < 5; retries++) {
+            ssize_t s = ::send(fd, &ack, 1, MSG_NOSIGNAL);
+            if (s == 1) return true;
+            if (s < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                struct pollfd pp{fd, POLLOUT, 0};
+                ::poll(&pp, 1, 100);
                 continue;
             }
-            if (pfds[i].revents & (POLLERR | POLLHUP)) { close(fd); pfds[i]=pfds[--nfds]; continue; }
+            return false;
+        }
+        return false;
+    };
 
-            uint64_t msg_size = 0;
-            try { cluster->transport->recv_raw(fd, &msg_size, sizeof(uint64_t)); }
-            catch (...) { close(fd); pfds[i]=pfds[--nfds]; continue; }
-            if (msg_size == 0) { close(fd); pfds[i]=pfds[--nfds]; continue; }
+    auto dispatch = [&](int fd, std::shared_ptr<Buffer> buf) -> bool {
+        // 返回 true = 保持连接；false = 关闭（仅 MSG_INIT_GRAPH 一次性连接）
+        buf->read_pos = 0;
+        int msg_type = buf->read_val<int>();
 
-            auto buf = std::make_shared<Buffer>();
-            buf->data.resize(msg_size);
-            try { cluster->transport->recv_raw(fd, buf->data.data(), msg_size); }
-            catch (...) { close(fd); pfds[i]=pfds[--nfds]; continue; }
-            buf->read_pos = 0;
-            int msg_type = buf->read_val<int>();
-
-            if (msg_type == MSG_INIT_GRAPH) {
-                bool remote_global = buf->read_val<bool>();
-                cluster->is_global_pull = remote_global;
-                deserialize_routing(*buf, cluster->vector_node_map);
-                if (local_hnsw) delete local_hnsw;
-                local_hnsw = deserialize_hnsw_subset<T>(*buf, /*do_compact=*/!remote_global);
-                if (remote_global && local_hnsw) {
-                    Cluster<T>* cl = cluster;
-                    local_hnsw->pull_fetcher_ = [cl](int vid){ return cl->fetch_remote_vector(vid); };
-                }
-                char ack = 1; cluster->transport->send_raw(fd, &ack, 1);
-                close(fd); pfds[i]=pfds[--nfds]; continue;
+        if (msg_type == MSG_INIT_GRAPH) {
+            bool remote_global = buf->read_val<bool>();
+            cluster->is_global_pull = remote_global;
+            deserialize_routing(*buf, cluster->vector_node_map);
+            if (local_hnsw) delete local_hnsw;
+            local_hnsw = deserialize_hnsw_subset<T>(*buf, /*do_compact=*/!remote_global);
+            if (remote_global && local_hnsw) {
+                Cluster<T>* cl = cluster;
+                local_hnsw->pull_fetcher_ = [cl](int vid){ return cl->fetch_remote_vector(vid); };
             }
+            try_send_ack(fd, 1);
+            return false; // 关闭连接
+        }
 
-            // SEARCH_RESULT → 内联
-            if (msg_type == MSG_SEARCH_RESULT) {
+        if (msg_type == MSG_SEARCH_RESULT) {
+            msg_pool_->submit([this, buf]() {
                 int qid = buf->read_val<int>();
                 std::vector<int> rs = buf->read_vec<int>();
                 Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
@@ -2736,11 +2737,12 @@ void Node<T>::tcp_server_loop()
                   auto it = sdk_cq_map_.find(qid);
                   if (it != sdk_cq_map_.end()) { cq = it->second; sdk_cq_map_.erase(it); } }
                 if (cq) cq->push({qid, std::move(rs), std::move(pl)});
-                continue;
-            }
+            });
+            return true;
+        }
 
-            // SHARD_RESULT → 内联
-            if (msg_type == MSG_SHARD_RESULT) {
+        if (msg_type == MSG_SHARD_RESULT) {
+            msg_pool_->submit([this, buf]() {
                 int qid = buf->read_val<int>();
                 int cnt = buf->read_val<int>();
                 std::vector<std::pair<DistT,int>> rs; rs.reserve(cnt);
@@ -2751,34 +2753,126 @@ void Node<T>::tcp_server_loop()
                   auto it = reduce_accum_map_.find(qid);
                   if (it != reduce_accum_map_.end()) acc = it->second; }
                 if (acc) acc->add_node_results(rs, pl);
-                continue;
+            });
+            return true;
+        }
+
+        if (msg_type == MSG_SEARCH) {
+            msg_pool_->submit([this, buf]() {
+                int qid = buf->read_val<int>(); int k = buf->read_val<int>();
+                std::vector<T> qv = buf->read_vec<T>();
+                Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
+                this->query(qid, qv, pl, k);
+            });
+            return true;
+        }
+
+        if (msg_type == MSG_ADD_VECTOR_LOCAL) {
+            int vid = buf->read_val<int>(); std::vector<T> vec = buf->read_vec<T>();
+            char ack = 1;
+            try {
+                if (!local_hnsw && cluster && cluster->is_shard) {
+                    std::lock_guard<std::mutex> lk(local_hnsw_mutex);
+                    if (!local_hnsw) local_hnsw = new HNSWGraph<T>(cluster->hnsw->dim, cluster->hnsw->m,
+                        cluster->hnsw->ef_construction, cluster->hnsw->ef_search,
+                        cluster->hnsw->limited_level, 100000, cluster->hnsw->seed);
+                }
+                if (local_hnsw) local_hnsw->add_vector(vid, vec);
+            } catch (...) { ack = 0; }
+            try_send_ack(fd, ack);
+            return true;
+        }
+
+        // 未知类型：保持连接，丢弃此消息
+        return true;
+    };
+
+    while (!stop_server.load()) {
+        int ret = ::poll(pfds.data(), pfds.size(), 100);
+        if (ret < 0) { if (stop_server.load()) break; continue; }
+
+        // 注意：循环中可能修改 pfds（drop_at），故用索引并谨慎处理删除
+        for (size_t i = 0; i < pfds.size(); ) {
+            short re = pfds[i].revents;
+            if (!(re & (POLLIN | POLLERR | POLLHUP))) { i++; continue; }
+
+            // listen socket
+            if (pfds[i].fd == sockfd) {
+                if (re & POLLIN) {
+                    struct sockaddr_in addr; socklen_t len = sizeof(addr);
+                    int cfd = ::accept(sockfd, (struct sockaddr*)&addr, &len);
+                    if (cfd >= 0) {
+                        int fl = ::fcntl(cfd, F_GETFL, 0);
+                        if (fl >= 0) ::fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
+                        int one = 1;
+                        ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                        pfds.push_back({cfd, POLLIN, 0});
+                        conns.push_back(ConnState{cfd});
+                    }
+                }
+                i++; continue;
             }
 
-            // MSG_SEARCH → msg_pool_
-            if (msg_type == MSG_SEARCH)
-                msg_pool_->submit([this, buf]() {
-                    int qid = buf->read_val<int>(); int k = buf->read_val<int>();
-                    std::vector<T> qv = buf->read_vec<T>();
-                    Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
-                    this->query(qid, qv, pl, k);
-                });
-            else if (msg_type == MSG_ADD_VECTOR_LOCAL) {
-                int vid = buf->read_val<int>(); std::vector<T> vec = buf->read_vec<T>();
-                char ack = 1;
-                try {
-                    if (!local_hnsw && cluster && cluster->is_shard) {
-                        std::lock_guard<std::mutex> lk(local_hnsw_mutex);
-                        if (!local_hnsw) local_hnsw = new HNSWGraph<T>(cluster->hnsw->dim, cluster->hnsw->m,
-                            cluster->hnsw->ef_construction, cluster->hnsw->ef_search,
-                            cluster->hnsw->limited_level, 100000, cluster->hnsw->seed);
+            // 数据 socket：错误 / 挂起 → 关闭
+            if (re & (POLLERR | POLLHUP | POLLNVAL)) { drop_at(i); continue; }
+
+            // POLLIN：drain 直到 EAGAIN 或读到完整消息后继续读下一条
+            ConnState &cs = conns[i - 1];
+            bool dropped = false;
+            bool exit_loop = false;
+            while (!exit_loop) {
+                if (cs.phase == ConnState::READING_HEADER) {
+                    ssize_t r = ::recv(cs.fd, cs.header_buf + cs.header_recv,
+                                       sizeof(cs.header_buf) - cs.header_recv, 0);
+                    if (r > 0) {
+                        cs.header_recv += static_cast<size_t>(r);
+                        if (cs.header_recv == sizeof(cs.header_buf)) {
+                            std::memcpy(&cs.msg_size, cs.header_buf, sizeof(uint64_t));
+                            if (cs.msg_size == 0) { dropped = true; break; }
+                            cs.body = std::make_shared<Buffer>();
+                            cs.body->data.resize(cs.msg_size);
+                            cs.body_recv = 0;
+                            cs.phase = ConnState::READING_BODY;
+                        }
+                    } else if (r == 0) { dropped = true; break; }
+                    else {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) { exit_loop = true; break; }
+                        if (errno == EINTR) continue;
+                        dropped = true; break;
                     }
-                    if (local_hnsw) local_hnsw->add_vector(vid, vec);
-                } catch (...) { ack = 0; }
-                cluster->transport->send_raw(fd, &ack, 1);
+                } else { // READING_BODY
+                    ssize_t r = ::recv(cs.fd,
+                                       cs.body->data.data() + cs.body_recv,
+                                       cs.msg_size - cs.body_recv, 0);
+                    if (r > 0) {
+                        cs.body_recv += static_cast<size_t>(r);
+                        if (cs.body_recv == cs.msg_size) {
+                            auto body = std::move(cs.body);
+                            cs.phase = ConnState::READING_HEADER;
+                            cs.header_recv = 0;
+                            cs.msg_size = 0;
+                            cs.body_recv = 0;
+                            int fd_for_dispatch = cs.fd;
+                            bool keep = dispatch(fd_for_dispatch, body);
+                            if (!keep) { dropped = true; break; }
+                            // 继续 while：可能下一条 header 已经在内核缓冲中
+                        }
+                    } else if (r == 0) { dropped = true; break; }
+                    else {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) { exit_loop = true; break; }
+                        if (errno == EINTR) continue;
+                        dropped = true; break;
+                    }
+                }
             }
+
+            if (dropped) { drop_at(i); continue; }
+            i++;
         }
     }
-    for (int i = 1; i < nfds; i++) close(pfds[i].fd);
+
+    // 退出清理
+    for (size_t i = 1; i < pfds.size(); i++) ::close(pfds[i].fd);
 }
 
 // SDK 通信 accept 循环（纯 TCP 端口，不走传输层抽象）
@@ -2871,7 +2965,7 @@ void Node<T>::handle_node_client(int conn_id)
             // MSG_SEARCH_RESULT：远程搜索结果返回，推入对应 SDK 连接的完成队列
             if (msg_type == MSG_SEARCH_RESULT)
             {
-                msg_pool_->submit_urgent([this, buf]() {
+                msg_pool_->submit([this, buf]() {
                     int query_id = buf->read_val<int>();
                     std::vector<int> results = buf->read_vec<int>();
 
@@ -2899,7 +2993,7 @@ void Node<T>::handle_node_client(int conn_id)
             // MSG_SHARD_RESULT：shard 模式异步结果回传，推入累积器
             if (msg_type == MSG_SHARD_RESULT)
             {
-                msg_pool_->submit_urgent([this, buf]() {
+                msg_pool_->submit([this, buf]() {
                     int query_id = buf->read_val<int>();
                     int result_cnt = buf->read_val<int>();
                     std::vector<std::pair<DistT, int>> results;

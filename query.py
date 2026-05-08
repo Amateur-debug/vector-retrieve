@@ -197,6 +197,9 @@ def _do_round(args_tuple):
             correct = len(results_set.intersection(true_ids))
             recall[i] = correct / k
 
+        # 每轮结束主动断开连接，模拟老代码 Process 结束时的清理
+        sdk_client.disconnect()
+
         return {
             "thread_id": thread_id,
             "pid": my_pid,

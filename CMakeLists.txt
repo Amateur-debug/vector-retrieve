@@ -38,6 +38,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # =============================================================================
+# Build Options
+# =============================================================================
+
+# 开启后，C++ 端会输出 LOG_DEBUG_STREAM 系列调试日志（per-query/per-connection
+# 级别），仅用于排障；benchmark 跑分务必关闭，否则 stderr 写盘会拖慢查询。
+# 用法：cmake -DVR_DEBUG=ON ..
+option(VR_DEBUG "Enable verbose DEBUG-level logging (LOG_DEBUG_STREAM)" OFF)
+
+# =============================================================================
 # Dependencies
 # =============================================================================
 
@@ -157,6 +166,11 @@ if(HAVE_RDMA)
     target_link_libraries(vector_retrieve PRIVATE ${RDMA_LIBS})
 endif()
 
+# DEBUG 日志开关（默认关闭）
+if(VR_DEBUG)
+    target_compile_definitions(vector_retrieve PRIVATE VR_LOG_LEVEL=1)
+endif()
+
 # =============================================================================
 # Link Libraries (if needed)
 # =============================================================================
@@ -181,6 +195,11 @@ if(HAVE_RDMA)
     message(STATUS "RDMA Support: ENABLED")
 else()
     message(STATUS "RDMA Support: DISABLED")
+endif()
+if(VR_DEBUG)
+    message(STATUS "Debug Logging: ENABLED (LOG_DEBUG_STREAM active)")
+else()
+    message(STATUS "Debug Logging: DISABLED (use -DVR_DEBUG=ON to enable)")
 endif()
 message(STATUS "========================================")
 message(STATUS "")

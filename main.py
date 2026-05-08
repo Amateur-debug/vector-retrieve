@@ -504,7 +504,8 @@ class VectorRetrieveRunner:
                 shard_flag = "--shard" if self.args.shard else ""
                 global_pull_flag = "--global-pull" if self.args.is_global_pull else ""
 
-                cpu_prefix = f"taskset -c 0-{self.num_cpu - 1} " if self.num_cpu and self.num_cpu > 0 else ""
+                # slurm 自己通过 cgroups 做 CPU 绑定，不需要 taskset
+                cpu_prefix = f"taskset -c 0-{self.num_cpu - 1} " if (self.num_cpu and self.num_cpu > 0 and not use_slurm) else ""
 
                 if use_slurm:
                     # srun 方式启动远程 worker
