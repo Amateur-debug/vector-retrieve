@@ -176,10 +176,30 @@ def build_command(dataset, params, skip_prepare=False, no_cleanup=False, use_slu
 
 
 def get_graph_path(dataset, params):
-    """生成图文件路径（与 main.py save_graph 对齐）"""
+    """生成图文件路径（与 main.py save_graph 对齐：分布式模式保存为 .bin）"""
     data_name = effective_data_name(dataset, params)
-    filename = f"hnsw-{data_name}-m{params['m']}-efc{params['ef_construction']}-ll{params['limited_level']}.json"
+    filename = f"hnsw-{data_name}-m{params['m']}-efc{params['ef_construction']}-ll{params['limited_level']}.bin"
     return os.path.join(".", "save", filename)
+
+
+def get_partition_base(dataset, params):
+    """生成分区图基础路径（与 main.py prepare() 中默认 cluster_base 对齐）。
+    实际分区文件为 base-0.bin, base-1.bin, ..., base-(node_num-1).bin"""
+    data_name = effective_data_name(dataset, params)
+    layer_sfx = "-layer" if params.get('layer') else ""
+    return os.path.join(
+        ".", "save", data_name, f"node{params['node_num']}",
+        f"m{params['m']}-efc{params['ef_construction']}-ll{params['limited_level']}-"
+        f"{params['partition_mode']}-rep{params.get('replication', 0)}{layer_sfx}.bin"
+    )
+
+
+def all_partitions_exist(dataset, params):
+    """所有 node 的分区文件都存在则返回 True"""
+    if params.get('shard'):
+        return False  # shard 模式不保存统一分区
+    base = get_partition_base(dataset, params)
+    return all(os.path.exists(f"{base}-{i}.bin") for i in range(params['node_num']))
 
 
 def get_result_path(dataset, params):
@@ -320,6 +340,9 @@ def run_batch():
                     cmd += ["--graph_path", graph_path]
                 else:
                     built_graphs.add(graph_key)
+                # 分区图缺失时统一加 --save：覆盖"图已建好但分区未保存"的场景
+                # （main.py 检测到分区文件齐全会跳过 --save；齐全则无需重复保存）
+                if not all_partitions_exist(dataset, params):
                     cmd.append("--save")
 
             efs = params['ef_search']
