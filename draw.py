@@ -830,10 +830,20 @@ def collect_group(args):
         return None
 
     # 转为 {label: [(x, y), ...]} 格式，按 group_val 排序
+    # 对 group_by=node_num + recall × qps 的图，紧跟着每个 node_num 注入 CoTra 实测点
+    inject_cotra = (group_by == 'node_num' and recall_x and args.y == 'qps')
     series_data = {}
     for gval in sorted(group_points.keys()):
         label = _format_group_label(group_by, gval)
         series_data[label] = sorted(group_points[gval].items(), key=lambda p: p[0])
+        if inject_cotra:
+            cotra_pts = lookup_cotra_qps(args.data_name, gval,
+                                         min_recall=getattr(args, 'min_recall', None))
+            if cotra_pts:
+                cotra_label = f"{gval} Nodes (CoTra)"
+                series_data[cotra_label] = sorted(cotra_pts.items())
+                for r, q in sorted(cotra_pts.items()):
+                    print(f"[{cotra_label}] hardcoded | {args.x}={r} | {args.y}={q}")
 
     return series_data
 
@@ -875,10 +885,20 @@ BAR_STYLES = {
     'cotra':    {'color': '#74c0fc', 'hatch': '||'},
 }
 
-# group 模式（如 group_by=node_num）多 series 时按顺序取色，沿用同一蓝色系
-GROUP_COLORS = ['#cae9ff', '#74c0fc', '#5fa8d3', '#1a759f', '#a2d2ff']
-GROUP_HATCHES = ['\\\\', '//', 'xx', '||', '--']
-GROUP_MARKERS = ['o', '^', 's', 'D', 'v']
+# group 模式（如 group_by=node_num）系统系列按顺序取色（淡到中等蓝）
+# 与 COTRA_COLORS 不重叠，避免同图撞色
+GROUP_COLORS = ['#cae9ff', '#a2d2ff', '#bcd8eb', '#dbe9f4']
+GROUP_HATCHES = ['\\\\', 'xx', '||', '--']
+GROUP_MARKERS = ['o', 's', 'D', 'v']
+
+# CoTra 多 series 时按顺序取色（中等到稍深蓝），仍在同一蓝色系内
+COTRA_COLORS = ['#74c0fc', '#3a8cb5']
+COTRA_HATCHES = ['||', '++']
+COTRA_MARKERS = ['X', '*']
+
+
+def is_cotra_label(label):
+    return '(CoTra)' in label
 
 
 def draw_line_compare(mode_points, mode_labels, args, mode_debug=None):
@@ -1082,7 +1102,7 @@ def draw_scatter_compare_split(mode_points, mode_labels, args, mode_debug=None):
 
 
 _GROUP_LABEL_FMT = {
-    'node_num': lambda v: f"{v} Nodes",
+    'node_num': lambda v: f"{v} Nodes (Ours)",
 }
 
 
@@ -1101,17 +1121,24 @@ def draw_line_single(series_data, args, prefix="line"):
 
     all_xs = []
     multi = len(series_data) > 1
-    for i, (label, pts) in enumerate(series_data.items()):
+    sys_idx = cotra_idx = 0
+    for label, pts in series_data.items():
         xs, ys = zip(*pts)
         all_xs.extend(xs)
         if multi:
-            marker = GROUP_MARKERS[i % len(GROUP_MARKERS)]
-            color = GROUP_COLORS[i % len(GROUP_COLORS)]
+            if is_cotra_label(label):
+                color = COTRA_COLORS[cotra_idx % len(COTRA_COLORS)]
+                marker = COTRA_MARKERS[cotra_idx % len(COTRA_MARKERS)]
+                cotra_idx += 1
+            else:
+                color = GROUP_COLORS[sys_idx % len(GROUP_COLORS)]
+                marker = GROUP_MARKERS[sys_idx % len(GROUP_MARKERS)]
+                sys_idx += 1
             ax.plot(xs, ys, linestyle='-', linewidth=C['linewidth'], marker=marker,
                     markersize=C['markersize'], color=color, label=label)
         else:
             ax.plot(xs, ys, linestyle='-', linewidth=1.5,
-                    color=GROUP_COLORS[2], label=label)
+                    color=GROUP_COLORS[1], label=label)
 
     if all_xs:
         ax.set_xlim(min(all_xs), max(all_xs))
@@ -1169,13 +1196,21 @@ def draw_bar_single(series_data, args, prefix="bar"):
 
     if n_series > 1:
         bar_width = min(0.8 / n_series, C['bar_width_max'])
+        # 系统系列 vs CoTra 系列分别在两个色组中各自循环，避免颜色冲突
+        sys_idx = cotra_idx = 0
         for i, (label, pts) in enumerate(series_data.items()):
             d = dict(pts)
             offset = (i - (n_series - 1) / 2) * bar_width
             xs_present = [x_indices[j] + offset for j, x in enumerate(all_xs) if x in d]
             ys_present = [d[x] for x in all_xs if x in d]
-            color = GROUP_COLORS[i % len(GROUP_COLORS)]
-            hatch = GROUP_HATCHES[i % len(GROUP_HATCHES)]
+            if is_cotra_label(label):
+                color = COTRA_COLORS[cotra_idx % len(COTRA_COLORS)]
+                hatch = COTRA_HATCHES[cotra_idx % len(COTRA_HATCHES)]
+                cotra_idx += 1
+            else:
+                color = GROUP_COLORS[sys_idx % len(GROUP_COLORS)]
+                hatch = GROUP_HATCHES[sys_idx % len(GROUP_HATCHES)]
+                sys_idx += 1
             ax.bar(xs_present, ys_present, bar_width, label=label,
                    color=color, hatch=hatch, alpha=0.85, edgecolor='black')
     else:
@@ -1184,7 +1219,7 @@ def draw_bar_single(series_data, args, prefix="bar"):
             d = dict(pts)
             ys = [d.get(x, 0) for x in all_xs]
             ax.bar(x_indices, ys, width=bar_width,
-                   color=GROUP_COLORS[2], alpha=0.85, label=label)
+                   color=GROUP_COLORS[1], alpha=0.85, label=label)
 
     ax.set_xticks(x_indices)
     ax.set_xticklabels([str(x) for x in all_xs], fontsize=C['font_tick_label'],

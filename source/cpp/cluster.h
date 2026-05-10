@@ -54,7 +54,10 @@ using namespace std;
 // 注意：TcpConnectionPool 已迁移到 tcp_transport.h 中统一管理
 // g_connection_pool 全局变量已被 Cluster::transport 成员变量替代
 
-// 消息处理线程池：固定大小 + FIFO 任务队列
+// 消息处理线程池：固定大小 + 双端任务队列。
+// submit() 把任务追加到队尾（FIFO，普通查询）；
+// submit_priority() 把任务插到队首（用于 MSG_SEARCH_RESULT/MSG_SHARD_RESULT 这类
+// 处理极轻但需要尽快返回给 SDK 的响应消息，避免被前面慢的 SEARCH 任务堵几十秒）。
 class MessageThreadPool
 {
 public:
@@ -81,12 +84,24 @@ public:
         }
     }
 
-    // 提交普通任务到线程池队列
+    // 提交普通任务到队尾（FIFO）
     void submit(std::function<void()> task)
     {
         {
             std::lock_guard<std::mutex> lk(mu_);
-            tasks_.push(std::move(task));
+            tasks_.push_back(std::move(task));
+        }
+        cv_.notify_one();
+    }
+
+    // 提交优先任务到队首：跳过排队的普通任务，下一个空闲 worker 立即处理。
+    // 注意：仍受限于 worker 数量；如果所有 worker 都在执行长任务（如 transfer_to_remote
+    // 的 send_raw 阻塞），priority 任务也得等其中一个 worker 先 idle。
+    void submit_priority(std::function<void()> task)
+    {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            tasks_.push_front(std::move(task));
         }
         cv_.notify_one();
     }
@@ -106,7 +121,7 @@ private:
                 if (stop_ && tasks_.empty())
                     return;
                 task = std::move(tasks_.front());
-                tasks_.pop();
+                tasks_.pop_front();
             }
             task();
         }
@@ -115,7 +130,7 @@ private:
     bool stop_;
     std::mutex mu_;
     std::condition_variable cv_;
-    std::queue<std::function<void()>> tasks_;
+    std::deque<std::function<void()>> tasks_;
     std::vector<std::thread> workers_;
 };
 
@@ -768,9 +783,20 @@ void recv_all(int sock, void *data, size_t size)
     while (total_read < size)
     {
         ssize_t r = recv(sock, ptr + total_read, size - total_read, 0);
-        if (r <= 0)
+        if (r == 0)
         {
-            throw std::runtime_error("recv failed");
+            // 对端正常关闭连接（EOF），用专门的消息让上层区分静默处理
+            throw std::runtime_error("peer closed");
+        }
+        if (r < 0)
+        {
+            // SDK 端 disconnect() 走 SO_LINGER=0 → 发 RST，服务端 recv 返回 ECONNRESET。
+            // 这是 SDK 短连接（init_routes/save/load_cluster/set_ef/partition）正常断开的副作用，
+            // 与 FIN 等效，按 peer closed 静默处理；其他 errno 才报真错。
+            int err = errno;
+            if (err == ECONNRESET || err == EPIPE)
+                throw std::runtime_error("peer closed");
+            throw std::runtime_error(std::string("recv failed: ") + std::strerror(err));
         }
         total_read += r;
     }
@@ -803,9 +829,8 @@ public:
 
     std::atomic<int> active_handlers{0};
 
-    // 消息处理线程池：handle_node_client 收到消息后立即分派到此线程池处理，
+    // 消息处理线程池：tcp_server_loop 收到完整消息后立即分派到此线程池处理，
     // 自己继续接收下一条消息，避免处理阻塞接收。
-    // MSG_SEARCH_RESULT 使用 submit_urgent 确保不被线程池满阻塞。
     std::unique_ptr<MessageThreadPool> msg_pool_;
     int msg_pool_size_ = 32;  // 默认线程池大小，可通过构造参数或外部设置
 
@@ -864,7 +889,6 @@ public:
     void close_connection_hard(int fd);
     void close_connection_soft(int fd);
 
-    void handle_node_client(int conn_id);   // 处理节点间消息（transport 收发）
     void handle_sdk_client(int client_fd);  // 处理 SDK 消息（裸 TCP 收发）
 
     std::vector<int> query(int query_id, const vector<T> &query_vector, Payload<DistT> &payload, int k = 10);
@@ -2036,7 +2060,32 @@ public:
         }
     }
 
-    // 跨节点传输：统计并将查询转发到目标节点
+    // 转发链路任何失败时调用：把空结果送达 origin，避免 SDK 端 query_recv 永久阻塞。
+    // 自动处理 origin 是本地（push 到本机 sdk_cq_map_）或远程（network send）两种情况。
+    // 用空 payload 构造，统计字段全为 0；该 query 召回为 0，但全局 drain 不会卡住。
+    void deliver_empty_result(int query_id, int origin_node_id)
+    {
+        if (origin_node_id < 0 || origin_node_id >= node_num)
+        {
+            LOG_INFO_STREAM("[Cluster] deliver_empty_result: invalid origin_node_id="
+                            << origin_node_id << " for query " << query_id);
+            return;
+        }
+        Payload<DistT> empty_payload;
+        empty_payload.origin_node_id = origin_node_id;
+        // 通过任意本机 Node 调用 send_result_to_origin —— 路由由 origin_node_id 决定，
+        // 调用者节点是哪个不影响投递结果
+        for (int i = 0; i < node_num; i++)
+        {
+            if (!nodes[i].is_remote_node && nodes[i].local_hnsw)
+            {
+                nodes[i].send_result_to_origin(query_id, std::vector<int>{}, empty_payload);
+                return;
+            }
+        }
+        LOG_INFO_STREAM("[Cluster] deliver_empty_result: no local node found for query " << query_id);
+    }
+
     // 跨节点传输：统计并将查询转发到目标节点
     std::vector<int> transfer_to_remote(int query_id, const vector<T> &query_vector, Payload<DistT> &payload, int k)
     {
@@ -2111,7 +2160,10 @@ public:
             int sock = transport->acquire_connection(target_node_id);
             if (sock < 0)
             {
-                LOG_DEBUG_STREAM("[Cluster] ERROR: Failed to get connection for query " << query_id << " to node " << target_node_id);
+                LOG_INFO_STREAM("[Cluster] transfer_to_remote: acquire_connection failed for query "
+                                << query_id << " to node " << target_node_id
+                                << "; delivering empty result to origin " << payload.origin_node_id);
+                deliver_empty_result(query_id, payload.origin_node_id);
                 return {};
             }
 
@@ -2152,6 +2204,10 @@ public:
             catch (...)
             {
                 transport->release_connection(target_node_id, sock, false);
+                LOG_INFO_STREAM("[Cluster] transfer_to_remote: send_raw threw for query "
+                                << query_id << " to node " << target_node_id
+                                << "; delivering empty result to origin " << payload.origin_node_id);
+                deliver_empty_result(query_id, payload.origin_node_id);
                 return {};
             }
         }
@@ -2746,42 +2802,87 @@ void Node<T>::tcp_server_loop()
             return false; // 关闭连接
         }
 
+        // MSG_SEARCH_RESULT / MSG_SHARD_RESULT 走 msg_pool_ 但用 submit_priority 插队到前面。
+        // 原因：这两条消息处理极轻（反序列化 + map 查找 + push），
+        // 如果跟 MSG_SEARCH（含 transfer_to_remote 的网络 send_raw 阻塞）一起 FIFO 排队，
+        // 慢的 SEARCH 任务会把响应消息堵在队尾几十秒，最终触发 SDK 超时。
         if (msg_type == MSG_SEARCH_RESULT) {
-            msg_pool_->submit([this, buf]() {
-                int qid = buf->read_val<int>();
-                std::vector<int> rs = buf->read_vec<int>();
-                Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
-                std::shared_ptr<SDKCompletionQueue<T>> cq;
-                { std::lock_guard<std::mutex> lk(sdk_cq_map_mu_);
-                  auto it = sdk_cq_map_.find(qid);
-                  if (it != sdk_cq_map_.end()) { cq = it->second; sdk_cq_map_.erase(it); } }
-                if (cq) cq->push({qid, std::move(rs), std::move(pl)});
+            msg_pool_->submit_priority([this, buf]() {
+                int qid = -1;
+                try {
+                    qid = buf->read_val<int>();
+                    std::vector<int> rs = buf->read_vec<int>();
+                    Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
+                    std::shared_ptr<SDKCompletionQueue<T>> cq;
+                    { std::lock_guard<std::mutex> lk(sdk_cq_map_mu_);
+                      auto it = sdk_cq_map_.find(qid);
+                      if (it != sdk_cq_map_.end()) { cq = it->second; sdk_cq_map_.erase(it); } }
+                    if (cq) cq->push({qid, std::move(rs), std::move(pl)});
+                } catch (const std::exception &e) {
+                    LOG_INFO_STREAM("[Node " << node_id << "] MSG_SEARCH_RESULT handler threw for query " << qid
+                                    << ": " << e.what() << "; pushing empty result");
+                    if (qid >= 0) {
+                        std::shared_ptr<SDKCompletionQueue<T>> cq;
+                        { std::lock_guard<std::mutex> lk(sdk_cq_map_mu_);
+                          auto it = sdk_cq_map_.find(qid);
+                          if (it != sdk_cq_map_.end()) { cq = it->second; sdk_cq_map_.erase(it); } }
+                        if (cq) {
+                            Payload<DistT> empty;
+                            try { cq->push({qid, std::vector<int>{}, std::move(empty)}); } catch (...) {}
+                        }
+                    }
+                } catch (...) {
+                    LOG_INFO_STREAM("[Node " << node_id << "] MSG_SEARCH_RESULT handler unknown exception for query " << qid);
+                }
             });
             return true;
         }
 
         if (msg_type == MSG_SHARD_RESULT) {
-            msg_pool_->submit([this, buf]() {
-                int qid = buf->read_val<int>();
-                int cnt = buf->read_val<int>();
-                std::vector<std::pair<DistT,int>> rs; rs.reserve(cnt);
-                for (int j=0;j<cnt;j++) rs.push_back({buf->read_val<DistT>(), buf->read_val<int>()});
-                Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
-                std::shared_ptr<ReduceQueryAccumulator<T>> acc;
-                { std::lock_guard<std::mutex> lk(reduce_accum_mu_);
-                  auto it = reduce_accum_map_.find(qid);
-                  if (it != reduce_accum_map_.end()) acc = it->second; }
-                if (acc) acc->add_node_results(rs, pl);
+            msg_pool_->submit_priority([this, buf]() {
+                try {
+                    int qid = buf->read_val<int>();
+                    int cnt = buf->read_val<int>();
+                    std::vector<std::pair<DistT,int>> rs; rs.reserve(cnt);
+                    for (int j=0;j<cnt;j++) rs.push_back({buf->read_val<DistT>(), buf->read_val<int>()});
+                    Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
+                    std::shared_ptr<ReduceQueryAccumulator<T>> acc;
+                    { std::lock_guard<std::mutex> lk(reduce_accum_mu_);
+                      auto it = reduce_accum_map_.find(qid);
+                      if (it != reduce_accum_map_.end()) acc = it->second; }
+                    if (acc) acc->add_node_results(rs, pl);
+                } catch (const std::exception &e) {
+                    LOG_INFO_STREAM("[Node " << node_id << "] MSG_SHARD_RESULT handler threw: " << e.what());
+                } catch (...) {}
             });
             return true;
         }
 
         if (msg_type == MSG_SEARCH) {
             msg_pool_->submit([this, buf]() {
-                int qid = buf->read_val<int>(); int k = buf->read_val<int>();
-                std::vector<T> qv = buf->read_vec<T>();
-                Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
-                this->query(qid, qv, pl, k);
+                int qid = -1;
+                int origin = -1;
+                try {
+                    qid = buf->read_val<int>();
+                    int k = buf->read_val<int>();
+                    std::vector<T> qv = buf->read_vec<T>();
+                    Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
+                    origin = pl.origin_node_id;
+                    this->query(qid, qv, pl, k);
+                } catch (const std::exception &e) {
+                    // 任何异常（反序列化、local_hnsw->query、转发）都要把空结果送回 origin，
+                    // 否则 origin 节点的 sdk_cq_map_[qid] 永远 orphan
+                    LOG_INFO_STREAM("[Node " << node_id << "] MSG_SEARCH handler threw for query " << qid
+                                    << " (origin=" << origin << "): " << e.what()
+                                    << "; delivering empty result");
+                    if (qid >= 0 && origin >= 0)
+                        cluster->deliver_empty_result(qid, origin);
+                } catch (...) {
+                    LOG_INFO_STREAM("[Node " << node_id << "] MSG_SEARCH handler unknown exception for query " << qid
+                                    << " (origin=" << origin << "); delivering empty result");
+                    if (qid >= 0 && origin >= 0)
+                        cluster->deliver_empty_result(qid, origin);
+                }
             });
             return true;
         }
@@ -2919,316 +3020,6 @@ void Node<T>::sdk_server_loop()
     }
 }
 
-// ==================== 处理节点间消息（transport 收发） ====================
-// 设计：每个 TCP 连接一个 handle_node_client 线程，负责接收消息。
-// 收到消息后立即分派到 msg_pool_ 线程池处理，自己继续接收下一条消息。
-// MSG_SEARCH_RESULT 使用 submit_urgent 绕过线程池队列，避免死锁：
-//   如果线程池满且所有 worker 都在等待 SEARCH_RESULT（阻塞在 wait_for_async_result），
-//   而 SEARCH_RESULT 排在队列后面无法被处理，就会形成死锁。
-// MSG_INIT_GRAPH 内联处理（一次性初始化，需要 break 退出循环）。
-// 对于 MSG_ADD_VECTOR_LOCAL / MSG_QUERY_LOCAL 等需要回复的消息：
-//   发送方会阻塞等待回复，不会发送下一条消息，因此 recv 线程阻塞在 recv_raw 上，
-//   worker 线程通过 send_raw 发送回复是安全的（TCP 支持不同线程并发读写同一 fd）。
-template <typename T>
-void Node<T>::handle_node_client(int conn_id)
-{
-    active_handlers++;
-    LOG_DEBUG_STREAM("[Node " << node_id << "] handle_node_client started, conn_id=" << conn_id);
-
-    while (true)
-    {
-        try
-        {
-            uint64_t msg_size = 0;
-            LOG_DEBUG_STREAM("[Node " << node_id << "] handle_node_client waiting for msg_size, conn_id=" << conn_id);
-            cluster->transport->recv_raw(conn_id, &msg_size, sizeof(uint64_t));
-            if (msg_size == 0)
-                break;
-
-            LOG_DEBUG_STREAM("[Node " << node_id << "] handle_node_client received msg_size=" << msg_size << ", conn_id=" << conn_id);
-            // 直接 recv 到独立 buffer，然后 move 给线程池任务，零拷贝
-            auto buf = std::make_shared<Buffer>();
-            buf->data.resize(msg_size);
-            cluster->transport->recv_raw(conn_id, buf->data.data(), msg_size);
-            buf->read_pos = 0;
-            int msg_type = buf->read_val<int>();
-
-            // MSG_INIT_GRAPH：一次性初始化消息，内联处理后退出循环
-            if (msg_type == MSG_INIT_GRAPH)
-            {
-                LOG_DEBUG_STREAM("Node " << node_id << " receiving graph partition...");
-                bool remote_is_global_pull = buf->read_val<bool>();
-                cluster->is_global_pull = remote_is_global_pull;  // 远程节点同步模式标志
-                deserialize_routing(*buf, cluster->vector_node_map);
-
-                if (local_hnsw)
-                    delete local_hnsw;
-                local_hnsw = deserialize_hnsw_subset<T>(*buf, /*do_compact=*/!remote_is_global_pull);
-
-                // global-pull 模式下注入远程向量拉取回调
-                if (remote_is_global_pull && local_hnsw)
-                {
-                    Cluster<T> *cl = cluster;
-                    local_hnsw->pull_fetcher_ = [cl](int vid) -> std::vector<T> {
-                        return cl->fetch_remote_vector(vid);
-                    };
-                }
-
-                LOG_DEBUG_STREAM("Node " << node_id << " initialized with " << local_hnsw->get_cur_element_count() << " vectors.");
-
-                char ack = 1;
-                cluster->transport->send_raw(conn_id, &ack, 1);
-                break;
-            }
-
-            // MSG_SEARCH_RESULT：远程搜索结果返回，推入对应 SDK 连接的完成队列
-            if (msg_type == MSG_SEARCH_RESULT)
-            {
-                msg_pool_->submit([this, buf]() {
-                    int query_id = buf->read_val<int>();
-                    std::vector<int> results = buf->read_vec<int>();
-
-                    Payload<DistT> payload;
-                    deserialize_payload(*buf, payload, local_hnsw);
-
-                    std::shared_ptr<SDKCompletionQueue<T>> cq;
-                    {
-                        std::lock_guard<std::mutex> lk(sdk_cq_map_mu_);
-                        auto it = sdk_cq_map_.find(query_id);
-                        if (it != sdk_cq_map_.end()) {
-                            cq = it->second;
-                            sdk_cq_map_.erase(it);
-                        }
-                    }
-                    if (cq) {
-                        cq->push({query_id, std::move(results), std::move(payload)});
-                    } else {
-                        LOG_DEBUG_STREAM("[Node " << node_id << "] Warning: No completion queue for query " << query_id);
-                    }
-                });
-                continue;
-            }
-
-            // MSG_SHARD_RESULT：shard 模式异步结果回传，推入累积器
-            if (msg_type == MSG_SHARD_RESULT)
-            {
-                msg_pool_->submit([this, buf]() {
-                    int query_id = buf->read_val<int>();
-                    int result_cnt = buf->read_val<int>();
-                    std::vector<std::pair<DistT, int>> results;
-                    results.reserve(result_cnt);
-                    for (int j = 0; j < result_cnt; j++) {
-                        DistT dist = buf->read_val<DistT>();
-                        int id = buf->read_val<int>();
-                        results.push_back({dist, id});
-                    }
-                    Payload<DistT> payload;
-                    deserialize_payload(*buf, payload, local_hnsw);
-
-                    std::shared_ptr<ReduceQueryAccumulator<T>> accum;
-                    {
-                        std::lock_guard<std::mutex> lk(reduce_accum_mu_);
-                        auto it = reduce_accum_map_.find(query_id);
-                        if (it != reduce_accum_map_.end())
-                            accum = it->second;
-                    }
-                    if (accum) {
-                        accum->add_node_results(results, payload);
-                    } else {
-                        LOG_DEBUG_STREAM("[Node " << node_id << "] Warning: No shard accumulator for query " << query_id);
-                    }
-                });
-                continue;
-            }
-
-            // MSG_FETCH_VECTOR：global-pull 模式下的向量拉取请求，内联处理避免线程池死锁。
-            // 原因：查询处理线程在 pool 中阻塞等待拉取响应；若拉取请求也排队到 pool，
-            // 当所有 pool 线程都阻塞在查询（等待拉取结果）时，新到的拉取请求无法被处理，形成死锁。
-            // 由于操作极轻量（hash 查找 + memcpy + 一次 send），内联处理不会影响 recv 吞吐。
-            if (msg_type == MSG_FETCH_VECTOR)
-            {
-                int vid = buf->read_val<int>();
-                std::vector<T> vec;
-                if (local_hnsw)
-                    vec = local_hnsw->get_vector(vid);
-
-                Buffer resp_buf;
-                resp_buf.write_vec(vec);
-
-                uint64_t resp_size = resp_buf.data.size();
-                cluster->transport->send_raw(conn_id, &resp_size, sizeof(uint64_t));
-                cluster->transport->send_raw(conn_id, resp_buf.data.data(), resp_size);
-                continue;
-            }
-
-            // 其他消息类型：提交到线程池队列处理
-            msg_pool_->submit([this, buf, msg_type, conn_id]() {
-                try
-                {
-                    if (msg_type == MSG_SEARCH)
-                    {
-                        int query_id = buf->read_val<int>();
-                        int k = buf->read_val<int>();
-                        std::vector<T> query_vector = buf->read_vec<T>();
-
-                        Payload<DistT> payload;
-                        deserialize_payload(*buf, payload, local_hnsw);
-
-                        LOG_DEBUG_STREAM("[Node " << node_id << "] Received MSG_SEARCH for query " << query_id << ", transfer_cnt=" << payload.remote_transfer_cnt << ", origin=" << payload.origin_node_id);
-
-                        this->query(query_id, query_vector, payload, k);
-                    }
-                    else if (msg_type == MSG_ADD_VECTOR_LOCAL)
-                    {
-                        int vid = buf->read_val<int>();
-                        std::vector<T> vec = buf->read_vec<T>();
-
-                        char ack = 1;
-                        try {
-                            if (local_hnsw == nullptr && cluster && cluster->is_shard)
-                            {
-                                std::lock_guard<std::mutex> lk(local_hnsw_mutex);
-                                if (local_hnsw == nullptr)
-                                {
-                                    local_hnsw = new HNSWGraph<T>(
-                                        cluster->hnsw->dim, cluster->hnsw->m, cluster->hnsw->ef_construction,
-                                        cluster->hnsw->ef_search, cluster->hnsw->limited_level, 100000, cluster->hnsw->seed);
-                                }
-                            }
-                            if (local_hnsw)
-                                local_hnsw->add_vector(vid, vec);
-                        } catch (...) {
-                            LOG_DEBUG_STREAM("[Node " << node_id << "] Error adding local vector " << vid);
-                            ack = 0;
-                        }
-
-                        cluster->transport->send_raw(conn_id, &ack, 1);
-                    }
-                    else if (msg_type == MSG_QUERY_LOCAL)
-                    {
-                        int query_id = buf->read_val<int>();
-                        int k = buf->read_val<int>();
-                        std::vector<T> query_vector = buf->read_vec<T>();
-
-                        Payload<DistT> payload;
-                        deserialize_payload(*buf, payload, local_hnsw);
-
-                        std::vector<pair<DistT, int>> results;
-                        if (local_hnsw)
-                        {
-                            local_hnsw->query(query_vector, payload, k);
-                            // 堆内存 iid 编码，pop 时解码成 vid
-                            auto pq = payload.results;
-                            while (!pq.empty())
-                            {
-                                auto item = pq.top();
-                                results.push_back({item.first, local_hnsw->decode_key(item.second)});
-                                pq.pop();
-                            }
-                        }
-
-                        Buffer resp_buf;
-                        resp_buf.write_val((int)results.size());
-                        for (const auto &p : results)
-                        {
-                            resp_buf.write_val(p.first);
-                            resp_buf.write_val(p.second);
-                        }
-                        serialize_payload(resp_buf, payload, local_hnsw);
-
-                        uint64_t resp_size = resp_buf.data.size();
-                        cluster->transport->send_raw(conn_id, &resp_size, sizeof(uint64_t));
-                        cluster->transport->send_raw(conn_id, resp_buf.data.data(), resp_size);
-                    }
-                    else if (msg_type == MSG_QUERY_SHARD)
-                    {
-                        // 异步 shard 查询：执行本地搜索，结果通过 MSG_SHARD_RESULT 回传给 origin
-                        int query_id = buf->read_val<int>();
-                        int k = buf->read_val<int>();
-                        std::vector<T> query_vector = buf->read_vec<T>();
-                        int origin_node_id = buf->read_val<int>();
-
-                        std::vector<std::pair<DistT, int>> results;
-                        Payload<DistT> payload;
-                        if (local_hnsw)
-                        {
-                            local_hnsw->query(query_vector, payload, k);
-                            // 堆内存 iid 编码，pop 时解码成 vid
-                            auto pq = payload.results;
-                            while (!pq.empty())
-                            {
-                                auto item = pq.top();
-                                results.push_back({item.first, local_hnsw->decode_key(item.second)});
-                                pq.pop();
-                            }
-                        }
-
-                        // 回传结果给 origin 节点
-                        Node<T>& origin_node = cluster->nodes[origin_node_id];
-                        if (!origin_node.is_remote_node)
-                        {
-                            // origin 是本地节点，直接喂入累积器
-                            std::shared_ptr<ReduceQueryAccumulator<T>> accum;
-                            {
-                                std::lock_guard<std::mutex> lk(origin_node.reduce_accum_mu_);
-                                auto it = origin_node.reduce_accum_map_.find(query_id);
-                                if (it != origin_node.reduce_accum_map_.end())
-                                    accum = it->second;
-                            }
-                            if (accum)
-                                accum->add_node_results(results, payload);
-                        }
-                        else
-                        {
-                            // origin 在远程，通过网络发送 MSG_SHARD_RESULT
-                            int sock = cluster->transport->acquire_connection(origin_node_id);
-                            if (sock >= 0) {
-                                try {
-                                    Buffer resp_buf;
-                                    resp_buf.write_val((int)MSG_SHARD_RESULT);
-                                    resp_buf.write_val(query_id);
-                                    resp_buf.write_val((int)results.size());
-                                    for (const auto &p : results) {
-                                        resp_buf.write_val(p.first);
-                                        resp_buf.write_val(p.second);
-                                    }
-                                    serialize_payload(resp_buf, payload, local_hnsw);
-                                    uint64_t resp_size = resp_buf.data.size();
-                                    cluster->transport->send_raw(sock, &resp_size, sizeof(uint64_t));
-                                    cluster->transport->send_raw(sock, resp_buf.data.data(), resp_size);
-                                    cluster->transport->release_connection(origin_node_id, sock, true);
-                                } catch (...) {
-                                    cluster->transport->release_connection(origin_node_id, sock, false);
-                                    LOG_DEBUG_STREAM("[Node " << node_id << "] Failed to send MSG_SHARD_RESULT to origin " << origin_node_id);
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        LOG_DEBUG_STREAM("[Node " << node_id << "] Unknown node message type: " << msg_type);
-                    }
-                }
-                catch (const std::exception &e)
-                {
-                    LOG_DEBUG_STREAM("[Node " << node_id << "] Error processing msg_type=" << msg_type << ": " << e.what());
-                }
-            });
-        }
-        catch (const std::exception &e)
-        {
-            LOG_DEBUG_STREAM("[Node " << node_id << "] Error in handle_node_client recv: " << e.what());
-            break;
-        }
-        catch (...)
-        {
-            break;
-        }
-    }
-
-    cluster->transport->close_connection(conn_id);
-    active_handlers--;
-}
 
 // ==================== 处理 SDK 消息（裸 TCP 收发） ====================
 // 异步流水线模型：Reader 线程读取查询并处理，Writer 线程发送结果。
@@ -3413,25 +3204,57 @@ void Node<T>::handle_sdk_client(int client_fd)
                     }
                     else
                     {
-                        // Forward 模式
-                        pl->origin_node_id = node_id;
-                        std::vector<int> results;
-                        if (local_hnsw)
-                            results = local_hnsw->query(*qv, *pl, k);
-
+                        // Forward 模式：先 inflight_count++ 再做工作，保证任何抛错路径都能被 writer 平衡 dec
                         inflight_count++;
+                        try
+                        {
+                            pl->origin_node_id = node_id;
+                            std::vector<int> results;
+                            if (local_hnsw)
+                                results = local_hnsw->query(*qv, *pl, k);
 
-                        if (!cluster->is_distributed || !pl->continue_search)
-                        {
-                            completion_queue->push({query_id, std::move(results), std::move(*pl)});
+                            if (!cluster->is_distributed || !pl->continue_search)
+                            {
+                                completion_queue->push({query_id, std::move(results), std::move(*pl)});
+                            }
+                            else
+                            {
+                                {
+                                    std::lock_guard<std::mutex> lk(sdk_cq_map_mu_);
+                                    sdk_cq_map_[query_id] = completion_queue;
+                                }
+                                cluster->transfer_to_remote(query_id, *qv, *pl, k);
+                            }
                         }
-                        else
+                        catch (const std::exception &e)
                         {
+                            // 任何异常（local_hnsw->query 抛、transfer_to_remote 抛、push 抛）都不能让 SDK hang
+                            // 强制把空结果推到 completion_queue，让 SDK 收到 query_id 对应的回包
+                            LOG_INFO_STREAM("[Node " << node_id << "] MSG_QUERY lambda threw for query "
+                                            << query_id << ": " << e.what()
+                                            << "; pushing empty result to keep SDK unblocked");
+                            // 清理可能已 register 的 sdk_cq_map_ 条目（避免后续 MSG_SEARCH_RESULT 看到 stale）
                             {
                                 std::lock_guard<std::mutex> lk(sdk_cq_map_mu_);
-                                sdk_cq_map_[query_id] = completion_queue;
+                                sdk_cq_map_.erase(query_id);
                             }
-                            cluster->transfer_to_remote(query_id, *qv, *pl, k);
+                            Payload<DistT> empty_payload;
+                            try {
+                                completion_queue->push({query_id, std::vector<int>{}, std::move(empty_payload)});
+                            } catch (...) {}
+                        }
+                        catch (...)
+                        {
+                            LOG_INFO_STREAM("[Node " << node_id << "] MSG_QUERY lambda unknown exception for query "
+                                            << query_id << "; pushing empty result");
+                            {
+                                std::lock_guard<std::mutex> lk(sdk_cq_map_mu_);
+                                sdk_cq_map_.erase(query_id);
+                            }
+                            Payload<DistT> empty_payload;
+                            try {
+                                completion_queue->push({query_id, std::vector<int>{}, std::move(empty_payload)});
+                            } catch (...) {}
                         }
                     }
                 });
@@ -3657,7 +3480,13 @@ void Node<T>::handle_sdk_client(int client_fd)
         }
         catch (const std::exception &e)
         {
-            LOG_INFO_STREAM("[Node " << node_id << "] Error in handle_sdk_client (fd=" << client_fd << "): " << e.what());
+            // 对端正常关闭（peer closed）是良性事件 —— SDK 一次性请求完毕断开都会走这里
+            // 仅在真正的错误时打日志
+            std::string msg = e.what();
+            if (msg != "peer closed")
+            {
+                LOG_INFO_STREAM("[Node " << node_id << "] Error in handle_sdk_client (fd=" << client_fd << "): " << msg);
+            }
             break;
         }
         catch (...)
@@ -3721,37 +3550,52 @@ void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& result
         return;
     }
     
-    // origin_node 在远程节点上，通过网络发送查询结果
+    // origin_node 在远程节点上，通过网络发送查询结果。
+    // 重试若干次以容忍连接池/瞬时网络抖动，避免 SDK 端 query_recv 永久阻塞。
     LOG_DEBUG_STREAM("[Node " << node_id << "] Sending result to remote origin node " << payload.origin_node_id);
-    
-    // 使用通信中间层获取连接
-    int sock = cluster->transport->acquire_connection(payload.origin_node_id);
-    if (sock < 0)
+
+    // 序列化一次，重试时复用
+    Buffer buf;
+    buf.write_val((int)MSG_SEARCH_RESULT);
+    buf.write_val(query_id);
+    buf.write_vec(results);
+    serialize_payload(buf, payload, local_hnsw);
+    uint64_t msg_size = buf.data.size();
+
+    constexpr int MAX_RETRIES = 3;
+    constexpr int BASE_DELAY_MS = 50;
+    for (int attempt = 0; attempt < MAX_RETRIES; ++attempt)
     {
-        LOG_DEBUG_STREAM("[Node " << node_id << "] Failed to get connection to origin node");
-        return;
+        int sock = cluster->transport->acquire_connection(payload.origin_node_id);
+        if (sock < 0)
+        {
+            if (attempt + 1 < MAX_RETRIES)
+                std::this_thread::sleep_for(std::chrono::milliseconds(BASE_DELAY_MS << attempt));
+            continue;
+        }
+
+        try
+        {
+            cluster->transport->send_raw(sock, &msg_size, sizeof(uint64_t));
+            cluster->transport->send_raw(sock, buf.data.data(), msg_size);
+            cluster->transport->release_connection(payload.origin_node_id, sock, true);
+            LOG_DEBUG_STREAM("[Node " << node_id << "] Result sent to origin node " << payload.origin_node_id);
+            return;
+        }
+        catch (...)
+        {
+            cluster->transport->release_connection(payload.origin_node_id, sock, false);
+            if (attempt + 1 < MAX_RETRIES)
+                std::this_thread::sleep_for(std::chrono::milliseconds(BASE_DELAY_MS << attempt));
+        }
     }
-    
-    try
-    {
-        Buffer buf;
-        buf.write_val((int)MSG_SEARCH_RESULT);
-        buf.write_val(query_id);
-        buf.write_vec(results);
-        serialize_payload(buf, payload, local_hnsw);
-        
-        uint64_t msg_size = buf.data.size();
-        cluster->transport->send_raw(sock, &msg_size, sizeof(uint64_t));
-        cluster->transport->send_raw(sock, buf.data.data(), msg_size);
-        
-        cluster->transport->release_connection(payload.origin_node_id, sock, true);
-        LOG_DEBUG_STREAM("[Node " << node_id << "] Result sent to origin node " << payload.origin_node_id);
-    }
-    catch (...)
-    {
-        LOG_DEBUG_STREAM("[Node " << node_id << "] Exception sending result to origin node");
-        cluster->transport->release_connection(payload.origin_node_id, sock, false);
-    }
+
+    // 所有重试失败：origin 节点的 sdk_cq_map_[query_id] 仍在等，但我们已尽力。
+    // 大声日志报警，让运维知道有 query 真的丢了（这种情况下 origin 端 SDK 仍会 hang，
+    // 需要 SDK 侧加 query_recv 超时来保底；此 log 是定位线索）。
+    LOG_INFO_STREAM("[Node " << node_id << "] CRITICAL: failed to deliver result for query "
+                    << query_id << " to remote origin " << payload.origin_node_id
+                    << " after " << MAX_RETRIES << " retries");
 }
 
 // Node::query() — 用于两种场景：

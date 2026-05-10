@@ -1188,12 +1188,18 @@ class VectorRetrieveRunner:
                         print(f"[orchestrate] ERROR: query rank {rank} on {host} died (rc={proc.returncode}). stderr: {stderr[:500]}")
                         with open(os.path.join(barrier_dir, "abort"), "w") as f:
                             f.write("aborted")
-                        return None
+                        raise QueryStallError(
+                            f"query rank {rank} on {host} died at round {run_idx+1} "
+                            f"(rc={proc.returncode}); stderr: {stderr[:200]}"
+                        )
                 if time.time() - wait_start > ready_timeout:
                     print(f"[orchestrate] TIMEOUT round {run_idx+1}: only {ready_count}/{world_size} ready after {ready_timeout}s")
                     with open(os.path.join(barrier_dir, "abort"), "w") as f:
                         f.write("timeout")
-                    return None
+                    raise QueryStallError(
+                        f"ready barrier timeout at round {run_idx+1}: "
+                        f"only {ready_count}/{world_size} ready after {ready_timeout}s"
+                    )
                 time.sleep(0.1)
 
             # 写 go_<run_idx> 文件，3s 后让所有 rank 同步开始
@@ -1210,6 +1216,7 @@ class VectorRetrieveRunner:
         # 等所有 query.py 完成；记录每个 rank 的完成时刻
         print(f"[orchestrate] Waiting for all query.py instances to finish...")
         rank_finish_times = []
+        failed_ranks = []
         for rank, host, proc, log_file in ssh_procs:
             try:
                 stdout, stderr = proc.communicate()
@@ -1226,8 +1233,14 @@ class VectorRetrieveRunner:
                 print(f"[orchestrate] rank {rank} ({host}) finished at +{finish_t - first_round_scheduled_start:.2f}s, rc={rc}")
                 if tail_log:
                     print(f"  log tail:\n{tail_log}")
+                if rc != 0:
+                    failed_ranks.append((rank, host, rc))
             except Exception as e:
                 print(f"[orchestrate] rank {rank} ({host}): error waiting: {e}")
+                failed_ranks.append((rank, host, -1))
+        if failed_ranks:
+            detail = ", ".join(f"rank{r}@{h}(rc={c})" for r, h, c in failed_ranks)
+            raise QueryStallError(f"query rank(s) exited non-zero: {detail}")
 
         # main.py 视角的 wall-clock：从第一轮 scheduled_start 到最后一个 rank 完成
         # （含 num_runs 轮 + 各轮间的同步等待）
@@ -1284,7 +1297,7 @@ class VectorRetrieveRunner:
         num_queries = len(recall)
         if num_queries == 0:
             print("[orchestrate] ERROR: no query results aggregated")
-            return None
+            raise QueryStallError("no query results aggregated from any rank")
 
         avg_recall = sum(recall.values()) / num_queries
         all_remote_transfer_cnt = sum(remote_transfer_cnt.values())

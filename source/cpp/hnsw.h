@@ -1198,6 +1198,14 @@ public:
                 int remote_vid = -(cand_key + 1);
                 if (is_compacted)
                 {
+                    // 修复：candidates heap 里可能持有"已经在 native node 上 visited
+                    // 过的 remote vid"——它的条目是从早些探索路径上加进来的，序列化/反序列化
+                    // 跨节点后这里又出现。如果不检查 remote_visited_set 就推回去转发，
+                    // 会形成 "转发→pending 全 visited 跳过→主循环 pop 同一 remote→再转发"
+                    // 的 dead loop。检查后直接丢弃这个候选，不影响结果（它的 vid 已经
+                    // 在 visited_vids 里被算过距离并入过 results 堆）。
+                    if (remote_visited_set.count(remote_vid))
+                        continue;
                     payload.candidates.push({cand_dist, cand_key});
                     payload.continue_search = true;
                     payload.require_id = remote_vid;

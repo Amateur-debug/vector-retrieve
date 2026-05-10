@@ -135,7 +135,9 @@ def build_command(dataset, params, skip_prepare=False, no_cleanup=False, use_slu
     groundtruth_path = os.path.join(DATASET_ROOT, dataset['groundtruth'])
 
     cmd = [
-        "python", SCRIPT_PATH,
+        # -u: 关掉 stdout block-buffer，否则 main.py 进度日志会卡在 Python 缓冲区
+        # 直到填满 4-8KB 才刷出，slurm 日志看起来像"卡住"
+        "python", "-u", SCRIPT_PATH,
         "--data_name", data_name,
         "--data_path", data_path,
         "--query_path", query_path,
