@@ -99,7 +99,8 @@ def parse_filename_params(filename):
     """从结果文件名中解析参数，返回参数字典"""
     params = {}
 
-    match = re.search(r'results-([a-z][a-z0-9]*)-m', filename)
+    # data_name 允许复合名（含 '-'），用 -m<digit> 作为终结锚点，如 sift100m-u8
+    match = re.search(r'results-(.+?)-m\d', filename)
     if match:
         params['data_name'] = match.group(1)
 
@@ -220,41 +221,51 @@ def make_output_filename(prefix, args, extra_keys=None):
     def _label(s):
         return filename_label(s)
 
+    # group_by 的参数本身在该图里是变化维度，不应固化到文件名中
+    group_by = getattr(args, 'group_by', None)
+
+    def _skip(name):
+        return group_by is not None and group_by == name
+
     parts = [
         prefix,
         f"{_label(args.x)}-{_label(args.y)}-{args.data_name}",
     ]
-    if args.m is not None:
+    if args.m is not None and not _skip('m'):
         parts.append(f"m{args.m}")
-    if args.ef_construction is not None:
+    if args.ef_construction is not None and not _skip('ef_construction'):
         parts.append(f"efc{args.ef_construction}")
     # efs: 没有固定 recall 且 y 轴是 qps 时才写入文件名
-    if args.ef_search is not None and getattr(args, 'recall', None) is None and args.y == 'qps':
+    if args.ef_search is not None and getattr(args, 'recall', None) is None \
+            and args.y == 'qps' and not _skip('ef_search'):
         parts.append(f"efs{args.ef_search}")
-    if args.limited_level is not None:
+    if args.limited_level is not None and not _skip('limited_level'):
         parts.append(f"ll{args.limited_level}")
-    if args.node_num is not None:
+    if args.node_num is not None and not _skip('node_num'):
         parts.append(f"node{args.node_num}")
-    if getattr(args, 'partition_mode', None) is not None:
+    if getattr(args, 'partition_mode', None) is not None and not _skip('partition_mode'):
         parts.append(args.partition_mode)
     if getattr(args, 'global', False):
         parts.append("global")
-    if args.replication is not None:
+    if args.replication is not None and not _skip('replication'):
         parts.append(f"rep{args.replication}")
     _thread_independent = {"replication_num", "rep_per_node", "data_per_node",
                            "avg_remote_transfer_cnt", "avg_distance_cnt",
                            "avg_remote_transfer_data_per_transfer",
                            "avg_remote_transfer_data_per_query"}
-    if args.threads is not None and args.y not in _thread_independent:
+    if args.threads is not None and args.y not in _thread_independent and not _skip('threads'):
         parts.append(f"threads{args.threads}")
-    if getattr(args, 'num_query_threads', None) is not None and args.y not in _thread_independent:
+    if getattr(args, 'num_query_threads', None) is not None \
+            and args.y not in _thread_independent and not _skip('num_query_threads'):
         parts.append(f"query_threads{args.num_query_threads}")
     if getattr(args, 'recall', None) is not None:
         parts.append(f"recall{args.recall}")
-    if getattr(args, 'group_by', None) is not None:
-        parts.append(f"by-{args.group_by}")
     if extra_keys:
         parts.extend(extra_keys)
+    if getattr(args, 'mode', None) != 'compare' and getattr(args, 'layer', None) is True:
+        parts.append("layer")
+    if group_by is not None:
+        parts.append(f"by-{group_by}")
     return "-".join(parts) + ".pdf"
 
 
@@ -385,6 +396,44 @@ def bucket_recall_points(points_list, min_recall=None, max_recall=0.95):
 
 
 # ============================================================
+# CoTra 实测结果查表（无缩放，缺数据则不画）
+# Key: (data_name, node_num) -> {recall_bucket: qps}
+# recall_bucket 与 RECALL_BUCKET_SIZE=0.05 对齐
+# ============================================================
+COTRA_HARDCODED = {
+    # SIFT100M uint8, 640K queries, QG=16, threads=8/rank, 5 轮 trimmed mean
+    # 每个 recall 档独立校准 EF: target recall 处取最近测点
+    # 来源: memory/20260510/cotra_640k_recall_scaling_8x8_vs_8x16/results/official_summary.tsv
+    ('sift100m-u8', 8): {
+        # 8 nodes x 8 threads = 64; index 来自 memory/20260424/sift100m_8node_experiment
+        # ef=28/40/67/136 对应 recall 0.80/0.85/0.90/0.95
+        0.80: 171839,
+        0.85: 158936,
+        0.90: 109060,
+        0.95: 62596,
+    },
+    ('sift100m-u8', 16): {
+        # 16 nodes x 8 threads = 128; 16P index w/ MAX_WRITE_NUM=256
+        # ef=24/36/60/120 对应 recall 0.80/0.85/0.90/0.95
+        0.80: 225524,
+        0.85: 203828,
+        0.90: 161811,
+        0.95: 90637,
+    },
+}
+
+
+def lookup_cotra_qps(data_name, node_num, min_recall=None):
+    """查 CoTra 实测 QPS。返回 {recall_bucket: qps}，无匹配时返回 {}。"""
+    entry = COTRA_HARDCODED.get((data_name, node_num))
+    if not entry:
+        return {}
+    if min_recall is None:
+        return dict(entry)
+    return {r: q for r, q in entry.items() if r >= min_recall}
+
+
+# ============================================================
 # 数据收集函数（按 mode 分类）
 # ============================================================
 
@@ -499,15 +548,17 @@ def collect_compare(args):
             print(f"Skipping {f}: {e}")
 
     if args.y == 'qps' and recall_x:
-        cotra_base_qps = 68900
-        cotra_base_node_num = 8
-        cotra_base_threads = 8
-        node_scale = (args.node_num / cotra_base_node_num) if args.node_num is not None else 1.0
-        thread_scale = (args.threads / cotra_base_threads) if args.threads is not None else 1.0
-        cotra_qps = cotra_base_qps * node_scale * thread_scale
-        mode_points['cotra'][0.95] = cotra_qps
-        mode_labels['cotra'] = 'CoTra'
-        print(f"[CoTra] hardcoded | {args.x}=0.95 | {args.y}={cotra_qps}")
+        cotra_pts = lookup_cotra_qps(args.data_name, args.node_num,
+                                     min_recall=getattr(args, 'min_recall', None))
+        if cotra_pts:
+            mode_points['cotra'] = dict(cotra_pts)
+            mode_labels['cotra'] = 'CoTra'
+            for r, q in sorted(cotra_pts.items()):
+                print(f"[CoTra] hardcoded | {args.x}={r} | {args.y}={q}"
+                      f" | data_name={args.data_name} node_num={args.node_num}")
+        else:
+            print(f"[CoTra] no hardcoded entry for data_name={args.data_name},"
+                  f" node_num={args.node_num} — skipping CoTra")
 
     # --recall 模式：对每个 (mode, x_val) 选 recall 最接近目标的
     mode_debug = None
@@ -691,8 +742,11 @@ def collect_group(args):
     else:
         files = [directory]
 
+    recall_x = is_recall_x(args.x)
     # {group_val: {x_val: y_val}}
     group_points = defaultdict(dict)
+    # {group_val: [(x_val, y_val, filename), ...]} for recall x-axis
+    group_recall_candidates = defaultdict(list)
 
     for f in files:
         try:
@@ -751,11 +805,25 @@ def collect_group(args):
             if x_val is None or y_val is None or group_val is None:
                 continue
 
-            group_points[group_val][x_val] = y_val
-            print(f"[{group_by}={group_val}] {os.path.basename(f)} | {args.x}={x_val} | {args.y}={y_val}")
+            if recall_x:
+                group_recall_candidates[group_val].append((x_val, y_val, os.path.basename(f)))
+            else:
+                group_points[group_val][x_val] = y_val
+                print(f"[{group_by}={group_val}] {os.path.basename(f)} | {args.x}={x_val} | {args.y}={y_val}")
 
         except Exception as e:
             print(f"Skipping {f}: {e}")
+
+    # recall x 轴时，按 0.05 档位聚合，同档位取 y 最大
+    if recall_x and group_recall_candidates:
+        for group_val, candidates in group_recall_candidates.items():
+            bucketed, debug_info = bucket_recall_points(
+                candidates, min_recall=getattr(args, 'min_recall', None))
+            group_points[group_val] = bucketed
+            for bucket in sorted(bucketed.keys()):
+                raw_recall, fname = debug_info[bucket]
+                print(f"[{group_by}={group_val}] {fname} | {args.x}={bucket} "
+                      f"| {args.y}={bucketed[bucket]} | raw_recall={raw_recall:.4f}")
 
     if not group_points:
         print("No valid data points found.")
@@ -764,7 +832,7 @@ def collect_group(args):
     # 转为 {label: [(x, y), ...]} 格式，按 group_val 排序
     series_data = {}
     for gval in sorted(group_points.keys()):
-        label = f"{group_by}={gval}"
+        label = _format_group_label(group_by, gval)
         series_data[label] = sorted(group_points[gval].items(), key=lambda p: p[0])
 
     return series_data
@@ -806,6 +874,11 @@ BAR_STYLES = {
     'weaviate': {'color': '#a2d2ff', 'hatch': '--'},
     'cotra':    {'color': '#74c0fc', 'hatch': '||'},
 }
+
+# group 模式（如 group_by=node_num）多 series 时按顺序取色，沿用同一蓝色系
+GROUP_COLORS = ['#cae9ff', '#74c0fc', '#5fa8d3', '#1a759f', '#a2d2ff']
+GROUP_HATCHES = ['\\\\', '//', 'xx', '||', '--']
+GROUP_MARKERS = ['o', '^', 's', 'D', 'v']
 
 
 def draw_line_compare(mode_points, mode_labels, args, mode_debug=None):
@@ -1008,11 +1081,21 @@ def draw_scatter_compare_split(mode_points, mode_labels, args, mode_debug=None):
     save_figure(fig, args, "scatter-compare-split")
 
 
+_GROUP_LABEL_FMT = {
+    'node_num': lambda v: f"{v} Nodes",
+}
+
+
+def _format_group_label(group_by, val):
+    fmt = _GROUP_LABEL_FMT.get(group_by)
+    return fmt(val) if fmt else f"{group_by}={val}"
+
+
 _MARKERS = ['o', 's', '^', 'D', 'v', 'P', 'X', '*', 'h', '<', '>']
 
 
 def draw_line_single(series_data, args, prefix="line"):
-    """折线图 × 单系列模式（detail / merge）"""
+    """折线图 × 单/多系列模式（detail / merge / group）"""
     C = PLOT_CONFIG
     fig, ax = make_fig(C['fig_width_single'])
 
@@ -1021,10 +1104,14 @@ def draw_line_single(series_data, args, prefix="line"):
     for i, (label, pts) in enumerate(series_data.items()):
         xs, ys = zip(*pts)
         all_xs.extend(xs)
-        marker = _MARKERS[i % len(_MARKERS)] if multi else None
-        lw = C['linewidth'] if multi else 1.5
-        ax.plot(xs, ys, linestyle='-', linewidth=lw, marker=marker,
-                markersize=C['markersize'], label=label)
+        if multi:
+            marker = GROUP_MARKERS[i % len(GROUP_MARKERS)]
+            color = GROUP_COLORS[i % len(GROUP_COLORS)]
+            ax.plot(xs, ys, linestyle='-', linewidth=C['linewidth'], marker=marker,
+                    markersize=C['markersize'], color=color, label=label)
+        else:
+            ax.plot(xs, ys, linestyle='-', linewidth=1.5,
+                    color=GROUP_COLORS[2], label=label)
 
     if all_xs:
         ax.set_xlim(min(all_xs), max(all_xs))
@@ -1063,24 +1150,49 @@ def draw_scatter_single(series_data, args, prefix="scatter"):
 
 
 def draw_bar_single(series_data, args, prefix="bar"):
-    """柱状图 × 单系列模式（detail / merge）"""
+    """柱状图 × 单/多系列模式（detail / merge / group）
+
+    - 单 series: 与原有行为一致，单色柱状图。
+    - 多 series (例: group_by 多分组): 在每个 x 位置并排错位绘制各系列柱子。
+    """
     C = PLOT_CONFIG
-    fig_width = calc_fig_width(max(len(pts) for pts in series_data.values()))
+    n_series = max(len(series_data), 1)
+
+    # 所有 series 的 x 值并集（排序）
+    all_xs = sorted({x for pts in series_data.values() for x, _ in pts})
+    n_groups = len(all_xs)
+    x_indices = np.arange(n_groups)
+
+    fig_width = calc_fig_width(n_groups * n_series) if n_series > 1 \
+        else calc_fig_width(n_groups)
     fig, ax = make_fig(fig_width)
 
-    for label, pts in series_data.items():
-        xs, ys = zip(*pts)
-        x_labels = [str(x) for x in xs]
-        x_indices = np.arange(len(xs))
-        bar_width = min(0.6, max(0.2, 6.0 / max(len(xs), 1)))
-        ax.bar(x_indices, ys, width=bar_width, color='#1f77b4', alpha=0.85, label=label)
-        ax.set_xticks(x_indices)
-        ax.set_xticklabels(x_labels, fontsize=C['font_tick_label'],
-                           rotation=45 if len(xs) > 20 else 0)
+    if n_series > 1:
+        bar_width = min(0.8 / n_series, C['bar_width_max'])
+        for i, (label, pts) in enumerate(series_data.items()):
+            d = dict(pts)
+            offset = (i - (n_series - 1) / 2) * bar_width
+            xs_present = [x_indices[j] + offset for j, x in enumerate(all_xs) if x in d]
+            ys_present = [d[x] for x in all_xs if x in d]
+            color = GROUP_COLORS[i % len(GROUP_COLORS)]
+            hatch = GROUP_HATCHES[i % len(GROUP_HATCHES)]
+            ax.bar(xs_present, ys_present, bar_width, label=label,
+                   color=color, hatch=hatch, alpha=0.85, edgecolor='black')
+    else:
+        bar_width = min(0.6, max(0.2, 6.0 / max(n_groups, 1)))
+        for label, pts in series_data.items():
+            d = dict(pts)
+            ys = [d.get(x, 0) for x in all_xs]
+            ax.bar(x_indices, ys, width=bar_width,
+                   color=GROUP_COLORS[2], alpha=0.85, label=label)
+
+    ax.set_xticks(x_indices)
+    ax.set_xticklabels([str(x) for x in all_xs], fontsize=C['font_tick_label'],
+                       rotation=45 if n_groups > 20 else 0)
 
     x_label = "Query Index" if args.mode == "detail" else display_label(args.x)
     style_ax(ax, x_label, display_label(args.y), tick_axis='y', grid_axis='y')
-    setup_legend(ax, len(series_data))
+    setup_legend(ax, n_series)
     apply_layout(fig)
 
     save_figure(fig, args, prefix)

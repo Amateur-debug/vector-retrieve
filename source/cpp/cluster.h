@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -2166,6 +2167,12 @@ public:
     {
         try
         {
+            // 父目录可能不存在（例如新 node_num 的 save/.../nodeN/），先建出来；
+            // 否则 ofstream 静默 fail 但不抛异常，老代码会误报 "saved" 实际没落盘。
+            std::filesystem::path p(filepath);
+            if (p.has_parent_path())
+                std::filesystem::create_directories(p.parent_path());
+
             json routing_json_obj;
             routing_json_obj["vector_node_map"] = json::array();
             for (const auto &level_map : vector_node_map) {
@@ -2186,11 +2193,23 @@ public:
             }
 
             std::ofstream output_file(filepath, std::ios::binary);
+            if (!output_file) {
+                LOG_INFO_STREAM("[save] Failed to open " << filepath << " for writing");
+                return false;
+            }
             uint64_t routing_json_length = routing_json_string.size();
             output_file.write((char*)&routing_json_length, sizeof(uint64_t));
             output_file.write(routing_json_string.data(), routing_json_length);
             output_file.write(subset_buf.data.data(), subset_buf.data.size());
+            if (!output_file) {
+                LOG_INFO_STREAM("[save] Write failed for " << filepath);
+                return false;
+            }
             return true;
+        }
+        catch (const std::exception &e) {
+            LOG_INFO_STREAM("[save] Exception while saving " << filepath << ": " << e.what());
+            return false;
         }
         catch (...) { return false; }
     }

@@ -152,6 +152,7 @@ def _do_round(args_tuple):
         pending = {}
         sent, received = 0, 0
 
+        total = len(proc_indices)
         for idx, i in enumerate(proc_indices):
             payload = _PAYLOAD_CLS()
             qid = i + thread_id * _NUM_QUERIES + qid_base
@@ -169,9 +170,11 @@ def _do_round(args_tuple):
                 pull_cnt[orig_idx] = ret_payload.pull_cnt
                 pull_data[orig_idx] = ret_payload.pull_data
                 received += 1
-            if sent % 500 == 0:
+            # 最后一次 send 不打 periodic 日志（received 还差 pipeline 深度，会误导成"没收完"）
+            # 改由下面 drain 完成后的 "done" 日志统一汇报最终 sent/received
+            if sent % 500 == 0 and sent != total:
                 print(f"[pid={my_pid}] run={run_idx} tid={thread_id} "
-                      f"sent={sent}/{len(proc_indices)} received={received}", flush=True)
+                      f"sent={sent}/{total} received={received}", flush=True)
 
         while received < sent:
             ret_qid, results, ret_payload = sdk_client.query_recv()
@@ -187,7 +190,7 @@ def _do_round(args_tuple):
 
         query_time = time.time() - actual_start
         print(f"[pid={my_pid}] _do_round run={run_idx} tid={thread_id} done, "
-              f"time={query_time:.3f}s", flush=True)
+              f"sent={sent}/{total} received={received} time={query_time:.3f}s", flush=True)
 
         # 计算召回
         recall = {}

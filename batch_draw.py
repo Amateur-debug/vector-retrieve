@@ -7,570 +7,188 @@ from types import SimpleNamespace
 from draw import run_draw
 
 # ============================================================
-# 数据集总控：所有任务都会对每个 data_name 分别运行
+# 节点配置：每个数据集的 (node_num, query_threads) 列表
 # ============================================================
-DATA_NAMES = ["sift100m"]
+DATASET_NODE_CONFIG = {
+    "sift":        [(5, 40)],
+    "sift100m":    [(4, 32), (5, 40), (8, 64)],
+    "sift100m-u8": [(8, 64), (16, 128)],
+}
 
 # ============================================================
-# 画图任务配置
-# 每个任务定义 chart + mode + 固定参数，grid 中的参数取笛卡尔积
+# 任务模板 A：每个 (dataset, node_num) 扩展一次
+# node_num / num_query_threads 由 _make_task_list 动态注入
 # ============================================================
-DRAW_TASKS = [
-    # ==================== 论文用图 ====================
-    # --- [论文] compare：replication vs avg_remote_transfer_cnt 柱状图（Fig 5.2）---
+PER_NODE_TASKS = [
+    # --- compare: recall vs qps ---
     {
-        "chart": "bar",
-        "mode": "compare",
-        "grid": {
-            "x":            ["replication"],
-            "y":            ["avg_remote_transfer_cnt"],
-            "m":            [10],
-            "ef_construction": [200],
-            "ef_search":    [15],
-            "limited_level": [5],
-            "node_num":     [5],
-            "threads":      [8],
-            "num_query_threads": [40],
-        },
+        "chart": "line", "mode": "compare",
+        "grid": {"x": ["avg_recall@10"], "y": ["qps"],
+                 "replication": [2], "threads": [8]},
     },
-    # --- [论文] compare：efs vs qps 折线图（Fig 5.3）---
     {
-        "chart": "line",
-        "mode": "compare",
-        "grid": {
-            "x":            ["ef_search"],
-            "y":            ["qps"],
-            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
-            "ef_construction": [200],
-            "limited_level": [5],
-            "node_num":     [5],
-            "replication":   [0, 1, 2],
-            "threads":      [8, 16, 32, 64],
-            "num_query_threads": [40],
-        },
+        "chart": "bar", "mode": "compare",
+        "grid": {"x": ["avg_recall@10"], "y": ["qps"],
+                 "replication": [2], "threads": [8]},
     },
-    # --- [论文] compare：efs vs avg_remote_transfer_cnt 折线图（Fig 5.4）---
+    # --- compare: recall vs avg_distance_cnt (shard + global)
+    #     layer (k-means) 当作 'Global'，no-layer 排除；cotra/weaviate 不画 ---
     {
-        "chart": "line",
-        "mode": "compare",
-        "grid": {
-            "x":            ["ef_search"],
-            "y":            ["avg_remote_transfer_cnt"],
-            "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
-            "ef_construction": [200],
-            "limited_level": [5],
-            "node_num":     [5],
-            "replication":   [0, 1, 2],
-            "threads":      [8, 16, 32, 64],
-            "num_query_threads": [40],
-        },
+        "chart": "line", "mode": "compare",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_distance_cnt"],
+                 "replication": [2],
+                 "global": [True], "cotra": [False], "weaviate": [False]},
     },
-    # --- [论文] compare：recall vs avg_distance_cnt 折线图 ---
     {
-        "chart": "line",
-        "mode": "compare",
-        "grid": {
-            "x":            ["avg_recall@10"],
-            "y":            ["avg_distance_cnt"],
-            "node_num":     [5],
-            "replication":   [0, 1, 2],
-        },
+        "chart": "bar", "mode": "compare",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_distance_cnt"],
+                 "replication": [2],
+                 "global": [True], "cotra": [False], "weaviate": [False]},
     },
-    # --- [论文] compare：recall vs avg_distance_cnt 柱状图 ---
+    # --- compare: recall vs avg_remote_transfer_cnt ---
     {
-        "chart": "bar",
-        "mode": "compare",
-        "grid": {
-            "x":            ["avg_recall@10"],
-            "y":            ["avg_distance_cnt"],
-            "node_num":     [5],
-            "replication":   [0, 1, 2],
-        },
+        "chart": "line", "mode": "compare",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_remote_transfer_cnt"],
+                 "replication": [2]},
     },
-    # --- [论文] compare：recall vs avg_remote_transfer_cnt 折线图 ---
     {
-        "chart": "line",
-        "mode": "compare",
-        "grid": {
-            "x":            ["avg_recall@10"],
-            "y":            ["avg_remote_transfer_cnt"],
-            "node_num":     [5],
-            "replication":   [0, 1, 2],
-        },
+        "chart": "bar", "mode": "compare",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_remote_transfer_cnt"],
+                 "replication": [2]},
     },
-    # --- [论文] compare：recall vs avg_remote_transfer_cnt 柱状图（Fig 1.2）---
+    # --- compare: ef_search vs qps ---
     {
-        "chart": "bar",
-        "mode": "compare",
-        "grid": {
-            "x":            ["avg_recall@10"],
-            "y":            ["avg_remote_transfer_cnt"],
-            "node_num":     [5],
-            "replication":   [0, 1, 2],
-        },
+        "chart": "line", "mode": "compare",
+        "grid": {"x": ["ef_search"], "y": ["qps"],
+                 "m": [10, 15, 20, 25, 30, 35, 40],
+                 "ef_construction": [200], "limited_level": [5],
+                 "replication": [2], "threads": [8]},
     },
-    # --- [论文] compare：recall vs avg_distance_cnt 柱状图（shard + global）（Fig 1.1）---
+    # --- compare: ef_search vs avg_remote_transfer_cnt ---
     {
-        "chart": "bar",
-        "mode": "compare",
-        "grid": {
-            "x":            ["avg_recall@10"],
-            "y":            ["avg_distance_cnt"],
-            "node_num":     [5],
-            "replication":   [0, 1, 2],
-            "threads":      [8, 16, 32, 64],
-            "num_query_threads": [40],
-            "global":       [True],
-            "cotra":        [False],
-            "weaviate":     [False],
-        },
+        "chart": "line", "mode": "compare",
+        "grid": {"x": ["ef_search"], "y": ["avg_remote_transfer_cnt"],
+                 "m": [10, 15, 20, 25, 30, 35, 40],
+                 "ef_construction": [200], "limited_level": [5],
+                 "replication": [2], "threads": [8]},
     },
-    # --- [论文] compare：recall vs qps 折线图 ---
+    # --- compare: threads vs qps ---
     {
-        "chart": "line",
-        "mode": "compare",
-        "grid": {
-            "x":            ["avg_recall@10"],
-            "y":            ["qps"],
-            "node_num":     [5],
-            "replication":   [0, 1, 2],
-            "threads":      [8, 16, 32, 64],
-            "num_query_threads": [40],
-        },
+        "chart": "line", "mode": "compare",
+        "grid": {"x": ["threads"], "y": ["qps"],
+                 "m": [10], "ef_construction": [200], "limited_level": [5],
+                 "replication": [2]},
     },
-    # --- [论文] compare：recall vs qps 柱状图（Fig 5.1）---
+    # --- compare: replication vs avg_remote_transfer_cnt ---
     {
-        "chart": "bar",
-        "mode": "compare",
-        "grid": {
-            "x":            ["avg_recall@10"],
-            "y":            ["qps"],
-            "node_num":     [5],
-            "replication":   [0, 1, 2],
-            "threads":      [8, 16, 32, 64],
-            "num_query_threads": [40],
-        },
+        "chart": "bar", "mode": "compare",
+        "grid": {"x": ["replication"], "y": ["avg_remote_transfer_cnt"],
+                 "m": [10], "ef_construction": [200], "ef_search": [15],
+                 "limited_level": [5], "threads": [8]},
     },
-    # --- [论文] compare：threads vs qps 折线图 ---
+    # --- compare: replication vs qps，按 recall 取最近实验（每个 recall 一张图）---
     {
-        "chart": "line",
-        "mode": "compare",
-        "grid": {
-            "x":            ["threads"],
-            "y":            ["qps"],
-            "m":            [10],
-            "ef_construction": [200],
-            "limited_level": [5],
-            "node_num":     [5],
-            "replication":   [2],
-            "num_query_threads": [40],
-        },
+        "chart": "bar", "mode": "compare",
+        "grid": {"x": ["replication"], "y": ["qps"],
+                 "threads": [8],
+                 "recall": [0.85, 0.9, 0.95]},
     },
-    # ==================== 论文未用图（已注释）====================
-    # # --- compare：三路对比柱状图，threads vs qps ---
-    # {
-    #     "chart": "bar",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["threads"],
-    #         "y":            ["qps"],
-    #         "m":            [10],
-    #         "ef_construction": [200],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "replication":   [2],
-    #         "num_query_threads": [40],
-    #     },
-    # },
-    # # --- compare：固定 recall，threads vs qps 折线图 ---
-    # {
-    #     "chart": "line",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["threads"],
-    #         "y":            ["qps"],
-    #         "node_num":     [5],
-    #         "replication":   [2],
-    #         "num_query_threads": [40],
-    #         "recall":       [0.95, 0.9, 0.85],
-    #     },
-    # },
-    # # --- compare：固定 recall，threads vs qps 柱状图 ---
-    # {
-    #     "chart": "bar",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["threads"],
-    #         "y":            ["qps"],
-    #         "node_num":     [5],
-    #         "replication":   [2],
-    #         "num_query_threads": [40],
-    #         "recall":       [0.95, 0.9, 0.85],
-    #     },
-    # },
-    # # --- compare：replication vs replication_num 柱状图 ---
-    # {
-    #     "chart": "bar",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["replication"],
-    #         "y":            ["replication_num"],
-    #         "m":            [10],
-    #         "ef_construction": [200],
-    #         "ef_search":    [15],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "threads":      [8],
-    #         "num_query_threads": [40],
-    #     },
-    # },
-    # # --- compare：replication vs avg_remote_transfer_cnt 折线图 ---
-    # {
-    #     "chart": "line",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["replication"],
-    #         "y":            ["avg_remote_transfer_cnt"],
-    #         "m":            [10],
-    #         "ef_construction": [200],
-    #         "ef_search":    [15],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "threads":      [8],
-    #         "num_query_threads": [40],
-    #     },
-    # },
-    # # --- compare：replication vs avg_remote_transfer_data_per_transfer 折线图 ---
-    # {
-    #     "chart": "line",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["replication"],
-    #         "y":            ["avg_remote_transfer_data_per_transfer"],
-    #         "m":            [10],
-    #         "ef_construction": [200],
-    #         "ef_search":    [15],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #     },
-    # },
-    # --- compare：replication vs avg_remote_transfer_data_per_transfer 柱状图 ---
+    # --- compare: replication vs avg_remote_transfer_data_per_transfer ---
     {
-        "chart": "bar",
-        "mode": "compare",
-        "grid": {
-            "x":            ["replication"],
-            "y":            ["avg_remote_transfer_data_per_transfer"],
-            "m":            [10],
-            "ef_construction": [200],
-            "ef_search":    [15],
-            "limited_level": [5],
-            "node_num":     [5],
-        },
+        "chart": "bar", "mode": "compare",
+        "grid": {"x": ["replication"], "y": ["avg_remote_transfer_data_per_transfer"],
+                 "m": [10], "ef_construction": [200], "ef_search": [15],
+                 "limited_level": [5]},
     },
-    # # --- compare：replication vs avg_remote_transfer_data_per_query 折线图 ---
-    # {
-    #     "chart": "line",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["replication"],
-    #         "y":            ["avg_remote_transfer_data_per_query"],
-    #         "m":            [10],
-    #         "ef_construction": [200],
-    #         "ef_search":    [15],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #     },
-    # },
-    # --- compare：replication vs avg_remote_transfer_data_per_query 柱状图 ---
+    # --- compare: replication vs avg_remote_transfer_data_per_query ---
     {
-        "chart": "bar",
-        "mode": "compare",
-        "grid": {
-            "x":            ["replication"],
-            "y":            ["avg_remote_transfer_data_per_query"],
-            "m":            [10],
-            "ef_construction": [200],
-            "ef_search":    [15],
-            "limited_level": [5],
-            "node_num":     [5],
-        },
+        "chart": "bar", "mode": "compare",
+        "grid": {"x": ["replication"], "y": ["avg_remote_transfer_data_per_query"],
+                 "m": [10], "ef_construction": [200], "ef_search": [15],
+                 "limited_level": [5]},
     },
-    # # --- compare：avg_distance_cnt vs recall 折线图 ---
-    # {
-    #     "chart": "line",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["avg_distance_cnt"],
-    #         "y":            ["avg_recall@10"],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #         "threads":      [8],
-    #         "num_query_threads": [40],
-    #     },
-    # },
-    # # --- compare：avg_remote_transfer_cnt vs qps 折线图（split）---
-    # {
-    #     "chart": "line",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["avg_remote_transfer_cnt"],
-    #         "y":            ["qps"],
-    #         "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
-    #         "ef_construction": [200],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #         "threads":      [8, 16, 32, 64],
-    #         "num_query_threads": [40],
-    #         "split":        [True],
-    #     },
-    # },
-    # # --- compare：efs vs qps 柱状图 ---
-    # {
-    #     "chart": "bar",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["ef_search"],
-    #         "y":            ["qps"],
-    #         "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
-    #         "ef_construction": [200],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #         "threads":      [8, 16, 32, 64],
-    #         "num_query_threads": [40],
-    #     },
-    # },
-    # # --- compare：efs vs recall 折线图 ---
-    # {
-    #     "chart": "line",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["ef_search"],
-    #         "y":            ["avg_recall@10"],
-    #         "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
-    #         "ef_construction": [200],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #         "threads":      [8, 16, 32, 64],
-    #         "num_query_threads": [40],
-    #     },
-    # },
-    # # --- compare：efs vs recall 柱状图 ---
-    # {
-    #     "chart": "bar",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["ef_search"],
-    #         "y":            ["avg_recall@10"],
-    #         "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
-    #         "ef_construction": [200],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #         "threads":      [8, 16, 32, 64],
-    #         "num_query_threads": [40],
-    #     },
-    # },
-    # # --- compare：efs vs avg_remote_transfer_data_per_transfer 折线图 ---
-    # {
-    #     "chart": "line",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["ef_search"],
-    #         "y":            ["avg_remote_transfer_data_per_transfer"],
-    #         "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
-    #         "ef_construction": [200],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #     },
-    # },
-    # # --- compare：efs vs avg_remote_transfer_data_per_transfer 柱状图 ---
-    # {
-    #     "chart": "bar",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["ef_search"],
-    #         "y":            ["avg_remote_transfer_data_per_transfer"],
-    #         "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
-    #         "ef_construction": [200],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #     },
-    # },
-    # # --- compare：efs vs avg_remote_transfer_data_per_query 折线图 ---
-    # {
-    #     "chart": "line",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["ef_search"],
-    #         "y":            ["avg_remote_transfer_data_per_query"],
-    #         "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
-    #         "ef_construction": [200],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #     },
-    # },
-    # # --- compare：efs vs avg_remote_transfer_data_per_query 柱状图 ---
-    # {
-    #     "chart": "bar",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["ef_search"],
-    #         "y":            ["avg_remote_transfer_data_per_query"],
-    #         "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
-    #         "ef_construction": [200],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #     },
-    # },
-    # # --- compare：recall vs avg_remote_transfer_data_per_transfer 折线图 ---
-    # {
-    #     "chart": "line",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["avg_recall@10"],
-    #         "y":            ["avg_remote_transfer_data_per_transfer"],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #     },
-    # },
-    # # --- compare：recall vs avg_remote_transfer_data_per_transfer 柱状图 ---
-    # {
-    #     "chart": "bar",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["avg_recall@10"],
-    #         "y":            ["avg_remote_transfer_data_per_transfer"],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #     },
-    # },
-    # # --- compare：recall vs avg_remote_transfer_data_per_query 折线图 ---
-    # {
-    #     "chart": "line",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["avg_recall@10"],
-    #         "y":            ["avg_remote_transfer_data_per_query"],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #     },
-    # },
-    # # --- compare：recall vs avg_remote_transfer_data_per_query 柱状图 ---
-    # {
-    #     "chart": "bar",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["avg_recall@10"],
-    #         "y":            ["avg_remote_transfer_data_per_query"],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #     },
-    # },
-    # # --- compare：recall vs avg_distance_cnt 折线图（shard + global）---
-    # {
-    #     "chart": "line",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["avg_recall@10"],
-    #         "y":            ["avg_distance_cnt"],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #         "threads":      [8, 16, 32, 64],
-    #         "num_query_threads": [40],
-    #         "global":       [True],
-    #         "cotra":        [False],
-    #         "weaviate":     [False],
-    #     },
-    # },
-    # # --- group：x=ef_search, y=qps, 按 m 分组 ---
-    # {
-    #     "chart": "line",
-    #     "mode": "group",
-    #     "grid": {
-    #         "x":            ["ef_search"],
-    #         "y":            ["qps"],
-    #         "group_by":     ["m"],
-    #         "ef_construction": [200],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #         "threads":      [8, 16, 32, 64],
-    #         "num_query_threads": [40],
-    #         "layer":        [True, False],
-    #     },
-    # },
-    # # --- group：x=m, y=qps, 按 ef_search 分组 ---
-    # {
-    #     "chart": "line",
-    #     "mode": "group",
-    #     "grid": {
-    #         "x":            ["m"],
-    #         "y":            ["qps"],
-    #         "group_by":     ["ef_search"],
-    #         "ef_construction": [200],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #         "threads":      [8, 16, 32, 64],
-    #         "num_query_threads": [40],
-    #         "layer":        [True, False],
-    #     },
-    # },
-    # --- group：recall vs avg_remote_transfer_cnt，按 replication 分组 ---
+    # --- group: recall vs avg_remote_transfer_cnt by replication ---
+    # layer=True → 只扫 layer 文件；layer=False → 只扫 no-layer 文件
     {
-        "chart": "line",
-        "mode": "group",
-        "grid": {
-            "x":            ["avg_recall@10"],
-            "y":            ["avg_remote_transfer_cnt"],
-            "group_by":     ["replication"],
-            "node_num":     [5],
-            "threads":      [8, 16, 32, 64],
-            "num_query_threads": [40],
-            "layer":        [True, False],
-        },
+        "chart": "line", "mode": "group",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_remote_transfer_cnt"],
+                 "group_by": ["replication"], "threads": [8],
+                 "layer": [True, False]},
     },
-    # # --- compare：efs vs avg_distance_cnt 折线图 ---
-    # {
-    #     "chart": "line",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["ef_search"],
-    #         "y":            ["avg_distance_cnt"],
-    #         "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
-    #         "ef_construction": [200],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #         "threads":      [8, 16, 32, 64],
-    #         "num_query_threads": [40],
-    #     },
-    # },
-    # # --- compare：efs vs avg_distance_cnt 柱状图 ---
-    # {
-    #     "chart": "bar",
-    #     "mode": "compare",
-    #     "grid": {
-    #         "x":            ["ef_search"],
-    #         "y":            ["avg_distance_cnt"],
-    #         "m":            [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
-    #         "ef_construction": [200],
-    #         "limited_level": [5],
-    #         "node_num":     [5],
-    #         "replication":   [0, 1, 2],
-    #         "threads":      [8, 16, 32, 64],
-    #         "num_query_threads": [40],
-    #     },
-    # },
 ]
+
+# ============================================================
+# 任务模板 B：每个 dataset 只扩展一次（跨节点数量对比）
+# node_num 不过滤（由 group_by 收集所有节点）
+# query_threads 不过滤（各节点使用自身线程数）
+# ============================================================
+NODE_COMPARE_TASKS = [
+    # --- node compare: recall vs qps (line) ---
+    {
+        "chart": "line", "mode": "group",
+        "grid": {"x": ["avg_recall@10"], "y": ["qps"],
+                 "group_by": ["node_num"],
+                 "replication": [2], "threads": [8], "layer": [True, False]},
+    },
+    # --- node compare: recall vs qps (bar) — 每个 recall 档位并排不同 node 的柱子 ---
+    {
+        "chart": "bar", "mode": "group",
+        "grid": {"x": ["avg_recall@10"], "y": ["qps"],
+                 "group_by": ["node_num"],
+                 "replication": [2], "threads": [8], "layer": [True, False]},
+    },
+    # --- node compare: recall vs avg_distance_cnt (line) ---
+    {
+        "chart": "line", "mode": "group",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_distance_cnt"],
+                 "group_by": ["node_num"],
+                 "replication": [2], "layer": [True, False]},
+    },
+    # --- node compare: recall vs avg_distance_cnt (bar) ---
+    {
+        "chart": "bar", "mode": "group",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_distance_cnt"],
+                 "group_by": ["node_num"],
+                 "replication": [2], "layer": [True, False]},
+    },
+    # --- node compare: recall vs avg_remote_transfer_cnt (line) ---
+    {
+        "chart": "line", "mode": "group",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_remote_transfer_cnt"],
+                 "group_by": ["node_num"],
+                 "replication": [2], "layer": [True, False]},
+    },
+    # --- node compare: recall vs avg_remote_transfer_cnt (bar) ---
+    {
+        "chart": "bar", "mode": "group",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_remote_transfer_cnt"],
+                 "group_by": ["node_num"],
+                 "replication": [2], "layer": [True, False]},
+    },
+]
+
+
+def _make_task_list(node_configs):
+    """Expand PER_NODE_TASKS for each node config, then append NODE_COMPARE_TASKS."""
+    tasks = []
+    for node_num, query_threads in node_configs:
+        for tmpl in PER_NODE_TASKS:
+            task = {
+                "chart": tmpl["chart"],
+                "mode": tmpl["mode"],
+                "grid": {**tmpl["grid"],
+                         "node_num": [node_num],
+                         "num_query_threads": [query_threads]},
+            }
+            tasks.append(task)
+    tasks.extend(NODE_COMPARE_TASKS)
+    return tasks
+
+
+DRAW_TASKS_BY_DATASET = {
+    name: _make_task_list(node_configs)
+    for name, node_configs in DATASET_NODE_CONFIG.items()
+}
 
 
 # 默认参数（与 draw.py 的 argparse 默认值对齐）
@@ -624,8 +242,13 @@ def make_args(chart, mode, params, debug=False):
 def run_batch(args):
     """批量画图"""
     tasks = []
-    for data_name in DATA_NAMES:
-        for task_def in DRAW_TASKS:
+    selected = args.dataset if getattr(args, "dataset", None) else list(DRAW_TASKS_BY_DATASET.keys())
+    for data_name in selected:
+        task_list = DRAW_TASKS_BY_DATASET.get(data_name)
+        if task_list is None:
+            print(f"[WARN] no task list for dataset '{data_name}', skipping")
+            continue
+        for task_def in task_list:
             chart = task_def["chart"]
             mode = task_def["mode"]
             grid = task_def["grid"]
@@ -664,6 +287,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch draw plots")
     parser.add_argument("--debug", action='store_true',
                         help="Pass --debug to each draw call")
+    parser.add_argument("--dataset", nargs="+", default=None,
+                        choices=list(DRAW_TASKS_BY_DATASET.keys()),
+                        help="Only run for these data_names (default: all in DRAW_TASKS_BY_DATASET)")
     args = parser.parse_args()
 
     run_batch(args)

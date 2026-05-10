@@ -43,10 +43,10 @@ def _get_query_threads(node_num, num_threads):
 PARAM_GRID = {
     "node_num":           [8, 16],
     "partition_mode":     ["k-means"],
-    "replication":        [2],
-    "m":                  [10, 15, 20, 25, 30, 35, 40],
+    "replication":        [1, 0],
+    "m":                  [20, 25, 30, 35, 40],
     "ef_construction":    [200],
-    "ef_search":          [15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
+    "ef_search":          [20, 25, 30, 35, 40, 45, 55, 60],
     "limited_level":      [5],
     "k":                  [10],
     "num_query_threads":  None,      # 由 node_num × num_threads 推导（8→64, 16→128）
@@ -60,8 +60,11 @@ PARAM_GRID = {
     "dtype":              ["uint8"],
 }
 
-# 全 (m, ef_search) 网格（与 5-node sift100m float 完整 sweep 对齐）
-ALLOWED_M_EFS = set()
+# 仅跑 rep2 sweep 中接近 recall=0.80/0.85/0.90/0.95 的最高 QPS 配置（覆盖 node8/16 × layer T/F 的 union）
+ALLOWED_M_EFS = {
+    (20, 35), (25, 40), (25, 55), (30, 25),
+    (30, 45), (35, 30), (40, 20), (40, 60),
+}
 
 # uint8 模式下 data_name 追加的后缀，保证 graph/results 文件名与 float 不冲突
 DTYPE_NAME_SUFFIX = {"uint8": "-u8"}
@@ -190,7 +193,7 @@ def get_partition_base(dataset, params):
     return os.path.join(
         ".", "save", data_name, f"node{params['node_num']}",
         f"m{params['m']}-efc{params['ef_construction']}-ll{params['limited_level']}-"
-        f"{params['partition_mode']}-rep{params.get('replication', 0)}{layer_sfx}.bin"
+        f"{params['partition_mode']}-rep{params.get('replication', 0)}{layer_sfx}"
     )
 
 

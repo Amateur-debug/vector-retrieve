@@ -746,11 +746,11 @@ class VectorRetrieveRunner:
                 elif self.graph_path and os.path.isdir(self.graph_path):
                     cluster_base = os.path.join(self.graph_path,
                         f"m{self.m}-efc{self.ef_construction}-ll{self.limited_level}-"
-                        f"{self.partition_mode}-rep{self.replication}{layer_sfx}.bin")
+                        f"{self.partition_mode}-rep{self.replication}{layer_sfx}")
                 else:
                     cluster_base = (f"./save/{self.data_name}/node{self.node_num}/"
                         f"m{self.m}-efc{self.ef_construction}-ll{self.limited_level}-"
-                        f"{self.partition_mode}-rep{self.replication}{layer_sfx}.bin")
+                        f"{self.partition_mode}-rep{self.replication}{layer_sfx}")
                 self.cluster_path = cluster_base
 
                 # 检查是否已有分区文件（优先加载，跳过建图和分区）
@@ -1458,17 +1458,17 @@ class VectorRetrieveRunner:
             results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
                             f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
                             f"node{self.node_num}-"
-                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{shard_suffix}.bin")
+                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{shard_suffix}.json")
         elif self.args.is_global_pull:
             results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
                             f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
                             f"node{self.node_num}-{self.partition_mode}-rep{self.replication}-"
-                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{global_pull_suffix}.bin")
+                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{global_pull_suffix}.json")
         else:
             results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
                             f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
                             f"node{self.node_num}-{self.partition_mode}-rep{self.replication}-"
-                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{layer_suffix}.bin")
+                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{layer_suffix}.json")
 
         with open(results_path, 'w') as f:
             json.dump(stats, f, indent=4)
