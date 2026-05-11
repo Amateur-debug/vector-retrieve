@@ -264,14 +264,19 @@ def make_output_filename(prefix, args, extra_keys=None):
         parts.extend(extra_keys)
     if getattr(args, 'mode', None) != 'compare' and getattr(args, 'layer', None) is True:
         parts.append("layer")
+    if getattr(args, 'filter_layer', None) is True:
+        parts.append("layer")
     if group_by is not None:
         parts.append(f"by-{group_by}")
+    output_tag = getattr(args, 'output_tag', None)
+    if output_tag:
+        parts.append(filename_label(str(output_tag)))
     return "-".join(parts) + ".pdf"
 
 
 DISPLAY_NAMES = {
     'avg_distance_cnt': 'Computation Count',
-    'avg_remote_transfer_cnt': 'Transfer Count',
+    'avg_remote_transfer_cnt': 'Communication Count',
     'avg_remote_transfer_data_per_transfer': 'Data per Transfer (bit)',
     'avg_remote_transfer_data_per_query': 'Data per Query (bit)',
     'qps': 'QPS',
@@ -397,40 +402,61 @@ def bucket_recall_points(points_list, min_recall=None, max_recall=0.95):
 
 # ============================================================
 # CoTra 实测结果查表（无缩放，缺数据则不画）
-# Key: (data_name, node_num) -> {recall_bucket: qps}
+# Key: metric -> (data_name, node_num) -> {recall_bucket: value}
 # recall_bucket 与 RECALL_BUCKET_SIZE=0.05 对齐
 # ============================================================
 COTRA_HARDCODED = {
-    # SIFT100M uint8, 640K queries, QG=16, threads=8/rank, 5 轮 trimmed mean
-    # 每个 recall 档独立校准 EF: target recall 处取最近测点
-    # 来源: memory/20260510/cotra_640k_recall_scaling_8x8_vs_8x16/results/official_summary.tsv
-    ('sift100m-u8', 8): {
-        # 8 nodes x 8 threads = 64; index 来自 memory/20260424/sift100m_8node_experiment
-        # ef=28/40/67/136 对应 recall 0.80/0.85/0.90/0.95
-        0.80: 171839,
-        0.85: 158936,
-        0.90: 109060,
-        0.95: 62596,
+    'qps': {
+        # SIFT100M uint8, 640K queries, QG=16, threads=8/rank, 5 轮 trimmed mean
+        # 每个 recall 档独立校准 EF: target recall 处取最近测点
+        # 来源: memory/20260510/cotra_640k_recall_scaling_8x8_vs_8x16/results/official_summary.tsv
+        ('sift100m-u8', 8): {
+            # 8 nodes x 8 threads = 64; index 来自 memory/20260424/sift100m_8node_experiment
+            # ef=28/40/67/136 对应 recall 0.80/0.85/0.90/0.95
+            0.80: 171839,
+            0.85: 158936,
+            0.90: 109060,
+            0.95: 62596,
+        },
+        ('sift100m-u8', 16): {
+            # 16 nodes x 8 threads = 128; 16P index w/ MAX_WRITE_NUM=256
+            # ef=24/36/60/120 对应 recall 0.80/0.85/0.90/0.95
+            0.80: 225524,
+            0.85: 203828,
+            0.90: 161811,
+            0.95: 90637,
+        },
     },
-    ('sift100m-u8', 16): {
-        # 16 nodes x 8 threads = 128; 16P index w/ MAX_WRITE_NUM=256
-        # ef=24/36/60/120 对应 recall 0.80/0.85/0.90/0.95
-        0.80: 225524,
-        0.85: 203828,
-        0.90: 161811,
-        0.95: 90637,
+    'avg_remote_transfer_cnt': {
+        ('sift100m-u8', 8): {
+            0.80: 42.37,
+            0.85: 51.33,
+            0.90: 67.76,
+            0.95: 110.23,
+        },
     },
 }
 
 
-def lookup_cotra_qps(data_name, node_num, min_recall=None):
-    """查 CoTra 实测 QPS。返回 {recall_bucket: qps}，无匹配时返回 {}。"""
-    entry = COTRA_HARDCODED.get((data_name, node_num))
+def lookup_cotra_metric(metric, data_name, node_num, min_recall=None):
+    """查 CoTra 实测指标。返回 {recall_bucket: value}，无匹配时返回 {}。"""
+    metric_entries = COTRA_HARDCODED.get(metric, {})
+    data_names = [data_name]
+    if data_name == 'sift100m':
+        data_names.append('sift100m-u8')
+    elif data_name == 'sift100m-u8':
+        data_names.append('sift100m')
+
+    entry = None
+    for name in data_names:
+        entry = metric_entries.get((name, node_num))
+        if entry:
+            break
     if not entry:
         return {}
     if min_recall is None:
         return dict(entry)
-    return {r: q for r, q in entry.items() if r >= min_recall}
+    return {r: v for r, v in entry.items() if r >= min_recall}
 
 
 # ============================================================
@@ -512,6 +538,16 @@ def collect_compare(args):
                 if file_params.get('replication') != args.replication:
                     continue
 
+            filter_partition_mode = getattr(args, 'filter_partition_mode', None)
+            if not is_weaviate and not file_params.get('shard') and filter_partition_mode is not None:
+                if file_params.get('partition_mode') != filter_partition_mode:
+                    continue
+
+            filter_layer = getattr(args, 'filter_layer', None)
+            if not is_weaviate and not file_params.get('shard') and filter_layer is not None:
+                if file_params.get('layer') != filter_layer:
+                    continue
+
             # --global 模式：排除 layer 文件，no-layer 数据归为 global
             is_global = getattr(args, 'global', False)
             if is_global and not is_weaviate and file_params.get('layer'):
@@ -547,17 +583,17 @@ def collect_compare(args):
         except Exception as e:
             print(f"Skipping {f}: {e}")
 
-    if args.y == 'qps' and recall_x:
-        cotra_pts = lookup_cotra_qps(args.data_name, args.node_num,
-                                     min_recall=getattr(args, 'min_recall', None))
+    if recall_x:
+        cotra_pts = lookup_cotra_metric(args.y, args.data_name, args.node_num,
+                                        min_recall=getattr(args, 'min_recall', None))
         if cotra_pts:
             mode_points['cotra'] = dict(cotra_pts)
             mode_labels['cotra'] = 'CoTra'
-            for r, q in sorted(cotra_pts.items()):
-                print(f"[CoTra] hardcoded | {args.x}={r} | {args.y}={q}"
+            for r, v in sorted(cotra_pts.items()):
+                print(f"[CoTra] hardcoded | {args.x}={r} | {args.y}={v}"
                       f" | data_name={args.data_name} node_num={args.node_num}")
-        else:
-            print(f"[CoTra] no hardcoded entry for data_name={args.data_name},"
+        elif getattr(args, 'cotra', False):
+            print(f"[CoTra] no hardcoded entry for y={args.y}, data_name={args.data_name},"
                   f" node_num={args.node_num} — skipping CoTra")
 
     # --recall 模式：对每个 (mode, x_val) 选 recall 最接近目标的
@@ -830,20 +866,20 @@ def collect_group(args):
         return None
 
     # 转为 {label: [(x, y), ...]} 格式，按 group_val 排序
-    # 对 group_by=node_num + recall × qps 的图，紧跟着每个 node_num 注入 CoTra 实测点
-    inject_cotra = (group_by == 'node_num' and recall_x and args.y == 'qps')
+    # 对 group_by=node_num + recall 图，紧跟着每个 node_num 注入 CoTra 实测点
+    inject_cotra = (group_by == 'node_num' and recall_x)
     series_data = {}
     for gval in sorted(group_points.keys()):
         label = _format_group_label(group_by, gval)
         series_data[label] = sorted(group_points[gval].items(), key=lambda p: p[0])
         if inject_cotra:
-            cotra_pts = lookup_cotra_qps(args.data_name, gval,
-                                         min_recall=getattr(args, 'min_recall', None))
+            cotra_pts = lookup_cotra_metric(args.y, args.data_name, gval,
+                                            min_recall=getattr(args, 'min_recall', None))
             if cotra_pts:
                 cotra_label = f"{gval} Nodes (CoTra)"
                 series_data[cotra_label] = sorted(cotra_pts.items())
-                for r, q in sorted(cotra_pts.items()):
-                    print(f"[{cotra_label}] hardcoded | {args.x}={r} | {args.y}={q}")
+                for r, v in sorted(cotra_pts.items()):
+                    print(f"[{cotra_label}] hardcoded | {args.x}={r} | {args.y}={v}")
 
     return series_data
 
@@ -1337,6 +1373,12 @@ def run_draw(args):
                     mode_labels.pop(mk, None)
                     if mode_debug:
                         mode_debug.pop(mk, None)
+
+        label_overrides = getattr(args, 'label_overrides', None)
+        if label_overrides:
+            for mk, label in label_overrides.items():
+                if mk in mode_labels:
+                    mode_labels[mk] = label
 
         if not any(mode_points.values()):
             print("No valid data points after mode filtering.")

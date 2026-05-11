@@ -56,6 +56,26 @@ PER_NODE_TASKS = [
         "grid": {"x": ["avg_recall@10"], "y": ["avg_remote_transfer_cnt"],
                  "replication": [2]},
     },
+    # --- compare: recall vs communication count (Ours + CoTra only), layer ---
+    {
+        "chart": "bar", "mode": "compare",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_remote_transfer_cnt"],
+                 "replication": [0, 1, 2], "partition_mode": ["k-means"], "layer": [True],
+                 "shard": [False], "no_layer": [False], "global": [False],
+                 "weaviate": [False], "cotra": [True],
+                 "label_overrides": [{"layer": "Ours"}],
+                 "output_tag": ["ours"]},
+    },
+    # --- compare: recall vs communication count (Ours + CoTra only), no-layer ---
+    {
+        "chart": "bar", "mode": "compare",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_remote_transfer_cnt"],
+                 "replication": [0, 1, 2], "partition_mode": ["k-means"], "layer": [False],
+                 "shard": [False], "no_layer": [True], "global": [False],
+                 "weaviate": [False], "cotra": [True],
+                 "label_overrides": [{"no-layer": "Ours"}],
+                 "output_tag": ["ours"]},
+    },
     # --- compare: ef_search vs qps ---
     {
         "chart": "line", "mode": "compare",
@@ -223,6 +243,8 @@ DEFAULTS = {
     "debug": False,
     "split": False,
     "vertical": False,
+    "label_overrides": None,
+    "output_tag": None,
 }
 
 
@@ -232,6 +254,10 @@ def make_args(chart, mode, params, debug=False):
     d["chart"] = chart
     d["mode"] = mode
     d["debug"] = debug
+    if "partition_mode" in params:
+        d["filter_partition_mode"] = params["partition_mode"]
+    if "layer" in params:
+        d["filter_layer"] = params["layer"]
     d.update(params)
     # Route output to ./plot/<data_name>/{pdf,png}
     if d.get("data_name"):

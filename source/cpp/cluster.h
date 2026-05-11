@@ -916,6 +916,7 @@ public:
 
     // 分区模式标识（控制向量在节点间的分配策略，如 round_robin、kmeans 等）
     std::string partition_mode;
+    std::string layer_partition_mode;
     std::unordered_map<int, std::vector<int>> layer_config;
     std::vector<bool> layer_replicate_flags;
 
@@ -947,6 +948,16 @@ public:
         {
             nodes.emplace_back(Node<T>(i, this, nullptr));
         }
+    }
+
+    uint64_t infer_replication_num_from_routes() const
+    {
+        uint64_t inferred_replication_num = 0;
+        for (const auto &level_map : vector_node_map)
+            for (const auto &kv : level_map)
+                if (kv.second.size() > 1)
+                    inferred_replication_num += (uint64_t)(kv.second.size() - 1);
+        return inferred_replication_num;
     }
 
     ~Cluster()
@@ -1412,6 +1423,7 @@ public:
         partition_mode = mode;
         replication_level = replication;
         replication_num = 0;
+        this->layer_partition_mode = layer_partition_mode;
         this->layer_replicate_flags = layer_replicate_flags;
 
         int max_level = hnsw->max_level;
@@ -2230,6 +2242,12 @@ public:
                 std::filesystem::create_directories(p.parent_path());
 
             json routing_json_obj;
+            routing_json_obj["partition_mode"] = partition_mode;
+            routing_json_obj["layer_partition_mode"] = layer_partition_mode;
+            routing_json_obj["replication_level"] = replication_level;
+            routing_json_obj["replication_num"] = replication_num;
+            routing_json_obj["layer_config"] = layer_config;
+            routing_json_obj["layer_replicate_flags"] = layer_replicate_flags;
             routing_json_obj["vector_node_map"] = json::array();
             for (const auto &level_map : vector_node_map) {
                 json level_json = json::object();
@@ -2283,6 +2301,18 @@ public:
             std::string routing_json_string(routing_json_length, '\0');
             input_file.read(&routing_json_string[0], routing_json_length);
             json routing_json_obj = json::parse(routing_json_string);
+            partition_mode = routing_json_obj.value("partition_mode", partition_mode);
+            layer_partition_mode = routing_json_obj.value("layer_partition_mode", layer_partition_mode);
+            replication_level = routing_json_obj.value("replication_level", replication_level);
+            replication_num = routing_json_obj.value("replication_num", replication_num);
+            if (routing_json_obj.contains("layer_config") && routing_json_obj["layer_config"].is_object())
+            {
+                layer_config.clear();
+                for (auto const &kv : routing_json_obj["layer_config"].items())
+                    layer_config[std::stoi(kv.key())] = kv.value().get<std::vector<int>>();
+            }
+            if (routing_json_obj.contains("layer_replicate_flags") && routing_json_obj["layer_replicate_flags"].is_array())
+                layer_replicate_flags = routing_json_obj["layer_replicate_flags"].get<std::vector<bool>>();
             if (routing_json_obj.contains("vector_node_map") && routing_json_obj["vector_node_map"].is_array())
             {
                 vector_node_map.clear();
@@ -2291,6 +2321,8 @@ public:
                     for (auto const &kv : routing_json_obj["vector_node_map"][level].items())
                         vector_node_map[level][std::stoi(kv.key())] = kv.value().get<std::vector<int>>();
             }
+            if (replication_num == 0 && !vector_node_map.empty())
+                replication_num = infer_replication_num_from_routes();
 
             input_file.seekg(0, std::ios::end);
             size_t total_size = input_file.tellg();
@@ -2342,6 +2374,7 @@ public:
 
         cluster->bandwidth = j.value("bandwidth", 1000.0);
         cluster->partition_mode = j.value("partition_mode", "");
+        cluster->layer_partition_mode = j.value("layer_partition_mode", "");
         cluster->outer_ring_max_iterations = j.value("outer_ring_max_iterations", 0);
         cluster->replication_level = j.value("replication_level", 0);
         cluster->replication_num = j.value("replication_num", (uint64_t)0);
@@ -3388,8 +3421,9 @@ void Node<T>::handle_sdk_client(int client_fd)
                     cj["node_num"] = cluster->node_num;
                     cj["bandwidth"] = cluster->bandwidth;
                     cj["partition_mode"] = cluster->partition_mode;
+                    cj["layer_partition_mode"] = cluster->layer_partition_mode;
                     cj["replication_level"] = cluster->replication_level;
-                    cj["replication_num"] = cluster->replication_num;
+                    cj["replication_num"] = cluster->replication_num ? cluster->replication_num : cluster->infer_replication_num_from_routes();
                     cj["is_distributed"] = cluster->is_distributed;
                     cj["is_shard"] = cluster->is_shard;
                     cj["is_global_pull"] = cluster->is_global_pull;

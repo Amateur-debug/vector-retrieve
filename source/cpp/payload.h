@@ -64,7 +64,7 @@ struct Payload {
     // 折返次数累计：target_node_id 命中 recent_nodes 的次数。
     int backtrack_cnt = 0;
 
-    // 跨节点序列化传输的已访问向量 vid 列表（外部 ID）。
+    // 跨节点序列化传输的已访问向量 vid 列表（外部 ID），表示距离已计算。
     // 选用 vector<int> 而非 set：序列化走单次 bulk memcpy，成本最低。
     // 节点内部本地向量的 visited 判重仍由 VisitedListPool（基于 internal_id）独立管理；
     // 远程邻居的 O(1) 去重由 search_layer_query 内部的局部 remote_visited_set 承担。

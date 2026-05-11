@@ -329,6 +329,7 @@ class VectorRetrieveRunner:
 
         self.graph_path = args.graph_path
         self.cluster_path = args.cluster_path
+        self.loaded_partitioned_graphs = False
 
         self.k = args.k
         self.m = args.m
@@ -763,6 +764,7 @@ class VectorRetrieveRunner:
                 route_client.init_routes()  # init_routes 内部会用临时连接获取路由，不需先 connect
                 route_client.load_cluster_all(cluster_base)
                 route_client.disconnect()
+                self.loaded_partitioned_graphs = True
                 print("Partitioned graphs loaded, skipping partition.")
                 # 加载后更新所有节点的 ef_search（分区图可能用不同的 ef 构建）
                 print(f"Setting ef_search={self.ef_search} on all worker nodes...")
@@ -1056,6 +1058,10 @@ class VectorRetrieveRunner:
         save_dir = "./save"
         os.makedirs(save_dir, exist_ok=True)
         if self.args.distributed:
+            if self.loaded_partitioned_graphs:
+                print("Skipping full HNSW save: partitioned graphs were loaded directly.")
+                return
+
             base = (f"{save_dir}/hnsw-{self.data_name}-m{self.m}-"
                     f"efc{self.ef_construction}-ll{self.limited_level}")
             hnsw_path = f"{base}.bin"
@@ -1406,11 +1412,21 @@ class VectorRetrieveRunner:
             "limited_level": hnsw_info.get("limited_level") if hnsw_info else self.limited_level,
             "max_level": hnsw_info.get("max_level") if hnsw_info else self.limited_level,
         }
+        info_partition_mode = cluster_info.get("partition_mode") if cluster_info else None
+        info_layer_partition_mode = cluster_info.get("layer_partition_mode") if cluster_info else None
+        info_replication_level = cluster_info.get("replication_level") if cluster_info else None
+        info_replication_num = cluster_info.get("replication_num") if cluster_info else None
+
+        effective_partition_mode = info_partition_mode or ("layer" if self.use_layer else self.partition_mode)
+        effective_layer_partition_mode = info_layer_partition_mode or (self.partition_mode if effective_partition_mode == "layer" else "")
+        effective_replication_level = info_replication_level if info_replication_level not in (None, 0) else self.replication
+        effective_replication_num = info_replication_num if info_replication_num is not None else 0
+
         cluster_params = {
             "node_num": cluster_info.get("node_num") if cluster_info else self.node_num,
-            "partition_mode": cluster_info.get("partition_mode") if cluster_info else self.partition_mode,
-            "replication_level": cluster_info.get("replication_level") if cluster_info else self.replication,
-            "replication_num": cluster_info.get("replication_num") if cluster_info else 0,
+            "partition_mode": effective_partition_mode,
+            "replication_level": effective_replication_level,
+            "replication_num": effective_replication_num,
             "bandwidth": cluster_info.get("bandwidth") if cluster_info else 0,
             "is_distributed": cluster_info.get("is_distributed") if cluster_info else True,
             "is_shard": cluster_info.get("is_shard") if cluster_info else self.args.shard,
@@ -1418,7 +1434,7 @@ class VectorRetrieveRunner:
             "max_track_num": self.max_track_num,
         }
         if cluster_params["partition_mode"] == "layer":
-            cluster_params["layer_partition_mode"] = self.partition_mode
+            cluster_params["layer_partition_mode"] = effective_layer_partition_mode
             cluster_params["layer_config"] = cluster_info.get("layer_config") if cluster_info else self.layer_config
             cluster_params["layer_replicate_flags"] = cluster_info.get("layer_replicate_flags") if cluster_info else self.layer_replicate_flags
 

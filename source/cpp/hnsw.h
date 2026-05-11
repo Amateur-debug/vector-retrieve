@@ -43,6 +43,7 @@
 #include "payload.h"
 #include "distance.h"
 #include "visited.h"
+#include "log.h"
 
 template <typename T>
 class HNSWGraph
@@ -1078,10 +1079,25 @@ public:
         unsigned short visited_tag = vl->cur_tag;
 
         bool is_compacted = !local_vids_.empty();
+        const bool arrived_from_transfer = payload.continue_search;
+        const int arrived_require_id = payload.require_id;
+        const bool arrived_for_pending = arrived_from_transfer && !payload.pending_vids.empty() &&
+                                         payload.pending_vids.front() == arrived_require_id;
+        const bool arrived_for_entry = arrived_from_transfer && !arrived_for_pending &&
+                                       arrived_require_id >= 0 && payload.entry_point_id == arrived_require_id;
+        const bool arrived_for_candidate = arrived_from_transfer && !arrived_for_pending &&
+                                           !arrived_for_entry && arrived_require_id >= 0;
+        if (arrived_from_transfer && arrived_require_id >= 0 && is_compacted &&
+            label_lookup_.find(arrived_require_id) == label_lookup_.end())
+        {
+            LOG_INFO_STREAM("[HNSW] transfer arrived but require_id is not local: vid="
+                            << arrived_require_id << " level=" << level
+                            << " start_level=" << payload.start_level
+                            << " local_count=" << cur_element_count_.load());
+        }
 
         // 远程 vid 的访问判重集合（主循环展开远程邻居时做 O(1) 去重）
         std::unordered_set<int> remote_visited_set;
-
         // 预分配 visited_vids 容量，减少搜索过程中 push_back 触发的动态扩容
         payload.reserve_visited(ef + 16);
 
@@ -1181,48 +1197,14 @@ public:
         // ---- 搜索主循环：堆内 (dist, key) 以 iid 编码 ----
         DistT lower_bound = payload.results.empty() ? std::numeric_limits<DistT>::max() : payload.results.top().first;
 
-        while (!payload.candidates.empty())
-        {
-            auto [cand_dist, cand_key] = payload.candidates.top();
-            if (cand_dist > lower_bound)
-                break;
-            payload.candidates.pop();
-
-            int cur_node;
-            if (cand_key >= 0)
-            {
-                cur_node = cand_key;
-            }
-            else
-            {
-                int remote_vid = -(cand_key + 1);
-                if (is_compacted)
-                {
-                    // 修复：candidates heap 里可能持有"已经在 native node 上 visited
-                    // 过的 remote vid"——它的条目是从早些探索路径上加进来的，序列化/反序列化
-                    // 跨节点后这里又出现。如果不检查 remote_visited_set 就推回去转发，
-                    // 会形成 "转发→pending 全 visited 跳过→主循环 pop 同一 remote→再转发"
-                    // 的 dead loop。检查后直接丢弃这个候选，不影响结果（它的 vid 已经
-                    // 在 visited_vids 里被算过距离并入过 results 堆）。
-                    if (remote_visited_set.count(remote_vid))
-                        continue;
-                    payload.candidates.push({cand_dist, cand_key});
-                    payload.continue_search = true;
-                    payload.require_id = remote_vid;
-                    payload.start_level = level;
-                    visited_pool_->release_list(vl);
-                    return;
-                }
-                continue;
-            }
-
+        auto expand_local_node = [&](int cur_node) -> bool {
             int *ll_cur;
             if (level == 0)
                 ll_cur = get_linklist0(cur_node);
             else
             {
                 if (element_levels_[cur_node] < level)
-                    continue;
+                    return false;
                 ll_cur = get_linklist(cur_node, level);
             }
 
@@ -1286,6 +1268,52 @@ public:
                 payload.continue_search = true;
                 payload.require_id = payload.pending_vids.front();
                 payload.start_level = level;
+                return true;
+            }
+            return false;
+        };
+
+        if (arrived_for_candidate)
+        {
+            auto it = label_lookup_.find(arrived_require_id);
+            if (it == label_lookup_.end())
+            {
+                payload.continue_search = true;
+                payload.require_id = arrived_require_id;
+                payload.start_level = level;
+                visited_pool_->release_list(vl);
+                return;
+            }
+            if (expand_local_node(it->second))
+            {
+                visited_pool_->release_list(vl);
+                return;
+            }
+        }
+
+        while (!payload.candidates.empty())
+        {
+            auto [cand_dist, cand_key] = payload.candidates.top();
+            if (cand_dist > lower_bound)
+                break;
+            payload.candidates.pop();
+
+            if (cand_key < 0)
+            {
+                int remote_vid = -(cand_key + 1);
+                if (is_compacted)
+                {
+                    payload.continue_search = true;
+                    payload.require_id = remote_vid;
+                    payload.start_level = level;
+                    visited_pool_->release_list(vl);
+                    return;
+                }
+                continue;
+            }
+
+            if (expand_local_node(cand_key))
+            {
                 visited_pool_->release_list(vl);
                 return;
             }
