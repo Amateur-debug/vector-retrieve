@@ -70,6 +70,26 @@ _SDK_CLS = None
 _SDK_IP = None
 _SDK_PORT = None
 _COMM_MODE = None
+_TIMING_FIELDS = (
+    "total_ms",
+    "search_ms",
+    "serialize_ms",
+    "deserialize_ms",
+    "queue_ms",
+    "result_ms",
+    "network_ms",
+)
+
+
+def _payload_network_ms(payload):
+    residual = (
+        getattr(payload, "total_ms", 0.0)
+        - getattr(payload, "search_ms", 0.0)
+        - getattr(payload, "serialize_ms", 0.0)
+        - getattr(payload, "deserialize_ms", 0.0)
+        - getattr(payload, "result_ms", 0.0)
+    )
+    return max(0.0, residual)
 
 def _pool_init(dtype, sdk_ip, sdk_port, comm_mode,
                query_path, groundtruth_path, query_rank, query_world_size):
@@ -147,6 +167,7 @@ def _do_round(args_tuple):
         qid_base = query_rank * _NUM_QUERIES * num_query_threads
 
         recall_results, remote_transfer_cnt, remote_transfer_data, distance_cnt, backtrack_cnt, pull_cnt, pull_data = {}, {}, {}, {}, {}, {}, {}
+        timing_stats = {field: {} for field in _TIMING_FIELDS}
 
         PIPELINE_DEPTH = 16
         pending = {}
@@ -169,6 +190,11 @@ def _do_round(args_tuple):
                 backtrack_cnt[orig_idx] = ret_payload.backtrack_cnt
                 pull_cnt[orig_idx] = ret_payload.pull_cnt
                 pull_data[orig_idx] = ret_payload.pull_data
+                for field in _TIMING_FIELDS:
+                    if field == "network_ms":
+                        timing_stats[field][orig_idx] = _payload_network_ms(ret_payload)
+                    else:
+                        timing_stats[field][orig_idx] = getattr(ret_payload, field, 0.0)
                 received += 1
             # 最后一次 send 不打 periodic 日志（received 还差 pipeline 深度，会误导成"没收完"）
             # 改由下面 drain 完成后的 "done" 日志统一汇报最终 sent/received
@@ -186,6 +212,11 @@ def _do_round(args_tuple):
             backtrack_cnt[orig_idx] = ret_payload.backtrack_cnt
             pull_cnt[orig_idx] = ret_payload.pull_cnt
             pull_data[orig_idx] = ret_payload.pull_data
+            for field in _TIMING_FIELDS:
+                if field == "network_ms":
+                    timing_stats[field][orig_idx] = _payload_network_ms(ret_payload)
+                else:
+                    timing_stats[field][orig_idx] = getattr(ret_payload, field, 0.0)
             received += 1
 
         query_time = time.time() - actual_start
@@ -215,6 +246,7 @@ def _do_round(args_tuple):
             "backtrack_cnt": backtrack_cnt,
             "pull_cnt": pull_cnt,
             "pull_data": pull_data,
+            "timing_stats": timing_stats,
         }
     except Exception as e:
         print(f"[pid={my_pid}] _do_round run={run_idx} tid={thread_id} "
@@ -323,6 +355,7 @@ if __name__ == '__main__':
     all_backtrack_cnt = {}
     all_pull_cnt = {}
     all_pull_data = {}
+    all_timing_stats = {field: {} for field in _TIMING_FIELDS}
     for s in last_round_results:
         all_recall.update(s["recall"])
         all_remote_transfer_cnt.update(s["remote_transfer_cnt"])
@@ -331,6 +364,8 @@ if __name__ == '__main__':
         all_backtrack_cnt.update(s["backtrack_cnt"])
         all_pull_cnt.update(s["pull_cnt"])
         all_pull_data.update(s["pull_data"])
+        for field in _TIMING_FIELDS:
+            all_timing_stats[field].update(s.get("timing_stats", {}).get(field, {}))
 
     # ---------- QPS：>=3 轮去掉极值再平均 ----------
     if args.num_runs >= 3:
@@ -364,6 +399,8 @@ if __name__ == '__main__':
         "pull_cnt": {str(k): v for k, v in all_pull_cnt.items()},
         "pull_data": {str(k): v for k, v in all_pull_data.items()},
     }
+    for field in _TIMING_FIELDS:
+        results[field] = {str(k): v for k, v in all_timing_stats[field].items()}
 
     avg_recall = sum(all_recall.values()) / len(all_recall) if all_recall else 0
     results[f"avg_recall@{args.k}"] = avg_recall

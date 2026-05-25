@@ -31,6 +31,9 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include <condition_variable>
 #include <cstring>
@@ -137,6 +140,12 @@ private:
 template <typename T>
 class Cluster; // 前向声明
 
+inline double steady_now_ms()
+{
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // 异步 SDK 查询完成队列：每个 SDK 连接一个，支持 reader/writer 双线程模型
 template <typename T>
 struct SDKCompletionQueue {
@@ -189,6 +198,7 @@ struct ReduceQueryAccumulator {
     std::mutex mu;
     std::vector<std::pair<DistT, int>> all_results;
     Payload<DistT> merged_payload;
+    double query_start_ms = 0.0;
     std::shared_ptr<SDKCompletionQueue<T>> completion_queue;
     std::function<void()> cleanup_fn;   // 完成后从 map 中移除自己
 
@@ -201,6 +211,13 @@ struct ReduceQueryAccumulator {
             merged_payload.remote_transfer_cnt += payload.remote_transfer_cnt;
             merged_payload.remote_transfer_data += payload.remote_transfer_data;
             merged_payload.backtrack_cnt += payload.backtrack_cnt;
+            merged_payload.search_ms += payload.search_ms;
+            merged_payload.serialize_ms += payload.serialize_ms;
+            merged_payload.deserialize_ms += payload.deserialize_ms;
+            merged_payload.send_ms += payload.send_ms;
+            merged_payload.recv_ms += payload.recv_ms;
+            merged_payload.queue_ms += payload.queue_ms;
+            merged_payload.result_ms += payload.result_ms;
             count = received_count.fetch_add(1) + 1;
         }
         if (count == total_nodes) {
@@ -211,6 +228,8 @@ struct ReduceQueryAccumulator {
             final_ids.reserve(limit);
             for (size_t i = 0; i < limit; i++)
                 final_ids.push_back(all_results[i].second);
+            if (query_start_ms != 0.0)
+                merged_payload.total_ms = steady_now_ms() - query_start_ms;
             completion_queue->push({query_id, std::move(final_ids), std::move(merged_payload)});
             if (cleanup_fn) cleanup_fn();
         }
@@ -235,7 +254,8 @@ enum MessageType
     MSG_SET_HNSW_PARAMS = 13,   // 运行时更新 HNSW 参数（如 ef_search）
     MSG_QUERY_SHARD = 14,      // 异步 shard 查询请求（远程节点执行本地查询后通过 MSG_SHARD_RESULT 回传）
     MSG_SHARD_RESULT = 15,     // shard 查询结果异步回传（携带 distance+vid 对，用于合并排序）
-    MSG_FETCH_VECTOR = 16      // global-pull 模式：按 vid 同步拉取远程节点的向量数据
+    MSG_FETCH_VECTOR = 16,     // global-pull 模式：按 vid 同步拉取远程节点的向量数据
+    MSG_RELEASE_FULL_HNSW = 17
 };
 
 // 序列化/反序列化辅助缓冲区（用于 HNSW 图的网络传输、分布式同步和持久化存储）
@@ -334,7 +354,9 @@ template <typename T> class HNSWGraph;
 template <typename T>
 void serialize_payload(Buffer &buf, Payload<DistTOf<T>> &payload, const HNSWGraph<T> *graph)
 {
-    // 标量字段打包：一次 memcpy 写入所有标量
+    double timing_start_ms = steady_now_ms();
+    // 标量字段打包：先写占位 header，完成后回填本次 serialize_ms。
+    size_t header_pos = buf.data.size();
     PayloadHeader header = payload.to_header();
     buf.write_val(header);
 
@@ -367,14 +389,23 @@ void serialize_payload(Buffer &buf, Payload<DistTOf<T>> &payload, const HNSWGrap
             for (const auto& item : vec) tmp.emplace_back(item);
         }
         buf.write(tmp.data(), (size_t)n * sizeof(std::pair<DistT, int>));
+        if (tmp.capacity() > 4096)
+            std::vector<std::pair<DistT, int>>().swap(tmp);
     };
     write_pq(PQAccessor<decltype(payload.candidates)>::get_container(payload.candidates));
     write_pq(PQAccessor<decltype(payload.results)>::get_container(payload.results));
+
+    payload.serialize_ms += steady_now_ms() - timing_start_ms;
+    header = payload.to_header();
+    std::memcpy(buf.data.data() + header_pos, &header, sizeof(PayloadHeader));
 }
 
 template <typename T>
 void deserialize_payload(Buffer &buf, Payload<DistTOf<T>> &payload, const HNSWGraph<T> *graph)
 {
+    double timing_start_ms = steady_now_ms();
+    auto timing_guard = [&]() { payload.deserialize_ms += steady_now_ms() - timing_start_ms; };
+    struct Guard { decltype(timing_guard) &fn; ~Guard() { fn(); } } guard{timing_guard};
     // 标量字段打包：一次 memcpy 读出所有标量
     PayloadHeader header = buf.read_val<PayloadHeader>();
     payload.from_header(header);
@@ -522,7 +553,7 @@ HNSWGraph<T> *deserialize_hnsw(Buffer &buf)
 // 序列化 HNSW 子集：保留完整的邻接结构（图骨架），但只传输指定子集的向量数据
 // 非本地向量的数据区清零以节省带宽，接收方通过 local_vids_ 区分本地/远程节点
 template <typename T>
-void serialize_hnsw_subset(Buffer &buf, const HNSWGraph<T> *hnsw, const std::unordered_set<int> &local_vids)
+void serialize_hnsw_subset(Buffer &buf, const HNSWGraph<T> *hnsw, const std::unordered_set<int> &local_vids, const std::unordered_map<int, int> *vid_ring = nullptr, int replication_level = 0)
 {
     size_t cur_count = hnsw->cur_element_count_.load();
     size_t vec_bytes = hnsw->dim * sizeof(T);
@@ -582,6 +613,30 @@ void serialize_hnsw_subset(Buffer &buf, const HNSWGraph<T> *hnsw, const std::uno
             size_t link_size = hnsw->size_links_per_element_ * link_level;
             buf.write(hnsw->link_lists_[i], link_size);
         }
+    }
+
+    uint32_t ring_magic = 0x474e4952;
+    buf.write_val(ring_magic);
+    int stored_replication_level = replication_level ? replication_level : hnsw->replication_level_;
+    buf.write_val(stored_replication_level);
+    buf.write_val((uint64_t)local_vids.size());
+    for (int vid : local_vids)
+    {
+        int ring = 0;
+        if (vid_ring)
+        {
+            auto it = vid_ring->find(vid);
+            if (it != vid_ring->end() && stored_replication_level > 0 && it->second == stored_replication_level)
+                ring = stored_replication_level;
+        }
+        else
+        {
+            auto it = hnsw->label_lookup_.find(vid);
+            if (it != hnsw->label_lookup_.end() && stored_replication_level > 0 && hnsw->is_iid_outermost(it->second))
+                ring = stored_replication_level;
+        }
+        buf.write_val(vid);
+        buf.write_val(ring);
     }
 }
 
@@ -661,6 +716,19 @@ HNSWGraph<T> *deserialize_hnsw_subset(Buffer &buf, bool do_compact = true)
 
     LOG_DEBUG_STREAM("Deserialized HNSW subset: " << cur_count << " elements, " << hnsw->local_vids_.size() << " local vids.");
 
+    uint32_t ring_magic = buf.read_val<uint32_t>();
+    if (ring_magic != 0x474e4952)
+        throw std::runtime_error("deserialize_hnsw_subset: missing RING section");
+    hnsw->replication_level_ = buf.read_val<int>();
+    uint64_t ring_count = buf.read_val<uint64_t>();
+    hnsw->local_vid_ring_.reserve(ring_count);
+    for (uint64_t i = 0; i < ring_count; i++)
+    {
+        int vid = buf.read_val<int>();
+        int ring = buf.read_val<int>();
+        hnsw->local_vid_ring_[vid] = ring;
+    }
+
     if (do_compact && hnsw->local_vids_.size() < cur_count)
     {
         // 紧凑重排：仅保留本地持有的向量，远程邻居以负数编码 -(vid+1) 表示
@@ -671,6 +739,20 @@ HNSWGraph<T> *deserialize_hnsw_subset(Buffer &buf, bool do_compact = true)
     {
         // 所有元素都是本地向量，图已经是紧凑格式，无需 compact
         hnsw->is_global_pull_mode_ = false;
+        hnsw->is_compacted_graph_ = true;
+        hnsw->resize_outermost_bits(hnsw->max_elements_);
+        if (hnsw->replication_level_ > 0)
+        {
+            for (uint64_t i = 0; i < cur_count; i++)
+            {
+                int vid = hnsw->get_external_label((int)i);
+                auto ring_it = hnsw->local_vid_ring_.find(vid);
+                if (ring_it != hnsw->local_vid_ring_.end() && ring_it->second == hnsw->replication_level_)
+                    hnsw->set_iid_outermost((int)i);
+            }
+        }
+        std::unordered_set<int>().swap(hnsw->local_vids_);
+        std::unordered_map<int, int>().swap(hnsw->local_vid_ring_);
         LOG_DEBUG_STREAM("Skipped compact (already compacted): " << cur_count << " local elements.");
     }
     else
@@ -684,10 +766,13 @@ HNSWGraph<T> *deserialize_hnsw_subset(Buffer &buf, bool do_compact = true)
     return hnsw;
 }
 
-void serialize_routing(Buffer &buf, const std::vector<std::unordered_map<int, std::vector<int>>> &maps)
+void serialize_routing(Buffer &buf,
+                       const std::vector<std::unordered_map<int, std::vector<int>>> &node_maps)
 {
-    buf.write_val((uint64_t)maps.size());
-    for (const auto &map : maps)
+    uint32_t magic = 0x54554f52;
+    buf.write_val(magic);
+    buf.write_val((uint64_t)node_maps.size());
+    for (const auto &map : node_maps)
     {
         buf.write_val((uint64_t)map.size());
         for (const auto &kv : map)
@@ -698,19 +783,23 @@ void serialize_routing(Buffer &buf, const std::vector<std::unordered_map<int, st
     }
 }
 
-void deserialize_routing(Buffer &buf, std::vector<std::unordered_map<int, std::vector<int>>> &maps)
+void deserialize_routing(Buffer &buf,
+                         std::vector<std::unordered_map<int, std::vector<int>>> &node_maps)
 {
+    uint32_t magic = buf.read_val<uint32_t>();
+    if (magic != 0x54554f52)
+        throw std::runtime_error("deserialize_routing: missing ROUT section");
+
     uint64_t levels = buf.read_val<uint64_t>();
-    maps.clear();
-    maps.resize(levels);
+    node_maps.clear();
+    node_maps.resize(levels);
     for (uint64_t l = 0; l < levels; ++l)
     {
         uint64_t size = buf.read_val<uint64_t>();
         for (uint64_t i = 0; i < size; ++i)
         {
             int k = buf.read_val<int>();
-            std::vector<int> v = buf.read_vec<int>();
-            maps[l][k] = std::move(v);
+            node_maps[l][k] = buf.read_vec<int>();
         }
     }
 }
@@ -911,6 +1000,12 @@ public:
     // 向量到路由节点的映射关系（按层级组织，用于分布式查询时确定目标节点）
     std::vector<std::unordered_map<int, std::vector<int>>> vector_node_map;
 
+    bool dense_level0_routes_enabled_ = false;
+    int dense_level0_min_vid_ = 0;
+    uint64_t dense_level0_count_ = 0;
+    uint8_t dense_level0_owner_width_ = 0;
+    std::vector<uint8_t> dense_level0_owner_bytes_;
+
     // 模拟网络带宽限制（单位：Mb/s，用于分布式场景下的性能评估和延迟模拟）
     double bandwidth = 1000.0;
 
@@ -928,6 +1023,7 @@ public:
     bool is_distributed = false;
     bool is_shard = false;
     bool is_global_pull = false;  // global-pull 模式：每节点保留完整图骨架，仅向量数据按节点分布，查询时按需远程拉取
+    bool owns_hnsw = false;
 
     std::atomic<int> add_round_robin_counter{0};
 
@@ -950,14 +1046,609 @@ public:
         }
     }
 
+    void release_full_hnsw()
+    {
+        if (!hnsw)
+            return;
+        for (const auto &node : nodes)
+            if (node.local_hnsw == hnsw)
+                return;
+        size_t released = hnsw->estimated_owned_bytes();
+        if (owns_hnsw)
+            delete hnsw;
+        else
+            hnsw->release_storage();
+        hnsw = nullptr;
+#if defined(__GLIBC__)
+        malloc_trim(0);
+#endif
+        LOG_INFO_STREAM("[release_full_hnsw] released full graph estimate=" << HNSWGraph<T>::format_bytes(released));
+    }
+
     uint64_t infer_replication_num_from_routes() const
     {
-        uint64_t inferred_replication_num = 0;
-        for (const auto &level_map : vector_node_map)
+        return 0;
+    }
+
+    size_t estimate_route_map_bytes(const std::vector<std::unordered_map<int, std::vector<int>>> &maps) const
+    {
+        size_t total = maps.capacity() * sizeof(std::unordered_map<int, std::vector<int>>);
+        for (const auto &level_map : maps)
+        {
+            total += level_map.bucket_count() * sizeof(void *);
             for (const auto &kv : level_map)
+                total += sizeof(std::pair<const int, std::vector<int>>) + sizeof(void *)
+                       + kv.second.capacity() * sizeof(int);
+        }
+        return total;
+    }
+
+    size_t dense_level0_route_bytes() const
+    {
+        return dense_level0_owner_bytes_.capacity();
+    }
+
+    void clear_dense_level0_routes()
+    {
+        dense_level0_routes_enabled_ = false;
+        dense_level0_min_vid_ = 0;
+        dense_level0_count_ = 0;
+        dense_level0_owner_width_ = 0;
+        std::vector<uint8_t>().swap(dense_level0_owner_bytes_);
+    }
+
+    void normalize_route_owners(std::vector<int> &owners) const
+    {
+        std::vector<int> cleaned;
+        cleaned.reserve(owners.size());
+        for (int node_id : owners)
+        {
+            if (node_id < 0 || node_id >= node_num)
+                continue;
+            if (std::find(cleaned.begin(), cleaned.end(), node_id) == cleaned.end())
+                cleaned.push_back(node_id);
+        }
+        owners.swap(cleaned);
+    }
+
+    std::vector<int> normalized_route_owners(const std::vector<int> &owners) const
+    {
+        std::vector<int> cleaned = owners;
+        normalize_route_owners(cleaned);
+        return cleaned;
+    }
+
+    int primary_from_route(const std::vector<int> &candidates) const
+    {
+        for (int node_id : candidates)
+            if (node_id >= 0 && node_id < node_num)
+                return node_id;
+        return -1;
+    }
+
+    void append_route_owner(int level, int vid, int node_id)
+    {
+        if (level < 0 || node_id < 0 || node_id >= node_num)
+            return;
+        if (level >= (int)vector_node_map.size())
+            vector_node_map.resize((size_t)level + 1);
+        auto &owners = vector_node_map[level][vid];
+        if (std::find(owners.begin(), owners.end(), node_id) == owners.end())
+            owners.push_back(node_id);
+    }
+
+    int current_local_node_id() const
+    {
+        for (int i = 0; i < node_num; i++)
+            if (!nodes[i].is_remote_node)
+                return i;
+        return -1;
+    }
+
+    bool choose_from_route(const std::vector<int> &owners, int current_node_id, uint64_t salt, int &owner_node_id) const
+    {
+        int valid_count = 0;
+        int nonlocal_count = 0;
+        for (int node_id : owners)
+        {
+            if (node_id < 0 || node_id >= node_num)
+                continue;
+            valid_count++;
+            if (node_id != current_node_id)
+                nonlocal_count++;
+        }
+        int target_count = nonlocal_count > 0 ? nonlocal_count : valid_count;
+        if (target_count <= 0)
+            return false;
+        int pick = (int)(salt % (uint64_t)target_count);
+        for (int node_id : owners)
+        {
+            if (node_id < 0 || node_id >= node_num)
+                continue;
+            if (nonlocal_count > 0 && node_id == current_node_id)
+                continue;
+            if (pick-- == 0)
+            {
+                owner_node_id = node_id;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool choose_route_owner(int level, int vid, int current_node_id, uint64_t salt, int &owner_node_id) const
+    {
+        if (level >= 0 && level < (int)vector_node_map.size())
+        {
+            auto it = vector_node_map[level].find(vid);
+            if (it != vector_node_map[level].end() && choose_from_route(it->second, current_node_id, salt, owner_node_id))
+                return true;
+        }
+        if (level == 0)
+            return lookup_dense_level0_owner(vid, owner_node_id);
+        return false;
+    }
+
+    bool lookup_dense_level0_owner(int vid, int &owner_node_id) const
+    {
+        if (!dense_level0_routes_enabled_ || dense_level0_owner_width_ == 0)
+            return false;
+        int64_t offset = (int64_t)vid - (int64_t)dense_level0_min_vid_;
+        if (offset < 0 || (uint64_t)offset >= dense_level0_count_)
+            return false;
+        size_t pos = (size_t)offset * dense_level0_owner_width_;
+        if (pos + dense_level0_owner_width_ > dense_level0_owner_bytes_.size())
+            return false;
+
+        uint32_t owner = 0;
+        if (dense_level0_owner_width_ == 1)
+        {
+            uint8_t v = dense_level0_owner_bytes_[pos];
+            if (v == std::numeric_limits<uint8_t>::max())
+                return false;
+            owner = v;
+        }
+        else if (dense_level0_owner_width_ == 2)
+        {
+            uint16_t v;
+            std::memcpy(&v, dense_level0_owner_bytes_.data() + pos, sizeof(v));
+            if (v == std::numeric_limits<uint16_t>::max())
+                return false;
+            owner = v;
+        }
+        else if (dense_level0_owner_width_ == 4)
+        {
+            uint32_t v;
+            std::memcpy(&v, dense_level0_owner_bytes_.data() + pos, sizeof(v));
+            if (v == std::numeric_limits<uint32_t>::max())
+                return false;
+            owner = v;
+        }
+        else
+        {
+            return false;
+        }
+
+        if (owner >= (uint32_t)node_num)
+            return false;
+        owner_node_id = (int)owner;
+        return true;
+    }
+
+    bool lookup_primary_owner(int level, int vid, int &owner_node_id) const
+    {
+        if (level == 0 && lookup_dense_level0_owner(vid, owner_node_id))
+            return true;
+        if (level < 0 || level >= (int)vector_node_map.size())
+            return false;
+        auto it = vector_node_map[level].find(vid);
+        if (it == vector_node_map[level].end())
+            return false;
+        int owner = primary_from_route(it->second);
+        if (owner < 0)
+            return false;
+        owner_node_id = owner;
+        return true;
+    }
+
+    void log_route_memory_breakdown(const std::string &prefix) const
+    {
+        auto log_maps = [&](const char *name, const std::vector<std::unordered_map<int, std::vector<int>>> &maps) {
+            size_t entries = 0;
+            size_t values = 0;
+            size_t buckets = 0;
+            size_t max_level_entries = 0;
+            for (const auto &level_map : maps)
+            {
+                entries += level_map.size();
+                buckets += level_map.bucket_count();
+                max_level_entries = std::max(max_level_entries, level_map.size());
+                for (const auto &kv : level_map)
+                    values += kv.second.size();
+            }
+            LOG_INFO_STREAM(prefix << " " << name << " memory estimate: total="
+                            << HNSWGraph<T>::format_bytes(estimate_route_map_bytes(maps))
+                            << ", levels=" << maps.size()
+                            << ", entries=" << entries
+                            << ", route_values=" << values
+                            << ", buckets=" << buckets
+                            << ", max_level_entries=" << max_level_entries);
+        };
+        log_maps("vector_node_map", vector_node_map);
+        if (dense_level0_routes_enabled_)
+        {
+            LOG_INFO_STREAM(prefix << " dense_level0_routes memory estimate: total="
+                            << HNSWGraph<T>::format_bytes(dense_level0_route_bytes())
+                            << ", min_vid=" << dense_level0_min_vid_
+                            << ", count=" << dense_level0_count_
+                            << ", owner_width=" << (int)dense_level0_owner_width_);
+        }
+    }
+
+    void log_cluster_memory_breakdown(const std::string &prefix) const
+    {
+        log_route_memory_breakdown(prefix);
+        size_t local_graph_total = 0;
+        for (const auto &node : nodes)
+        {
+            if (node.local_hnsw)
+            {
+                local_graph_total += node.local_hnsw->estimated_owned_bytes();
+                node.local_hnsw->log_memory_breakdown(prefix + " node" + std::to_string(node.node_id));
+            }
+        }
+        LOG_INFO_STREAM(prefix << " local_hnsw total estimate on this process=" << HNSWGraph<T>::format_bytes(local_graph_total));
+    }
+
+    static constexpr uint32_t partition_file_magic()
+    {
+        return 0x46505256; // VRPF
+    }
+
+    static constexpr uint32_t partition_route_magic()
+    {
+        return 0x54525250; // PRRT
+    }
+
+    uint8_t route_owner_width() const
+    {
+        if (node_num <= (int)std::numeric_limits<uint8_t>::max())
+            return 1;
+        if (node_num <= (int)std::numeric_limits<uint16_t>::max())
+            return 2;
+        return 4;
+    }
+
+    void write_owner_value(std::vector<uint8_t> &bytes, uint8_t width, size_t idx, uint32_t owner) const
+    {
+        size_t pos = idx * width;
+        if (width == 1)
+        {
+            bytes[pos] = (uint8_t)owner;
+        }
+        else if (width == 2)
+        {
+            uint16_t v = (uint16_t)owner;
+            std::memcpy(bytes.data() + pos, &v, sizeof(v));
+        }
+        else
+        {
+            uint32_t v = owner;
+            std::memcpy(bytes.data() + pos, &v, sizeof(v));
+        }
+    }
+
+    void serialize_partition_routing(Buffer &buf) const
+    {
+        buf.write_string(partition_mode);
+        buf.write_string(layer_partition_mode);
+        buf.write_val(replication_level);
+        buf.write_val(replication_num);
+        buf.write_val(node_num);
+        serialize_layer_config(buf, layer_config);
+        serialize_layer_replicate_flags(buf, layer_replicate_flags);
+
+        buf.write_val(partition_route_magic());
+        buf.write_val((uint32_t)2);
+        uint64_t levels = std::max<uint64_t>((uint64_t)vector_node_map.size(), dense_level0_routes_enabled_ ? 1 : 0);
+        buf.write_val(levels);
+
+        const auto *level0 = (!vector_node_map.empty()) ? &vector_node_map[0] : nullptr;
+        bool wrote_dense = false;
+        if (dense_level0_routes_enabled_)
+        {
+            buf.write_val((uint8_t)1);
+            buf.write_val(dense_level0_min_vid_);
+            buf.write_val(dense_level0_count_);
+            buf.write_val(dense_level0_owner_width_);
+            buf.write_val((uint64_t)dense_level0_owner_bytes_.size());
+            if (!dense_level0_owner_bytes_.empty())
+                buf.write(dense_level0_owner_bytes_.data(), dense_level0_owner_bytes_.size());
+            buf.write_val((uint64_t)0);
+            wrote_dense = true;
+        }
+        else if (level0 && !level0->empty())
+        {
+            int min_vid = std::numeric_limits<int>::max();
+            int max_vid = std::numeric_limits<int>::min();
+            uint64_t valid_entries = 0;
+            for (const auto &kv : *level0)
+            {
+                int owner = primary_from_route(kv.second);
+                if (owner < 0)
+                    continue;
+                min_vid = std::min(min_vid, kv.first);
+                max_vid = std::max(max_vid, kv.first);
+                valid_entries++;
+            }
+
+            uint8_t width = route_owner_width();
+            bool can_dense = valid_entries > 0 && min_vid >= 0 && max_vid >= min_vid;
+            uint64_t range = can_dense ? (uint64_t)((int64_t)max_vid - (int64_t)min_vid + 1) : 0;
+            if (can_dense)
+                can_dense = range <= valid_entries + valid_entries / 4 + 1024;
+            if (can_dense && range > (std::numeric_limits<size_t>::max() / width))
+                can_dense = false;
+
+            if (can_dense)
+            {
+                std::vector<uint8_t> dense_bytes((size_t)range * width, 0xff);
+                for (const auto &kv : *level0)
+                {
+                    int owner = primary_from_route(kv.second);
+                    if (owner < 0)
+                        continue;
+                    size_t idx = (size_t)((int64_t)kv.first - (int64_t)min_vid);
+                    write_owner_value(dense_bytes, width, idx, (uint32_t)owner);
+                }
+                buf.write_val((uint8_t)1);
+                buf.write_val(min_vid);
+                buf.write_val(range);
+                buf.write_val(width);
+                buf.write_val((uint64_t)dense_bytes.size());
+                buf.write(dense_bytes.data(), dense_bytes.size());
+                buf.write_val((uint64_t)0);
+                wrote_dense = true;
+            }
+        }
+
+        if (!wrote_dense)
+        {
+            buf.write_val((uint8_t)0);
+            uint64_t count = 0;
+            if (level0)
+            {
+                for (const auto &kv : *level0)
+                    if (!normalized_route_owners(kv.second).empty())
+                        count++;
+            }
+            buf.write_val(count);
+            if (level0)
+            {
+                for (const auto &kv : *level0)
+                {
+                    std::vector<int> owners = normalized_route_owners(kv.second);
+                    int owner = primary_from_route(owners);
+                    if (owner < 0)
+                        continue;
+                    buf.write_val(kv.first);
+                    buf.write_vec(std::vector<int>{owner});
+                }
+            }
+        }
+
+        for (uint64_t level = 1; level < levels; level++)
+        {
+            const auto *level_map = (level < vector_node_map.size()) ? &vector_node_map[level] : nullptr;
+            uint64_t count = 0;
+            if (level_map)
+            {
+                for (const auto &kv : *level_map)
+                    if (!normalized_route_owners(kv.second).empty())
+                        count++;
+            }
+            buf.write_val(count);
+            if (!level_map)
+                continue;
+            for (const auto &kv : *level_map)
+            {
+                std::vector<int> owners = normalized_route_owners(kv.second);
+                if (owners.empty())
+                    continue;
+                buf.write_val(kv.first);
+                buf.write_vec(owners);
+            }
+        }
+    }
+
+    void deserialize_partition_routing(Buffer &buf)
+    {
+        partition_mode = buf.read_string();
+        layer_partition_mode = buf.read_string();
+        replication_level = buf.read_val<int>();
+        replication_num = buf.read_val<uint64_t>();
+        int file_node_num = buf.read_val<int>();
+        if (file_node_num != node_num)
+            throw std::runtime_error("load_local: node_num mismatch in partition routing");
+        deserialize_layer_config(buf, layer_config);
+        deserialize_layer_replicate_flags(buf, layer_replicate_flags);
+
+        uint32_t route_magic = buf.read_val<uint32_t>();
+        if (route_magic != partition_route_magic())
+            throw std::runtime_error("load_local: missing PRRT route section");
+        uint32_t route_version = buf.read_val<uint32_t>();
+        if (route_version != 2)
+            throw std::runtime_error("load_local: unsupported partition route version");
+        uint64_t levels = buf.read_val<uint64_t>();
+        vector_node_map.clear();
+        vector_node_map.resize(levels);
+        clear_dense_level0_routes();
+
+        uint8_t level0_encoding = buf.read_val<uint8_t>();
+        if (level0_encoding == 1)
+        {
+            dense_level0_min_vid_ = buf.read_val<int>();
+            dense_level0_count_ = buf.read_val<uint64_t>();
+            dense_level0_owner_width_ = buf.read_val<uint8_t>();
+            if (dense_level0_owner_width_ != 1 && dense_level0_owner_width_ != 2 && dense_level0_owner_width_ != 4)
+                throw std::runtime_error("load_local: invalid dense owner width");
+            uint64_t bytes = buf.read_val<uint64_t>();
+            if (bytes != dense_level0_count_ * dense_level0_owner_width_)
+                throw std::runtime_error("load_local: dense route byte size mismatch");
+            if (bytes > (uint64_t)std::numeric_limits<size_t>::max())
+                throw std::runtime_error("load_local: dense route too large for this process");
+            dense_level0_owner_bytes_.resize((size_t)bytes);
+            if (bytes > 0)
+                buf.read(dense_level0_owner_bytes_.data(), (size_t)bytes);
+            dense_level0_routes_enabled_ = true;
+            uint64_t extra_count = buf.read_val<uint64_t>();
+            if (!vector_node_map.empty())
+                vector_node_map[0].reserve((size_t)std::min<uint64_t>(extra_count, (uint64_t)std::numeric_limits<size_t>::max()));
+            for (uint64_t i = 0; i < extra_count; i++)
+            {
+                int vid = buf.read_val<int>();
+                std::vector<int> owners = buf.read_vec<int>();
+                normalize_route_owners(owners);
+                if (!owners.empty() && !vector_node_map.empty())
+                    vector_node_map[0][vid] = std::move(owners);
+            }
+        }
+        else if (level0_encoding == 0)
+        {
+            uint64_t count = buf.read_val<uint64_t>();
+            if (!vector_node_map.empty())
+                vector_node_map[0].reserve((size_t)std::min<uint64_t>(count, (uint64_t)std::numeric_limits<size_t>::max()));
+            for (uint64_t i = 0; i < count; i++)
+            {
+                int vid = buf.read_val<int>();
+                std::vector<int> owners = buf.read_vec<int>();
+                normalize_route_owners(owners);
+                if (!owners.empty() && !vector_node_map.empty())
+                    vector_node_map[0][vid] = std::move(owners);
+            }
+        }
+        else
+        {
+            throw std::runtime_error("load_local: unknown level0 route encoding");
+        }
+
+        for (uint64_t level = 1; level < levels; level++)
+        {
+            uint64_t count = buf.read_val<uint64_t>();
+            vector_node_map[level].reserve((size_t)std::min<uint64_t>(count, (uint64_t)std::numeric_limits<size_t>::max()));
+            for (uint64_t i = 0; i < count; i++)
+            {
+                int vid = buf.read_val<int>();
+                std::vector<int> owners = buf.read_vec<int>();
+                normalize_route_owners(owners);
+                if (!owners.empty())
+                    vector_node_map[level][vid] = std::move(owners);
+            }
+        }
+        filter_routes_for_runtime();
+        if (buf.read_pos != buf.data.size())
+            throw std::runtime_error("load_local: trailing bytes in partition routing section");
+    }
+
+    std::string build_routing_json_string() const
+    {
+        json routing_json_obj;
+        routing_json_obj["partition_mode"] = partition_mode;
+        routing_json_obj["layer_partition_mode"] = layer_partition_mode;
+        routing_json_obj["replication_level"] = replication_level;
+        routing_json_obj["replication_num"] = replication_num;
+        routing_json_obj["layer_config"] = layer_config;
+        routing_json_obj["layer_replicate_flags"] = layer_replicate_flags;
+        routing_json_obj["vector_node_map"] = json::array();
+        for (const auto &level_map : vector_node_map)
+        {
+            json level_json = json::object();
+            for (const auto &kv : level_map)
+                level_json[std::to_string(kv.first)] = kv.second;
+            routing_json_obj["vector_node_map"].push_back(std::move(level_json));
+        }
+        return routing_json_obj.dump();
+    }
+
+    bool write_partition_file(const std::string &filepath,
+                              const std::unordered_set<int> &local_vids,
+                              const std::unordered_map<int, int> *local_vid_ring)
+    {
+        std::filesystem::path p(filepath);
+        if (p.has_parent_path())
+            std::filesystem::create_directories(p.parent_path());
+
+        Buffer routing_buf;
+        serialize_partition_routing(routing_buf);
+        Buffer subset_buf;
+        serialize_hnsw_subset(subset_buf, hnsw, local_vids, local_vid_ring, replication_level);
+
+        std::ofstream output_file(filepath, std::ios::binary);
+        if (!output_file)
+        {
+            LOG_INFO_STREAM("[partition nfs-load] Failed to open " << filepath << " for writing");
+            return false;
+        }
+        uint32_t magic = partition_file_magic();
+        uint32_t version = 2;
+        uint64_t routing_size = routing_buf.data.size();
+        output_file.write((char *)&magic, sizeof(uint32_t));
+        output_file.write((char *)&version, sizeof(uint32_t));
+        output_file.write((char *)&routing_size, sizeof(uint64_t));
+        output_file.write(routing_buf.data.data(), routing_buf.data.size());
+        output_file.write(subset_buf.data.data(), subset_buf.data.size());
+        if (!output_file)
+        {
+            LOG_INFO_STREAM("[partition nfs-load] Write failed for " << filepath);
+            return false;
+        }
+        LOG_INFO_STREAM("[partition nfs-load] Wrote " << filepath
+                        << " routing=" << HNSWGraph<T>::format_bytes(routing_buf.data.size())
+                        << " subset=" << HNSWGraph<T>::format_bytes(subset_buf.data.size())
+                        << " total=" << HNSWGraph<T>::format_bytes(sizeof(uint32_t) * 2 + sizeof(uint64_t) + routing_buf.data.size() + subset_buf.data.size()));
+        return true;
+    }
+
+    bool should_keep_full_route_level(int level) const
+    {
+        return level >= 0 && level < (int)layer_replicate_flags.size() && layer_replicate_flags[level];
+    }
+
+    void normalize_routes_primary_first()
+    {
+        for (auto &level_map : vector_node_map)
+        {
+            for (auto it = level_map.begin(); it != level_map.end(); )
+            {
+                normalize_route_owners(it->second);
+                if (it->second.empty())
+                    it = level_map.erase(it);
+                else
+                    ++it;
+            }
+        }
+    }
+
+    void filter_routes_for_runtime()
+    {
+        for (size_t level = 0; level < vector_node_map.size(); level++)
+        {
+            auto &level_map = vector_node_map[level];
+            if (should_keep_full_route_level((int)level))
+            {
+                for (auto &kv : level_map)
+                    normalize_route_owners(kv.second);
+                continue;
+            }
+            for (auto &kv : level_map)
+            {
+                normalize_route_owners(kv.second);
                 if (kv.second.size() > 1)
-                    inferred_replication_num += (uint64_t)(kv.second.size() - 1);
-        return inferred_replication_num;
+                    kv.second.resize(1);
+            }
+            if (level == 0 && dense_level0_routes_enabled_)
+                std::unordered_map<int, std::vector<int>>().swap(level_map);
+        }
     }
 
     ~Cluster()
@@ -1002,6 +1693,11 @@ public:
                 delete nodes[i].local_hnsw;
                 nodes[i].local_hnsw = nullptr;
             }
+        }
+        if (hnsw && owns_hnsw)
+        {
+            delete hnsw;
+            hnsw = nullptr;
         }
     }
 
@@ -1418,10 +2114,12 @@ public:
         return (int)removed.size();
     }
 
-    void partition(const string &mode, int replication = 1, const std::unordered_map<int, std::vector<int>> &layer_config = {}, const std::string &layer_partition_mode = "round_robin", const std::vector<bool> &layer_replicate_flags = {}, int num_threads = 0)
+    void partition(const string &mode, int replication = 1, const std::unordered_map<int, std::vector<int>> &layer_config = {}, const std::string &layer_partition_mode = "round_robin", const std::vector<bool> &layer_replicate_flags = {}, int num_threads = 0, const std::string &partition_distribution = "network-send", const std::string &partition_base = "")
     {
         partition_mode = mode;
         replication_level = replication;
+        if (hnsw)
+            hnsw->replication_level_ = replication;
         replication_num = 0;
         this->layer_partition_mode = layer_partition_mode;
         this->layer_replicate_flags = layer_replicate_flags;
@@ -1431,6 +2129,15 @@ public:
 
         // local_vids: 节点编号 -> 该节点持有的 vid 集合（不拷贝向量数据，零内存开销）
         vector<unordered_set<int>> local_vids(node_num);
+        vector<unordered_map<int, int>> local_vid_ring(node_num);
+        auto add_local_vid = [&](int node_id, int vid, int ring) {
+            if (node_id < 0 || node_id >= node_num)
+                return;
+            local_vids[node_id].insert(vid);
+            auto it = local_vid_ring[node_id].find(vid);
+            if (it == local_vid_ring[node_id].end() || ring < it->second)
+                local_vid_ring[node_id][vid] = ring;
+        };
 
         vector_node_map.clear();
         if (mode == "layer")
@@ -1445,7 +2152,7 @@ public:
                 int vid = hnsw->get_external_label((int)i);
                 int target = vid % node_num;
                 vector_node_map[0][vid] = {target};
-                local_vids[target].insert(vid);
+                add_local_vid(target, vid, 0);
             }
         }
         else if (mode == "k-means")
@@ -1458,7 +2165,7 @@ public:
                 int vid = hnsw->get_external_label((int)i);
                 int target = labels[i];
                 vector_node_map[0][vid] = {target};
-                local_vids[target].insert(vid);
+                add_local_vid(target, vid, 0);
             }
         }
         else if (mode == "outer_ring")
@@ -1472,7 +2179,7 @@ public:
                 int vid = hnsw->get_external_label((int)i);
                 int target = labels[i];
                 vector_node_map[0][vid] = {target};
-                local_vids[target].insert(vid);
+                add_local_vid(target, vid, 0);
                 local_vectors_tmp[target][vid] = hnsw->get_vector(vid);
             }
 
@@ -1490,8 +2197,9 @@ public:
             for (int i = 0; i < node_num; i++)
             {
                 local_vids[i].clear();
+                local_vid_ring[i].clear();
                 for (const auto &kv : local_vectors_tmp[i])
-                    local_vids[i].insert(kv.first);
+                    add_local_vid(i, kv.first, 0);
             }
         }
         else if (mode == "layer")
@@ -1567,20 +2275,27 @@ public:
 
                     if (is_replicate_level)
                     {
-                        std::vector<int> route_nodes;
-                        route_nodes.reserve(target_nodes.size());
+                        int primary_node = -1;
+                        int replica_count = 0;
                         for (int target_node : target_nodes)
                         {
                             if (target_node < 0 || target_node >= node_num)
                                 continue;
-                            local_vids[target_node].insert(vid);
-                            route_nodes.push_back(target_node);
+                            add_local_vid(target_node, vid, 0);
+                            if (primary_node < 0)
+                                primary_node = target_node;
+                            replica_count++;
                         }
-                        if (!route_nodes.empty())
+                        if (primary_node >= 0)
                         {
-                            if (route_nodes.size() > 1)
-                                replication_num += (route_nodes.size() - 1);
-                            vector_node_map[level][vid] = std::move(route_nodes);
+                            if (replica_count > 1)
+                                replication_num += (uint64_t)(replica_count - 1);
+                            auto &owners = vector_node_map[level][vid];
+                            owners.clear();
+                            for (int target_node : target_nodes)
+                                if (target_node >= 0 && target_node < node_num)
+                                    owners.push_back(target_node);
+                            normalize_route_owners(owners);
                         }
                     }
                     else
@@ -1597,7 +2312,7 @@ public:
                         int target_node = target_nodes[target_idx];
                         if (target_node >= 0 && target_node < node_num)
                         {
-                            local_vids[target_node].insert(vid);
+                            add_local_vid(target_node, vid, 0);
                             vector_node_map[level][vid] = {target_node};
                         }
                     }
@@ -1611,14 +2326,12 @@ public:
                                         : false;
                 if (ep_replicate)
                 {
-                    std::vector<int> route_nodes;
+                    auto &owners = vector_node_map[max_level][hnsw->entry_point_id];
+                    owners.clear();
                     for (int target_node : layer_config.at(max_level))
-                    {
                         if (target_node >= 0 && target_node < node_num)
-                            route_nodes.push_back(target_node);
-                    }
-                    if (!route_nodes.empty())
-                        vector_node_map[max_level][hnsw->entry_point_id] = std::move(route_nodes);
+                            owners.push_back(target_node);
+                    normalize_route_owners(owners);
                 }
                 else
                 {
@@ -1727,9 +2440,10 @@ public:
                     }
                 }
 
+                int new_ring = r + 1;
                 for (int node_id = 0; node_id < node_num; node_id++)
                     for (int vid : updates[node_id])
-                        local_vids[node_id].insert(vid);
+                        add_local_vid(node_id, vid, new_ring);
 
                 for (size_t lvl = 0; lvl < route_updates.size(); lvl++)
                 {
@@ -1737,12 +2451,8 @@ public:
                     {
                         int vid = kv.first;
                         const auto &nodes = kv.second;
-                        auto &existing = vector_node_map[lvl][vid];
                         for (int node_id : nodes)
-                        {
-                            if (std::find(existing.begin(), existing.end(), node_id) == existing.end())
-                                existing.push_back(node_id);
-                        }
+                            append_route_owner((int)lvl, vid, node_id);
                     }
                 }
 
@@ -1753,15 +2463,35 @@ public:
         // 打印各节点分到的向量数
         for (int i = 0; i < node_num; i++)
             LOG_INFO_STREAM("[partition] node " << i << " local_vectors=" << local_vids[i].size());
+        log_route_memory_breakdown("[partition before distribute]");
 
         // 构建每个节点的 local_vids 集合
         std::vector<std::unordered_set<int>> node_local_vids(node_num);
         for (int i = 0; i < node_num; i++)
         {
-            node_local_vids[i] = std::move(local_vids[i]);
             if (hnsw->entry_point_id >= 0)
-                node_local_vids[i].insert(hnsw->get_external_label(hnsw->entry_point_id));
+                add_local_vid(i, hnsw->get_external_label(hnsw->entry_point_id), 0);
+            node_local_vids[i] = std::move(local_vids[i]);
         }
+
+        normalize_routes_primary_first();
+
+        if (partition_distribution == "nfs-load")
+        {
+            if (partition_base.empty())
+                throw std::runtime_error("partition nfs-load requires non-empty partition_base");
+            LOG_INFO_STREAM("[partition] Materializing partition files to NFS: " << partition_base << "-*.bin");
+            for (int i = 0; i < node_num; i++)
+            {
+                std::string filepath = partition_base + "-" + std::to_string(i) + ".bin";
+                if (!write_partition_file(filepath, node_local_vids[i], &local_vid_ring[i]))
+                    throw std::runtime_error("failed to write partition file: " + filepath);
+            }
+            log_route_memory_breakdown("[partition nfs-load done]");
+            return;
+        }
+        if (partition_distribution != "network-send")
+            throw std::runtime_error("unknown partition_distribution: " + partition_distribution);
 
         // 释放旧的 local_hnsw
         for (int i = 0; i < node_num; i++)
@@ -1794,7 +2524,7 @@ public:
                 buf.write_val((int)MSG_INIT_GRAPH);
                 buf.write_val(is_global_pull);  // 通知远程节点是否为 global-pull 模式（跳过 compact）
                 serialize_routing(buf, vector_node_map);
-                serialize_hnsw_subset(buf, hnsw, node_local_vids[i]);
+                serialize_hnsw_subset(buf, hnsw, node_local_vids[i], &local_vid_ring[i], replication_level);
 
                 uint64_t msg_size = buf.data.size();
                 LOG_INFO_STREAM("[partition] Sending MSG_INIT_GRAPH to node " << i << ", msg_size=" << msg_size << " bytes");
@@ -1833,10 +2563,13 @@ public:
                 // 本地节点：通过序列化/反序列化深拷贝子集图
                 Buffer buf;
                 serialize_routing(buf, vector_node_map);
-                serialize_hnsw_subset(buf, hnsw, node_local_vids[i]);
+                serialize_hnsw_subset(buf, hnsw, node_local_vids[i], &local_vid_ring[i], replication_level);
                 deserialize_routing(buf, vector_node_map);
 
                 target_node.local_hnsw = deserialize_hnsw_subset<T>(buf, /*do_compact=*/!is_global_pull);
+                if (target_node.local_hnsw)
+                    target_node.local_hnsw->log_memory_breakdown("[partition local node " + std::to_string(i) + "]");
+                log_route_memory_breakdown("[partition local node " + std::to_string(i) + "]");
 
                 // global-pull 模式下注入远程向量拉取回调
                 if (is_global_pull && target_node.local_hnsw)
@@ -1997,32 +2730,12 @@ public:
     // 注意：此函数不更新 payload 统计；调用方（HNSW 搜索层）负责记账 remote_transfer_cnt / remote_transfer_data。
     std::vector<T> fetch_remote_vector(int vid)
     {
-        if (vector_node_map.empty())
-            return {};
-
         int owner_node_id = 0;
-        auto it = vector_node_map[0].find(vid);
-        if (it == vector_node_map[0].end() || it->second.empty())
+        if (!lookup_primary_owner(0, vid, owner_node_id))
         {
             LOG_DEBUG_STREAM("[Cluster] fetch_remote_vector: vid " << vid << " not in routing map");
             return {};
         }
-
-        // 冗余分区时随机选择一个副本节点
-        const auto &candidates = it->second;
-        if (candidates.size() == 1)
-        {
-            owner_node_id = candidates[0];
-        }
-        else
-        {
-            static thread_local std::mt19937 gen(std::random_device{}());
-            std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
-            owner_node_id = candidates[dist(gen)];
-        }
-
-        if (owner_node_id < 0 || owner_node_id >= node_num)
-            return {};
 
         Node<T> &owner = nodes[owner_node_id];
 
@@ -2108,37 +2821,15 @@ public:
         if (route_level < 0 || route_level >= (int)vector_node_map.size())
             route_level = 0;
 
-        auto choose_target_node = [this](const std::vector<int> &candidates) -> int {
-            std::vector<int> valid;
-            valid.reserve(candidates.size());
-            for (int node_id : candidates)
-            {
-                if (node_id >= 0 && node_id < this->node_num)
-                    valid.push_back(node_id);
-            }
-            if (valid.empty())
-                return 0;
-            if (valid.size() == 1)
-                return valid[0];
-            static thread_local std::mt19937 gen(std::random_device{}());
-            std::uniform_int_distribution<size_t> dist(0, valid.size() - 1);
-            return valid[dist(gen)];
-        };
-
+        int current_node_id = current_local_node_id();
+        uint64_t route_salt = ((uint64_t)(uint32_t)query_id << 32) ^ (uint32_t)require_id ^ ((uint64_t)(uint32_t)route_level << 16);
         int target_node_id = 0;
-        if (!vector_node_map.empty())
+        if (!choose_route_owner(route_level, require_id, current_node_id, route_salt, target_node_id))
         {
-            auto it = vector_node_map[route_level].find(require_id);
-            if (it != vector_node_map[route_level].end())
-            {
-                target_node_id = choose_target_node(it->second);
-            }
-            else if (route_level != 0)
-            {
-                auto it0 = vector_node_map[0].find(require_id);
-                if (it0 != vector_node_map[0].end())
-                    target_node_id = choose_target_node(it0->second);
-            }
+            if (route_level != 0)
+                choose_route_owner(0, require_id, current_node_id, route_salt, target_node_id);
+            else
+                lookup_primary_owner(0, require_id, target_node_id);
         }
 
         Node<T> &target_node = nodes[target_node_id];
@@ -2204,8 +2895,10 @@ public:
 
             try
             {
+                double send_start_ms = steady_now_ms();
                 transport->send_raw(sock, &msg_size, sizeof(uint64_t));
                 transport->send_raw(sock, buf.data.data(), msg_size);
+                payload.send_ms += steady_now_ms() - send_start_ms;
 
                 transport->release_connection(target_node_id, sock, true);
 
@@ -2241,27 +2934,19 @@ public:
             if (p.has_parent_path())
                 std::filesystem::create_directories(p.parent_path());
 
-            json routing_json_obj;
-            routing_json_obj["partition_mode"] = partition_mode;
-            routing_json_obj["layer_partition_mode"] = layer_partition_mode;
-            routing_json_obj["replication_level"] = replication_level;
-            routing_json_obj["replication_num"] = replication_num;
-            routing_json_obj["layer_config"] = layer_config;
-            routing_json_obj["layer_replicate_flags"] = layer_replicate_flags;
-            routing_json_obj["vector_node_map"] = json::array();
-            for (const auto &level_map : vector_node_map) {
-                json level_json = json::object();
-                for (const auto &kv : level_map)
-                    level_json[std::to_string(kv.first)] = kv.second;
-                routing_json_obj["vector_node_map"].push_back(std::move(level_json));
-            }
-            string routing_json_string = routing_json_obj.dump();
+            Buffer routing_buf;
+            serialize_partition_routing(routing_buf);
 
             Buffer subset_buf;
             for (int i = 0; i < node_num; i++) {
                 if (!nodes[i].is_remote_node && nodes[i].local_hnsw) {
+                    std::unordered_set<int> local_vids_to_save;
+                    size_t local_count = nodes[i].local_hnsw->get_cur_element_count();
+                    local_vids_to_save.reserve(local_count);
+                    for (size_t iid = 0; iid < local_count; iid++)
+                        local_vids_to_save.insert(nodes[i].local_hnsw->get_external_label((int)iid));
                     serialize_hnsw_subset(subset_buf, nodes[i].local_hnsw,
-                                           nodes[i].local_hnsw->local_vids_);
+                                           local_vids_to_save);
                     break;
                 }
             }
@@ -2271,14 +2956,22 @@ public:
                 LOG_INFO_STREAM("[save] Failed to open " << filepath << " for writing");
                 return false;
             }
-            uint64_t routing_json_length = routing_json_string.size();
-            output_file.write((char*)&routing_json_length, sizeof(uint64_t));
-            output_file.write(routing_json_string.data(), routing_json_length);
+            uint32_t magic = partition_file_magic();
+            uint32_t version = 2;
+            uint64_t routing_size = routing_buf.data.size();
+            output_file.write((char*)&magic, sizeof(uint32_t));
+            output_file.write((char*)&version, sizeof(uint32_t));
+            output_file.write((char*)&routing_size, sizeof(uint64_t));
+            output_file.write(routing_buf.data.data(), routing_buf.data.size());
             output_file.write(subset_buf.data.data(), subset_buf.data.size());
             if (!output_file) {
                 LOG_INFO_STREAM("[save] Write failed for " << filepath);
                 return false;
             }
+            LOG_INFO_STREAM("[save] Wrote " << filepath
+                            << " routing=" << HNSWGraph<T>::format_bytes(routing_buf.data.size())
+                            << " subset=" << HNSWGraph<T>::format_bytes(subset_buf.data.size())
+                            << " total=" << HNSWGraph<T>::format_bytes(sizeof(uint32_t) * 2 + sizeof(uint64_t) + routing_buf.data.size() + subset_buf.data.size()));
             return true;
         }
         catch (const std::exception &e) {
@@ -2296,47 +2989,105 @@ public:
             std::ifstream input_file(filepath, std::ios::binary);
             if (!input_file) { LOG_INFO_STREAM("[load_local] Failed to open file"); return false; }
 
-            uint64_t routing_json_length = 0;
-            input_file.read((char*)&routing_json_length, sizeof(uint64_t));
-            std::string routing_json_string(routing_json_length, '\0');
-            input_file.read(&routing_json_string[0], routing_json_length);
-            json routing_json_obj = json::parse(routing_json_string);
-            partition_mode = routing_json_obj.value("partition_mode", partition_mode);
-            layer_partition_mode = routing_json_obj.value("layer_partition_mode", layer_partition_mode);
-            replication_level = routing_json_obj.value("replication_level", replication_level);
-            replication_num = routing_json_obj.value("replication_num", replication_num);
-            if (routing_json_obj.contains("layer_config") && routing_json_obj["layer_config"].is_object())
+            input_file.seekg(0, std::ios::end);
+            size_t total_size = input_file.tellg();
+            input_file.seekg(0);
+            if (total_size < sizeof(uint32_t))
+                throw std::runtime_error("load_local: partition file too small");
+
+            uint32_t magic = 0;
+            input_file.read((char *)&magic, sizeof(uint32_t));
+            if (!input_file)
+                throw std::runtime_error("load_local: failed to read partition magic");
+            size_t subset_offset = 0;
+            if (magic == partition_file_magic())
             {
+                constexpr size_t header_size = sizeof(uint32_t) * 2 + sizeof(uint64_t);
+                if (total_size < header_size)
+                    throw std::runtime_error("load_local: truncated binary partition header");
+                uint32_t version = 0;
+                uint64_t routing_size = 0;
+                input_file.read((char *)&version, sizeof(uint32_t));
+                input_file.read((char *)&routing_size, sizeof(uint64_t));
+                if (!input_file)
+                    throw std::runtime_error("load_local: failed to read binary partition header");
+                if (version != 2)
+                    throw std::runtime_error("load_local: unsupported partition file version");
+                if (routing_size > total_size - header_size)
+                    throw std::runtime_error("load_local: invalid routing section size");
+                std::vector<char> routing_data((size_t)routing_size);
+                if (routing_size > 0)
+                    input_file.read(routing_data.data(), (size_t)routing_size);
+                if (!input_file)
+                    throw std::runtime_error("load_local: failed to read binary routing section");
+                Buffer routing_buf;
+                routing_buf.data = std::move(routing_data);
+                deserialize_partition_routing(routing_buf);
+                subset_offset = header_size + (size_t)routing_size;
+                LOG_INFO_STREAM("[load_local] Parsed binary routing: routing="
+                                << HNSWGraph<T>::format_bytes((size_t)routing_size));
+            }
+            else
+            {
+                input_file.seekg(0);
+                if (total_size < sizeof(uint64_t))
+                    throw std::runtime_error("load_local: truncated legacy partition header");
+                uint64_t routing_json_length = 0;
+                input_file.read((char*)&routing_json_length, sizeof(uint64_t));
+                if (!input_file)
+                    throw std::runtime_error("load_local: failed to read legacy routing JSON length");
+                if (routing_json_length > total_size - sizeof(uint64_t))
+                    throw std::runtime_error("load_local: invalid legacy routing JSON length");
+                LOG_INFO_STREAM("[load_local] Loading legacy JSON routing: "
+                                << HNSWGraph<T>::format_bytes((size_t)routing_json_length));
+                std::string routing_json_string((size_t)routing_json_length, '\0');
+                input_file.read(&routing_json_string[0], (size_t)routing_json_length);
+                if (!input_file)
+                    throw std::runtime_error("load_local: failed to read legacy routing JSON");
+                json routing_json_obj = json::parse(routing_json_string);
+                partition_mode = routing_json_obj.value("partition_mode", partition_mode);
+                layer_partition_mode = routing_json_obj.value("layer_partition_mode", layer_partition_mode);
+                replication_level = routing_json_obj.value("replication_level", replication_level);
+                replication_num = routing_json_obj.value("replication_num", replication_num);
+                if (!routing_json_obj.contains("layer_config") || !routing_json_obj["layer_config"].is_object())
+                    throw std::runtime_error("load_local: missing layer_config");
                 layer_config.clear();
                 for (auto const &kv : routing_json_obj["layer_config"].items())
                     layer_config[std::stoi(kv.key())] = kv.value().get<std::vector<int>>();
-            }
-            if (routing_json_obj.contains("layer_replicate_flags") && routing_json_obj["layer_replicate_flags"].is_array())
+
+                if (!routing_json_obj.contains("layer_replicate_flags") || !routing_json_obj["layer_replicate_flags"].is_array())
+                    throw std::runtime_error("load_local: missing layer_replicate_flags");
                 layer_replicate_flags = routing_json_obj["layer_replicate_flags"].get<std::vector<bool>>();
-            if (routing_json_obj.contains("vector_node_map") && routing_json_obj["vector_node_map"].is_array())
-            {
+
+                if (!routing_json_obj.contains("vector_node_map") || !routing_json_obj["vector_node_map"].is_array())
+                    throw std::runtime_error("load_local: missing vector_node_map");
+                clear_dense_level0_routes();
                 vector_node_map.clear();
                 vector_node_map.resize(routing_json_obj["vector_node_map"].size());
                 for (size_t level = 0; level < routing_json_obj["vector_node_map"].size(); level++)
                     for (auto const &kv : routing_json_obj["vector_node_map"][level].items())
                         vector_node_map[level][std::stoi(kv.key())] = kv.value().get<std::vector<int>>();
+                normalize_routes_primary_first();
+                filter_routes_for_runtime();
+                subset_offset = sizeof(uint64_t) + (size_t)routing_json_length;
             }
-            if (replication_num == 0 && !vector_node_map.empty())
-                replication_num = infer_replication_num_from_routes();
 
-            input_file.seekg(0, std::ios::end);
-            size_t total_size = input_file.tellg();
-            size_t subset_offset = sizeof(uint64_t) + routing_json_length;
+            if (subset_offset >= total_size)
+                throw std::runtime_error("load_local: missing HNSW subset section");
             size_t subset_size = total_size - subset_offset;
             input_file.seekg(subset_offset);
             std::vector<char> subset_data(subset_size);
             input_file.read(subset_data.data(), subset_size);
+            if (!input_file)
+                throw std::runtime_error("load_local: failed to read HNSW subset section");
             input_file.close();
             LOG_INFO_STREAM("[load_local] File read complete: " << subset_size << " bytes, deserializing...");
 
             Buffer subset_buf; subset_buf.data = std::move(subset_data);
             HNSWGraph<T> *loaded_graph = deserialize_hnsw_subset<T>(subset_buf, /*do_compact=*/true);
             LOG_INFO_STREAM("[load_local] Deserialized, elements=" << loaded_graph->get_cur_element_count() << ", assigning to node...");
+            log_route_memory_breakdown("[load_local]");
+            loaded_graph->log_memory_breakdown("[load_local]");
             for (int i = 0; i < node_num; i++)
             {
                 if (!nodes[i].is_remote_node)
@@ -2349,7 +3100,16 @@ public:
             delete loaded_graph;
             return false;
         }
-        catch (...) { return false; }
+        catch (const std::exception &e)
+        {
+            LOG_INFO_STREAM("[load_local] Exception while loading " << filepath << ": " << e.what());
+            return false;
+        }
+        catch (...)
+        {
+            LOG_INFO_STREAM("[load_local] Unknown exception while loading " << filepath);
+            return false;
+        }
     }
 
     // 从文件加载 cluster 状态
@@ -2371,6 +3131,7 @@ public:
 
         int node_num = j.value("node_num", 4);
         Cluster<T> *cluster = new Cluster<T>(hnsw, node_num);
+        cluster->owns_hnsw = (hnsw != nullptr);
 
         cluster->bandwidth = j.value("bandwidth", 1000.0);
         cluster->partition_mode = j.value("partition_mode", "");
@@ -2385,71 +3146,27 @@ public:
 
         if (cluster->partition_mode == "layer")
         {
-            if (j.contains("layer_config") && j["layer_config"].is_object())
-            {
-                cluster->layer_config.clear();
-                for (auto const &kv : j["layer_config"].items())
-                {
-                    int level = std::stoi(kv.key());
-                    if (kv.value().is_array())
-                    {
-                        cluster->layer_config[level] = kv.value().get<std::vector<int>>();
-                    }
-                }
-            }
-            if (j.contains("layer_replicate_flags") && j["layer_replicate_flags"].is_array())
-            {
-                cluster->layer_replicate_flags = j["layer_replicate_flags"].get<std::vector<bool>>();
-            }
+            if (!j.contains("layer_config") || !j["layer_config"].is_object())
+                throw std::runtime_error("cluster load: missing layer_config");
+            cluster->layer_config.clear();
+            for (auto const &kv : j["layer_config"].items())
+                cluster->layer_config[std::stoi(kv.key())] = kv.value().get<std::vector<int>>();
+
+            if (!j.contains("layer_replicate_flags") || !j["layer_replicate_flags"].is_array())
+                throw std::runtime_error("cluster load: missing layer_replicate_flags");
+            cluster->layer_replicate_flags = j["layer_replicate_flags"].get<std::vector<bool>>();
         }
 
-        // 加载 vector_node_map（layer: 多层；非 layer: 仅第0层）
-        if (j.contains("vector_node_map"))
-        {
-            cluster->vector_node_map.clear();
-            if (cluster->partition_mode == "layer")
-            {
-                if (!j["vector_node_map"].is_array())
-                    throw std::runtime_error("vector_node_map format error for layer mode");
-                cluster->vector_node_map.resize(j["vector_node_map"].size());
-                for (size_t l = 0; l < j["vector_node_map"].size(); l++)
-                {
-                    const auto &jmap = j["vector_node_map"][l];
-                    for (auto const &kv : jmap.items())
-                    {
-                        int vid = std::stoi(kv.key());
-                        if (kv.value().is_array())
-                        {
-                            cluster->vector_node_map[l][vid] = kv.value().get<std::vector<int>>();
-                        }
-                        else
-                        {
-                            int node_id = kv.value().get<int>();
-                            cluster->vector_node_map[l][vid] = {node_id};
-                        }
-                    }
-                }
-            }
-            else
-            {
-                if (!j["vector_node_map"].is_object())
-                    throw std::runtime_error("vector_node_map format error for non-layer mode");
-                cluster->vector_node_map.resize(1);
-                for (auto const &kv : j["vector_node_map"].items())
-                {
-                    int vid = std::stoi(kv.key());
-                    if (kv.value().is_array())
-                    {
-                        cluster->vector_node_map[0][vid] = kv.value().get<std::vector<int>>();
-                    }
-                    else
-                    {
-                        int node_id = kv.value().get<int>();
-                        cluster->vector_node_map[0][vid] = {node_id};
-                    }
-                }
-            }
-        }
+        if (!j.contains("vector_node_map") || !j["vector_node_map"].is_array())
+            throw std::runtime_error("cluster load: missing vector_node_map");
+        cluster->vector_node_map.clear();
+        cluster->vector_node_map.resize(j["vector_node_map"].size());
+        for (size_t l = 0; l < j["vector_node_map"].size(); l++)
+            for (auto const &kv : j["vector_node_map"][l].items())
+                cluster->vector_node_map[l][std::stoi(kv.key())] = kv.value().get<std::vector<int>>();
+
+        cluster->normalize_routes_primary_first();
+        cluster->filter_routes_for_runtime();
 
         // 加载每个节点的状态
         if (j.contains("nodes"))
@@ -2825,8 +3542,13 @@ void Node<T>::tcp_server_loop()
             bool remote_global = buf->read_val<bool>();
             cluster->is_global_pull = remote_global;
             deserialize_routing(*buf, cluster->vector_node_map);
+            cluster->normalize_routes_primary_first();
+            cluster->filter_routes_for_runtime();
             if (local_hnsw) delete local_hnsw;
             local_hnsw = deserialize_hnsw_subset<T>(*buf, /*do_compact=*/!remote_global);
+            cluster->log_route_memory_breakdown("[MSG_INIT_GRAPH node " + std::to_string(node_id) + "]");
+            if (local_hnsw)
+                local_hnsw->log_memory_breakdown("[MSG_INIT_GRAPH node " + std::to_string(node_id) + "]");
             if (remote_global && local_hnsw) {
                 Cluster<T>* cl = cluster;
                 local_hnsw->pull_fetcher_ = [cl](int vid){ return cl->fetch_remote_vector(vid); };
@@ -2846,6 +3568,8 @@ void Node<T>::tcp_server_loop()
                     qid = buf->read_val<int>();
                     std::vector<int> rs = buf->read_vec<int>();
                     Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
+                    if (pl.query_start_ms != 0.0)
+                        pl.total_ms = steady_now_ms() - pl.query_start_ms;
                     std::shared_ptr<SDKCompletionQueue<T>> cq;
                     { std::lock_guard<std::mutex> lk(sdk_cq_map_mu_);
                       auto it = sdk_cq_map_.find(qid);
@@ -2892,7 +3616,8 @@ void Node<T>::tcp_server_loop()
         }
 
         if (msg_type == MSG_SEARCH) {
-            msg_pool_->submit([this, buf]() {
+            double enqueue_ms = steady_now_ms();
+            msg_pool_->submit([this, buf, enqueue_ms]() {
                 int qid = -1;
                 int origin = -1;
                 try {
@@ -2900,6 +3625,9 @@ void Node<T>::tcp_server_loop()
                     int k = buf->read_val<int>();
                     std::vector<T> qv = buf->read_vec<T>();
                     Payload<DistT> pl; deserialize_payload(*buf, pl, local_hnsw);
+                    pl.queue_ms += steady_now_ms() - enqueue_ms;
+                    if (pl.query_start_ms == 0.0)
+                        pl.query_start_ms = steady_now_ms();
                     origin = pl.origin_node_id;
                     this->query(qid, qv, pl, k);
                 } catch (const std::exception &e) {
@@ -3082,6 +3810,7 @@ void Node<T>::handle_sdk_client(int client_fd)
 
             try
             {
+                double result_start_ms = steady_now_ms();
                 Buffer resp_buf;
                 resp_buf.write_val(result.query_id);
                 resp_buf.write_val((int)result.results.size());
@@ -3090,6 +3819,7 @@ void Node<T>::handle_sdk_client(int client_fd)
                     resp_buf.write_val((DistT)0.0);
                     resp_buf.write_val(id);
                 }
+                result.payload.result_ms += steady_now_ms() - result_start_ms;
                 serialize_payload(resp_buf, result.payload, local_hnsw);
 
                 uint64_t resp_size = resp_buf.data.size();
@@ -3116,13 +3846,9 @@ void Node<T>::handle_sdk_client(int client_fd)
             if (msg_size == 0)
                 break;
 
-            // thread_local buffer 复用，避免每次消息都 malloc
-            thread_local std::vector<char> tls_sdk_buffer;
-            tls_sdk_buffer.resize(msg_size);
-            recv_all(client_fd, tls_sdk_buffer.data(), msg_size);
-
             Buffer buf;
-            buf.data.assign(tls_sdk_buffer.begin(), tls_sdk_buffer.begin() + msg_size);
+            buf.data.resize(msg_size);
+            recv_all(client_fd, buf.data.data(), msg_size);
             buf.read_pos = 0;
             int msg_type = buf.read_val<int>();
 
@@ -3157,8 +3883,12 @@ void Node<T>::handle_sdk_client(int client_fd)
                 // 查询执行提交到 msg_pool_，reader 线程只负责接收
                 auto qv = std::make_shared<std::vector<T>>(std::move(query_vector));
                 auto pl = std::make_shared<Payload<DistT>>(std::move(payload));
+                double enqueue_ms = steady_now_ms();
 
-                msg_pool_->submit([this, query_id, k, qv, pl, completion_queue, &inflight_count]() {
+                msg_pool_->submit([this, query_id, k, qv, pl, completion_queue, &inflight_count, enqueue_ms]() {
+                    pl->queue_ms += steady_now_ms() - enqueue_ms;
+                    if (pl->query_start_ms == 0.0)
+                        pl->query_start_ms = steady_now_ms();
                     if (cluster && cluster->is_shard)
                     {
                         // Shard 模式：异步流水线
@@ -3168,6 +3898,7 @@ void Node<T>::handle_sdk_client(int client_fd)
                         accum->query_id = query_id;
                         accum->k = k;
                         accum->total_nodes = cluster->node_num;
+                        accum->query_start_ms = pl->query_start_ms;
                         accum->completion_queue = completion_queue;
                         accum->cleanup_fn = [this, query_id]() {
                             std::lock_guard<std::mutex> lk(reduce_accum_mu_);
@@ -3248,6 +3979,8 @@ void Node<T>::handle_sdk_client(int client_fd)
 
                             if (!cluster->is_distributed || !pl->continue_search)
                             {
+                                if (pl->query_start_ms != 0.0)
+                                    pl->total_ms = steady_now_ms() - pl->query_start_ms;
                                 completion_queue->push({query_id, std::move(results), std::move(*pl)});
                             }
                             else
@@ -3304,14 +4037,27 @@ void Node<T>::handle_sdk_client(int client_fd)
                 deserialize_layer_config(buf, layer_config);
                 layer_partition_mode = buf.read_string();
                 deserialize_layer_replicate_flags(buf, layer_replicate_flags);
-                int num_threads = 0;
-                if (buf.read_pos < buf.data.size())
-                    num_threads = buf.read_val<int>();
-
-                if (cluster)
-                    cluster->partition(mode, replication, layer_config, layer_partition_mode, layer_replicate_flags, num_threads);
+                int num_threads = buf.read_val<int>();
+                std::string partition_distribution = buf.read_string();
+                std::string partition_base = buf.read_string();
 
                 char ack = 1;
+                try
+                {
+                    if (cluster)
+                        cluster->partition(mode, replication, layer_config, layer_partition_mode, layer_replicate_flags,
+                                           num_threads, partition_distribution, partition_base);
+                }
+                catch (const std::exception &e)
+                {
+                    LOG_INFO_STREAM("[Node " << node_id << "] MSG_PARTITION failed: " << e.what());
+                    ack = 0;
+                }
+                catch (...)
+                {
+                    LOG_INFO_STREAM("[Node " << node_id << "] MSG_PARTITION failed with unknown exception");
+                    ack = 0;
+                }
                 send_all(client_fd, &ack, 1);
                 break;
             }
@@ -3343,8 +4089,16 @@ void Node<T>::handle_sdk_client(int client_fd)
                     if (loaded_hnsw)
                     {
                         if (cluster->hnsw && cluster->hnsw != loaded_hnsw)
-                            delete cluster->hnsw;
+                        {
+                            if (cluster->owns_hnsw)
+                                delete cluster->hnsw;
+                            else
+                                cluster->hnsw->release_storage();
+                        }
                         cluster->hnsw = loaded_hnsw;
+                        cluster->owns_hnsw = true;
+                        if (cluster->node_num == 1 && !cluster->nodes.empty() && !cluster->nodes[0].is_remote_node)
+                            cluster->nodes[0].local_hnsw = loaded_hnsw;
                         ok = true;
                     }
                 }
@@ -3412,6 +4166,18 @@ void Node<T>::handle_sdk_client(int client_fd)
                 send_all(client_fd, &ack, 1);
                 break;
             }
+            else if (msg_type == MSG_RELEASE_FULL_HNSW)
+            {
+                bool ok = false;
+                if (cluster)
+                {
+                    cluster->release_full_hnsw();
+                    ok = true;
+                }
+                char ack = ok ? 1 : 0;
+                send_all(client_fd, &ack, 1);
+                break;
+            }
             else if (msg_type == MSG_GET_INFORMATION)
             {
                 json info;
@@ -3423,7 +4189,7 @@ void Node<T>::handle_sdk_client(int client_fd)
                     cj["partition_mode"] = cluster->partition_mode;
                     cj["layer_partition_mode"] = cluster->layer_partition_mode;
                     cj["replication_level"] = cluster->replication_level;
-                    cj["replication_num"] = cluster->replication_num ? cluster->replication_num : cluster->infer_replication_num_from_routes();
+                    cj["replication_num"] = cluster->replication_num;
                     cj["is_distributed"] = cluster->is_distributed;
                     cj["is_shard"] = cluster->is_shard;
                     cj["is_global_pull"] = cluster->is_global_pull;
@@ -3446,6 +4212,7 @@ void Node<T>::handle_sdk_client(int client_fd)
 
                     // 入口点所在节点：找到 vector_node_map 最高层中所有节点
                     json entry_nodes_json = json::array();
+                    bool entry_nodes_found = false;
                     if (!cluster->vector_node_map.empty())
                     {
                         // vector_node_map[level] 按层级从 0 开始，找最高非空层
@@ -3461,6 +4228,22 @@ void Node<T>::handle_sdk_client(int client_fd)
                                 }
                                 for (int nid : entry_node_set)
                                     entry_nodes_json.push_back(nid);
+                                entry_nodes_found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!entry_nodes_found && cluster->dense_level0_routes_enabled_)
+                    {
+                        for (int i = 0; i < cluster->node_num && i < (int)cluster->nodes.size(); i++)
+                        {
+                            HNSWGraph<T> *lh = cluster->nodes[i].local_hnsw;
+                            if (!cluster->nodes[i].is_remote_node && lh && lh->entry_point_id >= 0)
+                            {
+                                int ep_vid = lh->get_external_label(lh->entry_point_id);
+                                int owner = -1;
+                                if (cluster->lookup_primary_owner(0, ep_vid, owner))
+                                    entry_nodes_json.push_back(owner);
                                 break;
                             }
                         }
@@ -3469,15 +4252,27 @@ void Node<T>::handle_sdk_client(int client_fd)
 
                     info["cluster"] = std::move(cj);
 
-                    if (cluster->hnsw)
+                    HNSWGraph<T> *info_hnsw = cluster->hnsw;
+                    if (!info_hnsw)
+                    {
+                        for (auto &node : cluster->nodes)
+                        {
+                            if (!node.is_remote_node && node.local_hnsw)
+                            {
+                                info_hnsw = node.local_hnsw;
+                                break;
+                            }
+                        }
+                    }
+                    if (info_hnsw)
                     {
                         json hj;
-                        hj["dim"] = cluster->hnsw->dim;
-                        hj["m"] = cluster->hnsw->m;
-                        hj["ef_construction"] = cluster->hnsw->ef_construction;
-                        hj["ef_search"] = cluster->hnsw->ef_search;
-                        hj["limited_level"] = cluster->hnsw->limited_level;
-                        hj["max_level"] = cluster->hnsw->max_level;
+                        hj["dim"] = info_hnsw->dim;
+                        hj["m"] = info_hnsw->m;
+                        hj["ef_construction"] = info_hnsw->ef_construction;
+                        hj["ef_search"] = info_hnsw->ef_search;
+                        hj["limited_level"] = info_hnsw->limited_level;
+                        hj["max_level"] = info_hnsw->max_level;
                         info["hnsw"] = std::move(hj);
                     }
                     else
@@ -3576,6 +4371,8 @@ void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& result
             }
         }
         if (cq) {
+            if (payload.query_start_ms != 0.0)
+                payload.total_ms = steady_now_ms() - payload.query_start_ms;
             cq->push({query_id, results, std::move(payload)});
         } else {
             LOG_DEBUG_STREAM("[Node " << node_id << "] Warning: No completion queue for local query " << query_id);
@@ -3588,11 +4385,13 @@ void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& result
     // 重试若干次以容忍连接池/瞬时网络抖动，避免 SDK 端 query_recv 永久阻塞。
     LOG_DEBUG_STREAM("[Node " << node_id << "] Sending result to remote origin node " << payload.origin_node_id);
 
+    double result_start_ms = steady_now_ms();
     // 序列化一次，重试时复用
     Buffer buf;
     buf.write_val((int)MSG_SEARCH_RESULT);
     buf.write_val(query_id);
     buf.write_vec(results);
+    payload.result_ms += steady_now_ms() - result_start_ms;
     serialize_payload(buf, payload, local_hnsw);
     uint64_t msg_size = buf.data.size();
 
@@ -3610,8 +4409,10 @@ void Node<T>::send_result_to_origin(int query_id, const std::vector<int>& result
 
         try
         {
+            double send_start_ms = steady_now_ms();
             cluster->transport->send_raw(sock, &msg_size, sizeof(uint64_t));
             cluster->transport->send_raw(sock, buf.data.data(), msg_size);
+            payload.send_ms += steady_now_ms() - send_start_ms;
             cluster->transport->release_connection(payload.origin_node_id, sock, true);
             LOG_DEBUG_STREAM("[Node " << node_id << "] Result sent to origin node " << payload.origin_node_id);
             return;

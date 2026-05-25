@@ -30,7 +30,7 @@
 #SBATCH --error=/hpc2hdd/home/xchen740/workspace/vector-retrieve/logs/slurm_%j.err
 
 # --------------- 可覆盖参数 ---------------
-DATA_NAME="${DATA_NAME:-sift}"
+DATA_NAME="${DATA_NAME:-sift100m}"
 K="${K:-10}"
 M="${M:-10}"
 EF_CONST="${EF_CONST:-200}"
@@ -44,12 +44,15 @@ SVR_THREADS="${SVR_THREADS:-8}"            # worker 节点处理线程数
 # QUERY_THREADS 不再手动设置，自动 = (worker_num × svr_threads) / num_query_nodes
 NUM_QUERY_NODES="${NUM_QUERY_NODES:-2}"    # query 客户端数量
 CO_LOCATE="${CO_LOCATE:-0}"                # 1 = node0 同时跑 main.py + query rank 0 + worker 0
+CO_LOCATE_MAIN_QUERY="${CO_LOCATE_MAIN_QUERY:-0}"  # 1 = node0 同时跑 main.py + query rank 0（不含 worker），节省 1 个节点
 USE_SLURM="${USE_SLURM:-0}"                # 1 = main.py 用 srun 启动 query.py；0 = ssh
 SAVE="${SAVE:-1}"
 NUM_RUNS="${NUM_RUNS:-5}"
 BASE_PORT="${BASE_PORT:-18080}"
-DTYPE="${DTYPE:-}"                        # 非空时覆盖 preset dtype（如 uint8）
+DTYPE="${DTYPE:-uint8}"                   # 非空时覆盖 preset dtype（如 uint8）
+PARTITION_DISTRIBUTION="${PARTITION_DISTRIBUTION:-nfs-load}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+FORCE_REPARTITION="${FORCE_REPARTITION:-0}"
 
 # --------------- 初始化 ---------------
 set -euo pipefail
@@ -75,14 +78,43 @@ conda activate vector-retrieve
 # --------------- 2. 编译 ---------------
 echo "[2/5] Building C++ extension..."
 BUILD_DIR="$PROJECT_ROOT/build"
-SO_COUNT=$(find "$BUILD_DIR" -maxdepth 1 -name "vector_retrieve*.so" 2>/dev/null | wc -l)
-if [ "$SO_COUNT" -eq 0 ]; then
-    mkdir -p "$BUILD_DIR" && cd "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+SO_FILES=("$BUILD_DIR"/vector_retrieve*.so)
+SO_PATH=""
+if [ -e "${SO_FILES[0]}" ]; then
+    SO_PATH="${SO_FILES[0]}"
+fi
+
+NEEDS_BUILD=0
+if [ -z "$SO_PATH" ]; then
+    NEEDS_BUILD=1
+else
+    for src in "$PROJECT_ROOT"/CMakeLists.txt "$PROJECT_ROOT"/source/cpp/*.h "$PROJECT_ROOT"/source/cpp/*.cpp; do
+        if [ "$src" -nt "$SO_PATH" ]; then
+            NEEDS_BUILD=1
+            break
+        fi
+    done
+fi
+
+if [ "$NEEDS_BUILD" -eq 1 ]; then
+    cd "$BUILD_DIR"
+    rm -f CMakeCache.txt
+    rm -rf CMakeFiles
+    PYBIND11_CMAKE_DIR=$(python -c 'import pybind11, os; print(os.path.join(os.path.dirname(pybind11.__file__), "share", "cmake", "pybind11"))')
+    CXX_COMPILER="${CXX:-$(command -v g++ || command -v c++ || true)}"
+    if [ -z "$CXX_COMPILER" ] || [ ! -x "$CXX_COMPILER" ]; then
+        echo "ERROR: no executable C++ compiler found in PATH" >&2
+        exit 1
+    fi
     cmake .. -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CXX_COMPILER="$CXX_COMPILER" \
         -DPYTHON_EXECUTABLE="$(which python)" \
-        -Dpybind11_DIR="$(python -c 'import pybind11,os;print(os.path.join(os.path.dirname(pybind11.__file__),\"share\",\"cmake\",\"pybind11\"))')"
+        -Dpybind11_DIR="$PYBIND11_CMAKE_DIR"
     make -j"${SLURM_CPUS_PER_TASK:-$(nproc)}"
     cd "$PROJECT_ROOT"
+else
+    echo "  Existing C++ extension is up to date: $SO_PATH"
 fi
 echo "  Build OK"
 
@@ -111,6 +143,24 @@ if [ "$CO_LOCATE" = "1" ]; then
     QUERY_HOSTS=("${NODE_HOST_ARRAY[0]}")
     WORKER_IPS=("${NODE_IPS[@]}")
     WORKER_HOSTS=("${NODE_HOST_ARRAY[@]}")
+elif [ "$CO_LOCATE_MAIN_QUERY" = "1" ]; then
+    # main + query0 共址模式：node 0 = main.py + query rank 0；node [1..NUM_QUERY_NODES-1] = 其他 query；剩下 = worker
+    # 用于节省 1 个节点。total_nodes = NUM_QUERY_NODES + worker_count
+    QUERY_IPS=()
+    QUERY_HOSTS=()
+    QUERY_IPS+=("${NODE_IPS[0]}")
+    QUERY_HOSTS+=("${NODE_HOST_ARRAY[0]}")
+    for ((i=1; i<NUM_QUERY_NODES && i<TOTAL_COUNT; i++)); do
+        QUERY_IPS+=("${NODE_IPS[$i]}")
+        QUERY_HOSTS+=("${NODE_HOST_ARRAY[$i]}")
+    done
+
+    WORKER_IPS=()
+    WORKER_HOSTS=()
+    for ((i=NUM_QUERY_NODES; i<TOTAL_COUNT; i++)); do
+        WORKER_IPS+=("${NODE_IPS[$i]}")
+        WORKER_HOSTS+=("${NODE_HOST_ARRAY[$i]}")
+    done
 else
     # 标准模式：node 0 = host (main.py 总控)，node [1..NUM_QUERY_NODES] = query，剩下 = worker
     QUERY_IPS=()
@@ -233,6 +283,13 @@ if [ -n "$DTYPE" ]; then
     fi
 fi
 
+LAYER_SUFFIX="-layer"
+CLUSTER_BASE="./save/${EFFECTIVE_DATA_NAME}/node${WORKER_COUNT}/m${M}-efc${EF_CONST}-ll${LIMITED_LEVEL}-${PART_MODE}-rep${REPLICATION}${LAYER_SUFFIX}"
+if [ "$FORCE_REPARTITION" = "1" ]; then
+    echo "[force] Removing existing partitioned graphs: ${CLUSTER_BASE}-*.bin"
+    rm -f ${CLUSTER_BASE}-*.bin
+fi
+
 set -x
 python -u main.py \
     --data_name "$EFFECTIVE_DATA_NAME" \
@@ -244,6 +301,7 @@ python -u main.py \
     --limited_level "$LIMITED_LEVEL" \
     --node_num "$WORKER_COUNT" \
     --partition_mode "$PART_MODE" \
+    --partition_distribution "$PARTITION_DISTRIBUTION" \
     --replication "$REPLICATION" \
     --num_construction_threads "$BUILD_THREADS" \
     --num_query_threads "$TOTAL_QUERY_CONCURRENCY" \

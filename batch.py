@@ -29,7 +29,15 @@ DATASETS = [
         "base": "sift100m/base.u8bin",
         "query": "sift100m/queries.u8bin",
         "groundtruth": "sift100m/gt_100.bin",
-    }
+        "dtype": "uint8",
+    },
+    {
+        "name": "deep100m",
+        "base": "deep100m/base.fbin",
+        "query": "deep100m/queries.fbin",
+        "groundtruth": "deep100m/gt_100.bin",
+        "dtype": "float",
+    },
 ]
 
 # ============================================================
@@ -57,7 +65,7 @@ PARAM_GRID = {
     "layer":              [True, False],
     "comm_mode":          ["tcp"],
     "num_cpu":            [0],
-    "dtype":              ["uint8"],
+    "dtype":              [None],      # None = 使用 DATASETS 中的默认 dtype
 }
 
 # 仅跑 rep2 sweep 中接近 recall=0.80/0.85/0.90/0.95 的最高 QPS 配置（覆盖 node8/16 × layer T/F 的 union）
@@ -68,6 +76,11 @@ ALLOWED_M_EFS = {
 
 # uint8 模式下 data_name 追加的后缀，保证 graph/results 文件名与 float 不冲突
 DTYPE_NAME_SUFFIX = {"uint8": "-u8"}
+
+
+def effective_dtype(dataset, params):
+    """解析实际 dtype：参数显式指定优先，否则使用数据集默认值。"""
+    return params.get('dtype') or dataset.get('dtype', 'float')
 
 # 等待 graph 文件的最长秒数 (0 = 无限等待)
 GRAPH_WAIT_TIMEOUT = 0
@@ -108,7 +121,7 @@ def run_worker(cmd, task_id, total_tasks, description):
 def effective_data_name(dataset, params):
     """根据 dtype 给 data_name 加后缀，避免 float/uint8 结果互相覆盖。
     main.py 用 --data_name 决定 graph 与 results 文件名，所以后缀加在这里即可。"""
-    return dataset['name'] + DTYPE_NAME_SUFFIX.get(params.get('dtype'), "")
+    return dataset['name'] + DTYPE_NAME_SUFFIX.get(effective_dtype(dataset, params), "")
 
 
 def resolve_query_threads(params):
@@ -167,8 +180,7 @@ def build_command(dataset, params, skip_prepare=False, no_cleanup=False, use_slu
         cmd += ['--comm_mode', str(params['comm_mode'])]
     if params.get('num_cpu'):
         cmd += ['--num_cpu', str(params['num_cpu'])]
-    if params.get('dtype'):
-        cmd += ['--dtype', str(params['dtype'])]
+    cmd += ['--dtype', effective_dtype(dataset, params)]
     cmd += ['--num_runs', str(NUM_RUNS)]
     if skip_prepare:
         cmd.append('--skip_prepare')
@@ -235,11 +247,11 @@ def get_result_path(dataset, params):
     return os.path.join(".", "results", "cpp", filename)
 
 
-def get_group_key(dataset_name, params):
+def get_group_key(dataset, params):
     """生成分组键：相同 (dataset, m, efc, ll, node_num, partition_mode, replication, layer, dtype, ...) 的任务共享服务端。
     dtype 必须进入分组键：不同 dtype 的 HNSW 类不同，graph 不可复用。"""
     return (
-        dataset_name,
+        dataset['name'],
         params['m'],
         params['ef_construction'],
         params['limited_level'],
@@ -254,7 +266,7 @@ def get_group_key(dataset_name, params):
         params.get('num_threads', 8),
         resolve_query_threads(params),
         params.get('num_cpu', 0),
-        params.get('dtype', 'float'),
+        effective_dtype(dataset, params),
     )
 
 
@@ -303,7 +315,7 @@ def run_batch():
                 skipped += 1
                 continue
 
-            gk = get_group_key(dataset['name'], params)
+            gk = get_group_key(dataset, params)
             if gk not in groups:
                 groups[gk] = []
             groups[gk].append((dataset, dict(params)))
@@ -339,7 +351,7 @@ def run_batch():
             # 组内首个实际运行的任务处理 graph 加载/构建
             if is_first:
                 graph_path = get_graph_path(dataset, params)
-                graph_key = (dataset['name'], params.get('dtype', 'float'),
+                graph_key = (dataset['name'], effective_dtype(dataset, params),
                              params['m'], params['ef_construction'], params['limited_level'])
                 if os.path.exists(graph_path) or graph_key in built_graphs:
                     cmd += ["--graph_path", graph_path]
@@ -364,7 +376,7 @@ def run_batch():
             if not is_last:
                 flags.append("no_cleanup")
             flag_str = f" [{','.join(flags)}]" if flags else ""
-            description = (f"dtype={params.get('dtype', 'float')} m={params['m']} {mode_str} {layer_str} "
+            description = (f"dtype={effective_dtype(dataset, params)} m={params['m']} {mode_str} {layer_str} "
                            f"efs={efs}{flag_str}")
 
             run_worker(cmd, task_idx, total_runs, description)

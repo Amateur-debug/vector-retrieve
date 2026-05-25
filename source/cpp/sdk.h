@@ -4,6 +4,7 @@
 #include <chrono>
 #include <future>
 #include <sys/time.h>
+#include <poll.h>
 #include <thread>
 #include <vector>
 
@@ -310,8 +311,10 @@ public:
             serialize_payload(buf, payload, (const HNSWGraph<T>*)nullptr);
 
             uint64_t msg_size = buf.data.size();
+            double send_start_ms = steady_now_ms();
             transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
             transport->send_raw(sockfd, buf.data.data(), msg_size);
+            payload.send_ms += steady_now_ms() - send_start_ms;
         } catch (...) {
             disconnect();
             throw;
@@ -324,10 +327,20 @@ public:
     {
         try {
             uint64_t resp_size = 0;
+            struct pollfd pfd{sockfd, POLLIN, 0};
+            int pret;
+            do {
+                pret = ::poll(&pfd, 1, -1);
+            } while (pret < 0 && errno == EINTR);
+            if (pret <= 0 || !(pfd.revents & POLLIN)) {
+                throw std::runtime_error("query_recv: socket not readable");
+            }
+            double recv_start_ms = steady_now_ms();
             transport->recv_raw(sockfd, &resp_size, sizeof(uint64_t));
 
             std::vector<char> resp_data(resp_size);
             transport->recv_raw(sockfd, resp_data.data(), resp_size);
+            double recv_ms = steady_now_ms() - recv_start_ms;
 
             Buffer resp_buf;
             resp_buf.data = std::move(resp_data);
@@ -342,6 +355,7 @@ public:
             Payload<DistT> payload;
             // 客户端收回的堆项被置为 -(vid+1) 编码；客户端不再搜索，仅保留统计信息
             deserialize_payload(resp_buf, payload, (const HNSWGraph<T>*)nullptr);
+            payload.recv_ms += recv_ms;
 
             return {query_id, std::move(results), std::move(payload)};
         } catch (...) {
@@ -402,7 +416,7 @@ public:
         }
     }
 
-    void partition(const std::string &mode, int redundancy = 1, const std::unordered_map<int, std::vector<int>> &layer_config = {}, const std::string &layer_partition_mode = "round_robin", const std::vector<bool> &layer_replicate_flags = {}, int num_threads = 0)
+    void partition(const std::string &mode, int redundancy = 1, const std::unordered_map<int, std::vector<int>> &layer_config = {}, const std::string &layer_partition_mode = "round_robin", const std::vector<bool> &layer_replicate_flags = {}, int num_threads = 0, const std::string &partition_distribution = "network-send", const std::string &partition_base = "")
     {
         if (!connected && !connect()) {
             throw std::runtime_error("Failed to connect to cluster");
@@ -417,6 +431,8 @@ public:
             buf.write_string(layer_partition_mode);
             serialize_layer_replicate_flags(buf, layer_replicate_flags);
             buf.write_val(num_threads);
+            buf.write_string(partition_distribution);
+            buf.write_string(partition_base);
 
             uint64_t msg_size = buf.data.size();
             transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
@@ -582,6 +598,51 @@ public:
             throw;
         }
         disconnect();
+    }
+
+    void release_full_hnsw()
+    {
+        if (!connected && !connect()) {
+            throw std::runtime_error("Failed to connect to cluster");
+        }
+
+        try {
+            Buffer buf;
+            buf.write_val((int)MSG_RELEASE_FULL_HNSW);
+
+            uint64_t msg_size = buf.data.size();
+            transport->send_raw(sockfd, &msg_size, sizeof(uint64_t));
+            transport->send_raw(sockfd, buf.data.data(), msg_size);
+
+            char ack = 0;
+            transport->recv_raw(sockfd, &ack, 1);
+            if (ack != 1) {
+                throw std::runtime_error("Failed to release full hnsw");
+            }
+        } catch (...) {
+            disconnect();
+            throw;
+        }
+        disconnect();
+    }
+
+    void release_full_hnsw_all()
+    {
+        std::vector<std::future<void>> futures;
+        futures.reserve(all_work_endpoints.size());
+        for (size_t i = 0; i < all_work_endpoints.size(); i++)
+        {
+            futures.push_back(std::async(std::launch::async, [this, i]() {
+                const auto &endpoint = all_work_endpoints[i];
+                ClusterSDKClient node_client(endpoint.ip, endpoint.port, transport_config.comm_mode);
+                if (!node_client.connect())
+                    throw std::runtime_error("Failed to connect to node " + std::to_string(i) + " for full graph release");
+                try { node_client.release_full_hnsw(); }
+                catch (...) { node_client.disconnect(); throw; }
+                node_client.disconnect();
+            }));
+        }
+        for (auto &f : futures) f.get();
     }
 
     // 专用参数设置接口：运行时更新已加载图的可调参数。

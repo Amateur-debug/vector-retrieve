@@ -35,6 +35,15 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("send_timestamp", &Payload<float>::send_timestamp)
         .def_readwrite("distance_cnt", &Payload<float>::distance_cnt)
         .def_readwrite("backtrack_cnt", &Payload<float>::backtrack_cnt)
+        .def_readwrite("query_start_ms", &Payload<float>::query_start_ms)
+        .def_readwrite("total_ms", &Payload<float>::total_ms)
+        .def_readwrite("search_ms", &Payload<float>::search_ms)
+        .def_readwrite("serialize_ms", &Payload<float>::serialize_ms)
+        .def_readwrite("deserialize_ms", &Payload<float>::deserialize_ms)
+        .def_readwrite("send_ms", &Payload<float>::send_ms)
+        .def_readwrite("recv_ms", &Payload<float>::recv_ms)
+        .def_readwrite("queue_ms", &Payload<float>::queue_ms)
+        .def_readwrite("result_ms", &Payload<float>::result_ms)
         .def_readwrite("results", &Payload<float>::results)
         .def("topk_ids", &Payload<float>::topk_ids, py::arg("k"));
 
@@ -52,6 +61,15 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("send_timestamp", &Payload<double>::send_timestamp)
         .def_readwrite("distance_cnt", &Payload<double>::distance_cnt)
         .def_readwrite("backtrack_cnt", &Payload<double>::backtrack_cnt)
+        .def_readwrite("query_start_ms", &Payload<double>::query_start_ms)
+        .def_readwrite("total_ms", &Payload<double>::total_ms)
+        .def_readwrite("search_ms", &Payload<double>::search_ms)
+        .def_readwrite("serialize_ms", &Payload<double>::serialize_ms)
+        .def_readwrite("deserialize_ms", &Payload<double>::deserialize_ms)
+        .def_readwrite("send_ms", &Payload<double>::send_ms)
+        .def_readwrite("recv_ms", &Payload<double>::recv_ms)
+        .def_readwrite("queue_ms", &Payload<double>::queue_ms)
+        .def_readwrite("result_ms", &Payload<double>::result_ms)
         .def_readwrite("results", &Payload<double>::results)
         .def("topk_ids", &Payload<double>::topk_ids, py::arg("k"));
 
@@ -69,6 +87,15 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("send_timestamp", &Payload<int32_t>::send_timestamp)
         .def_readwrite("distance_cnt", &Payload<int32_t>::distance_cnt)
         .def_readwrite("backtrack_cnt", &Payload<int32_t>::backtrack_cnt)
+        .def_readwrite("query_start_ms", &Payload<int32_t>::query_start_ms)
+        .def_readwrite("total_ms", &Payload<int32_t>::total_ms)
+        .def_readwrite("search_ms", &Payload<int32_t>::search_ms)
+        .def_readwrite("serialize_ms", &Payload<int32_t>::serialize_ms)
+        .def_readwrite("deserialize_ms", &Payload<int32_t>::deserialize_ms)
+        .def_readwrite("send_ms", &Payload<int32_t>::send_ms)
+        .def_readwrite("recv_ms", &Payload<int32_t>::recv_ms)
+        .def_readwrite("queue_ms", &Payload<int32_t>::queue_ms)
+        .def_readwrite("result_ms", &Payload<int32_t>::result_ms)
         .def_readwrite("results", &Payload<int32_t>::results)
         .def("topk_ids", &Payload<int32_t>::topk_ids, py::arg("k"));
 
@@ -86,6 +113,15 @@ PYBIND11_MODULE(vector_retrieve, m)
         .def_readwrite("send_timestamp", &Payload<uint32_t>::send_timestamp)
         .def_readwrite("distance_cnt", &Payload<uint32_t>::distance_cnt)
         .def_readwrite("backtrack_cnt", &Payload<uint32_t>::backtrack_cnt)
+        .def_readwrite("query_start_ms", &Payload<uint32_t>::query_start_ms)
+        .def_readwrite("total_ms", &Payload<uint32_t>::total_ms)
+        .def_readwrite("search_ms", &Payload<uint32_t>::search_ms)
+        .def_readwrite("serialize_ms", &Payload<uint32_t>::serialize_ms)
+        .def_readwrite("deserialize_ms", &Payload<uint32_t>::deserialize_ms)
+        .def_readwrite("send_ms", &Payload<uint32_t>::send_ms)
+        .def_readwrite("recv_ms", &Payload<uint32_t>::recv_ms)
+        .def_readwrite("queue_ms", &Payload<uint32_t>::queue_ms)
+        .def_readwrite("result_ms", &Payload<uint32_t>::result_ms)
         .def_readwrite("results", &Payload<uint32_t>::results)
         .def("topk_ids", &Payload<uint32_t>::topk_ids, py::arg("k"));
 
@@ -340,7 +376,7 @@ PYBIND11_MODULE(vector_retrieve, m)
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123, py::arg("num_threads") = 0)
         .def("outer_ring", &Cluster<float>::outer_ring)
         .def("partition", &Cluster<float>::partition,
-             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
+             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0, py::arg("partition_distribution") = "network-send", py::arg("partition_base") = "")
         .def("set_node_info", &Cluster<float>::set_node_info,
              py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
         .def("start_node_server", &Cluster<float>::start_node_server,
@@ -400,7 +436,7 @@ PYBIND11_MODULE(vector_retrieve, m)
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123, py::arg("num_threads") = 0)
         .def("outer_ring", &Cluster<double>::outer_ring)
         .def("partition", &Cluster<double>::partition,
-             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
+             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0, py::arg("partition_distribution") = "network-send", py::arg("partition_base") = "")
         .def("set_node_info", &Cluster<double>::set_node_info,
              py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
         .def("start_node_server", &Cluster<double>::start_node_server,
@@ -460,7 +496,7 @@ PYBIND11_MODULE(vector_retrieve, m)
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123, py::arg("num_threads") = 0)
         .def("outer_ring", &Cluster<int32_t>::outer_ring)
         .def("partition", &Cluster<int32_t>::partition,
-             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
+             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0, py::arg("partition_distribution") = "network-send", py::arg("partition_base") = "")
         .def("set_node_info", &Cluster<int32_t>::set_node_info,
              py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
         .def("start_node_server", &Cluster<int32_t>::start_node_server,
@@ -520,7 +556,7 @@ PYBIND11_MODULE(vector_retrieve, m)
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123, py::arg("num_threads") = 0)
         .def("outer_ring", &Cluster<uint32_t>::outer_ring)
         .def("partition", &Cluster<uint32_t>::partition,
-             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
+             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0, py::arg("partition_distribution") = "network-send", py::arg("partition_base") = "")
         .def("set_node_info", &Cluster<uint32_t>::set_node_info,
              py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
         .def("start_node_server", &Cluster<uint32_t>::start_node_server,
@@ -561,12 +597,18 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
         .def("load_cluster_all", &ClusterSDKClient<float>::load_cluster_all,
              py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
+        .def("release_full_hnsw", &ClusterSDKClient<float>::release_full_hnsw,
+             py::call_guard<py::gil_scoped_release>())
+        .def("release_full_hnsw_all", &ClusterSDKClient<float>::release_full_hnsw_all,
+             py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<float>::partition,
              py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
              py::arg("layer_partition_mode") = "round_robin",
              py::arg("layer_replicate_flags") = std::vector<bool>{},
              py::arg("num_threads") = 0,
+             py::arg("partition_distribution") = "network-send",
+             py::arg("partition_base") = "",
              py::call_guard<py::gil_scoped_release>())
         .def("set_hnsw_params", &ClusterSDKClient<float>::set_hnsw_params,
              py::arg("ef_search") = -1,
@@ -617,12 +659,18 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
         .def("load_cluster_all", &ClusterSDKClient<double>::load_cluster_all,
              py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
+        .def("release_full_hnsw", &ClusterSDKClient<double>::release_full_hnsw,
+             py::call_guard<py::gil_scoped_release>())
+        .def("release_full_hnsw_all", &ClusterSDKClient<double>::release_full_hnsw_all,
+             py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<double>::partition,
              py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
              py::arg("layer_partition_mode") = "round_robin",
              py::arg("layer_replicate_flags") = std::vector<bool>{},
              py::arg("num_threads") = 0,
+             py::arg("partition_distribution") = "network-send",
+             py::arg("partition_base") = "",
              py::call_guard<py::gil_scoped_release>())
         .def("set_hnsw_params", &ClusterSDKClient<double>::set_hnsw_params,
              py::arg("ef_search") = -1,
@@ -673,12 +721,18 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
         .def("load_cluster_all", &ClusterSDKClient<int32_t>::load_cluster_all,
              py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
+        .def("release_full_hnsw", &ClusterSDKClient<int32_t>::release_full_hnsw,
+             py::call_guard<py::gil_scoped_release>())
+        .def("release_full_hnsw_all", &ClusterSDKClient<int32_t>::release_full_hnsw_all,
+             py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<int32_t>::partition,
              py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
              py::arg("layer_partition_mode") = "round_robin",
              py::arg("layer_replicate_flags") = std::vector<bool>{},
              py::arg("num_threads") = 0,
+             py::arg("partition_distribution") = "network-send",
+             py::arg("partition_base") = "",
              py::call_guard<py::gil_scoped_release>())
         .def("set_hnsw_params", &ClusterSDKClient<int32_t>::set_hnsw_params,
              py::arg("ef_search") = -1,
@@ -729,12 +783,18 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
         .def("load_cluster_all", &ClusterSDKClient<uint32_t>::load_cluster_all,
              py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
+        .def("release_full_hnsw", &ClusterSDKClient<uint32_t>::release_full_hnsw,
+             py::call_guard<py::gil_scoped_release>())
+        .def("release_full_hnsw_all", &ClusterSDKClient<uint32_t>::release_full_hnsw_all,
+             py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<uint32_t>::partition,
              py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
              py::arg("layer_partition_mode") = "round_robin",
              py::arg("layer_replicate_flags") = std::vector<bool>{},
              py::arg("num_threads") = 0,
+             py::arg("partition_distribution") = "network-send",
+             py::arg("partition_base") = "",
              py::call_guard<py::gil_scoped_release>())
         .def("set_hnsw_params", &ClusterSDKClient<uint32_t>::set_hnsw_params,
              py::arg("ef_search") = -1,
@@ -856,7 +916,7 @@ PYBIND11_MODULE(vector_retrieve, m)
                     py::arg("data"), py::arg("k"), py::arg("max_iters") = 100, py::arg("seed") = 123, py::arg("num_threads") = 0)
         .def("outer_ring", &Cluster<uint8_t>::outer_ring)
         .def("partition", &Cluster<uint8_t>::partition,
-             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0)
+             py::arg("mode"), py::arg("replication") = 1, py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{}, py::arg("layer_partition_mode") = "round_robin", py::arg("layer_replicate_flags") = std::vector<bool>{}, py::arg("num_threads") = 0, py::arg("partition_distribution") = "network-send", py::arg("partition_base") = "")
         .def("set_node_info", &Cluster<uint8_t>::set_node_info,
              py::arg("node_id"), py::arg("ip"), py::arg("port"), py::arg("is_remote"))
         .def("start_node_server", &Cluster<uint8_t>::start_node_server,
@@ -896,12 +956,18 @@ PYBIND11_MODULE(vector_retrieve, m)
              py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
         .def("load_cluster_all", &ClusterSDKClient<uint8_t>::load_cluster_all,
              py::arg("basepath"), py::call_guard<py::gil_scoped_release>())
+        .def("release_full_hnsw", &ClusterSDKClient<uint8_t>::release_full_hnsw,
+             py::call_guard<py::gil_scoped_release>())
+        .def("release_full_hnsw_all", &ClusterSDKClient<uint8_t>::release_full_hnsw_all,
+             py::call_guard<py::gil_scoped_release>())
         .def("partition", &ClusterSDKClient<uint8_t>::partition,
              py::arg("mode"), py::arg("replication") = 1,
              py::arg("layer_config") = std::unordered_map<int, std::vector<int>>{},
              py::arg("layer_partition_mode") = "round_robin",
              py::arg("layer_replicate_flags") = std::vector<bool>{},
              py::arg("num_threads") = 0,
+             py::arg("partition_distribution") = "network-send",
+             py::arg("partition_base") = "",
              py::call_guard<py::gil_scoped_release>())
         .def("set_hnsw_params", &ClusterSDKClient<uint8_t>::set_hnsw_params,
              py::arg("ef_search") = -1,

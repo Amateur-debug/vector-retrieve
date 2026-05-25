@@ -19,15 +19,18 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <queue>
 #include <random>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <functional>
@@ -107,6 +110,10 @@ public:
 
     // === 本地向量子集标记（分布式模式下使用） ===
     std::unordered_set<int> local_vids_;  // 本地持有向量数据的 vid 集合（空集合表示持有全部向量）
+    bool is_compacted_graph_ = false;
+    std::unordered_map<int, int> local_vid_ring_;
+    std::vector<uint64_t> iid_outermost_bits_;
+    int replication_level_ = 0;
 
     // === global-pull 模式：完整图骨架 + 按需远程拉取向量 ===
     // 开启后跳过 compact()，label_lookup_ 保留所有 vid；邻居列表全部为正数 internal_id。
@@ -183,6 +190,11 @@ public:
     // ========================================================
     ~HNSWGraph()
     {
+        release_storage();
+    }
+
+    void release_storage()
+    {
         if (data_level0_)
         {
             free(data_level0_);
@@ -198,6 +210,22 @@ public:
             free(link_lists_);
             link_lists_ = nullptr;
         }
+        link_locks_.clear();
+        link_locks_.shrink_to_fit();
+        element_levels_.clear();
+        element_levels_.shrink_to_fit();
+        std::unordered_map<int, int>().swap(label_lookup_);
+        std::unordered_set<int>().swap(local_vids_);
+        std::unordered_map<int, int>().swap(local_vid_ring_);
+        std::vector<uint64_t>().swap(iid_outermost_bits_);
+        visited_pool_.reset();
+        pull_fetcher_ = nullptr;
+        cur_element_count_ = 0;
+        max_elements_ = 0;
+        max_level = 0;
+        entry_point_id = -1;
+        is_compacted_graph_ = false;
+        is_global_pull_mode_ = false;
     }
 
     // 禁止拷贝构造和拷贝赋值（包含大量原始指针和互斥锁，拷贝语义不明确）
@@ -248,6 +276,35 @@ public:
     inline void set_list_count(int *data, int count)
     {
         data[0] = count;
+    }
+
+    void resize_outermost_bits(size_t n)
+    {
+        iid_outermost_bits_.assign((n + 63) / 64, 0);
+    }
+
+    inline void set_iid_outermost(int iid, bool value = true)
+    {
+        if (iid < 0)
+            return;
+        size_t idx = (size_t)iid / 64;
+        if (idx >= iid_outermost_bits_.size())
+            iid_outermost_bits_.resize(idx + 1, 0);
+        uint64_t mask = uint64_t{1} << ((size_t)iid % 64);
+        if (value)
+            iid_outermost_bits_[idx] |= mask;
+        else
+            iid_outermost_bits_[idx] &= ~mask;
+    }
+
+    inline bool is_iid_outermost(int iid) const
+    {
+        if (iid < 0)
+            return false;
+        size_t idx = (size_t)iid / 64;
+        if (idx >= iid_outermost_bits_.size())
+            return false;
+        return (iid_outermost_bits_[idx] & (uint64_t{1} << ((size_t)iid % 64))) != 0;
     }
 
     // ========================================================
@@ -311,16 +368,12 @@ public:
         size_t local_count = local_vids_.size();
 
         // 1. 构建 old_id -> new_id 映射（仅本地向量）
-        //    同时构建 vid -> old_id 映射（用于邻居列表中远程 vid 编码）
         std::vector<int> old_to_new(old_count, -1);  // -1 表示非本地
-        std::unordered_map<int, int> vid_to_old;      // vid -> old_internal_id
-        vid_to_old.reserve(old_count);
 
         int new_id = 0;
         for (size_t i = 0; i < old_count; i++)
         {
             int vid = get_external_label((int)i);
-            vid_to_old[vid] = (int)i;
             if (local_vids_.count(vid))
             {
                 old_to_new[i] = new_id++;
@@ -340,6 +393,7 @@ public:
         memset(new_links, 0, sizeof(char *) * new_max);
 
         std::vector<int> new_element_levels(new_max, 0);
+        std::vector<uint64_t> new_iid_outermost_bits((new_max + 63) / 64, 0);
 
         // 3. 拷贝本地向量数据到新位置
         for (size_t i = 0; i < old_count; i++)
@@ -359,6 +413,10 @@ public:
                 memcpy(new_links[nid], link_lists_[i], link_size);
             }
             new_element_levels[nid] = element_levels_[i];
+            int vid = get_external_label((int)i);
+            auto ring_it = local_vid_ring_.find(vid);
+            if (replication_level_ > 0 && ring_it != local_vid_ring_.end() && ring_it->second == replication_level_)
+                new_iid_outermost_bits[(size_t)nid / 64] |= uint64_t{1} << ((size_t)nid % 64);
         }
 
         // 4. 更新所有邻居列表中的 internal_id 引用
@@ -422,29 +480,35 @@ public:
         data_level0_ = new_data;
         link_lists_ = new_links;
         element_levels_ = std::move(new_element_levels);
+        iid_outermost_bits_ = std::move(new_iid_outermost_bits);
 
         // 7. 重建 label_lookup_（仅本地向量）
-        label_lookup_.clear();
+        std::unordered_map<int, int> new_label_lookup;
+        new_label_lookup.reserve(local_count);
         for (int nid = 0; nid < (int)local_count; nid++)
         {
             int vid = get_external_label(nid);
-            label_lookup_[vid] = nid;
+            new_label_lookup[vid] = nid;
         }
+        label_lookup_.swap(new_label_lookup);
 
         // 8. 更新容量和计数
         cur_element_count_ = local_count;
         max_elements_ = new_max;
 
         // 9. 重建锁和 visited_pool
-        link_locks_.clear();
-        link_locks_.resize(new_max);
+        std::vector<std::unique_ptr<std::mutex>> new_link_locks;
+        new_link_locks.resize(new_max);
         for (size_t i = 0; i < new_max; i++)
-            link_locks_[i] = std::make_unique<std::mutex>();
+            new_link_locks[i] = std::make_unique<std::mutex>();
+        link_locks_.swap(new_link_locks);
 
         visited_pool_ = std::make_unique<VisitedListPool>(1, new_max);
 
-        // 10. compact 后 local_vids_ 不再需要：所有本地向量就是 [0, local_count)
-        //     但保留它用于外部判断（如 add_vector 后的路由）
+        is_compacted_graph_ = true;
+        std::unordered_set<int>().swap(local_vids_);
+        std::unordered_map<int, int>().swap(local_vid_ring_);
+        log_memory_breakdown("[compact]");
     }
 
     // ========================================================
@@ -1078,7 +1142,7 @@ public:
         unsigned short *visited_array = vl->visited_array;
         unsigned short visited_tag = vl->cur_tag;
 
-        bool is_compacted = !local_vids_.empty();
+        bool is_compacted = is_compacted_graph_;
         const bool arrived_from_transfer = payload.continue_search;
         const int arrived_require_id = payload.require_id;
         const bool arrived_for_pending = arrived_from_transfer && !payload.pending_vids.empty() &&
@@ -1196,6 +1260,7 @@ public:
 
         // ---- 搜索主循环：堆内 (dist, key) 以 iid 编码 ----
         DistT lower_bound = payload.results.empty() ? std::numeric_limits<DistT>::max() : payload.results.top().first;
+        const bool ring_transfer_enabled = replication_level_ > 0 && is_compacted && !iid_outermost_bits_.empty();
 
         auto expand_local_node = [&](int cur_node) -> bool {
             int *ll_cur;
@@ -1312,6 +1377,15 @@ public:
                 continue;
             }
 
+            if (ring_transfer_enabled && is_iid_outermost(cand_key))
+            {
+                payload.continue_search = true;
+                payload.require_id = get_external_label(cand_key);
+                payload.start_level = level;
+                visited_pool_->release_list(vl);
+                return;
+            }
+
             if (expand_local_node(cand_key))
             {
                 visited_pool_->release_list(vl);
@@ -1333,6 +1407,14 @@ public:
     // ========================================================
     std::vector<int> query(const std::vector<T> &query_vector, Payload<DistT> &payload, int k)
     {
+        double timing_start_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto timing_guard = [&]() {
+            double timing_end_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            payload.search_ms += timing_end_ms - timing_start_ms;
+        };
+        struct Guard { decltype(timing_guard) &fn; ~Guard() { fn(); } } guard{timing_guard};
         if (cur_element_count_.load() == 0)
             return {};
 
@@ -1455,6 +1537,81 @@ public:
     size_t get_cur_element_count() const
     {
         return cur_element_count_.load();
+    }
+
+    size_t high_level_link_bytes() const
+    {
+        if (!link_lists_)
+            return 0;
+        size_t total = 0;
+        size_t cur_count = cur_element_count_.load();
+        for (size_t i = 0; i < cur_count; i++)
+            if (link_lists_[i] && element_levels_[i] > 0)
+                total += (size_t)element_levels_[i] * size_links_per_element_;
+        return total;
+    }
+
+    size_t estimated_owned_bytes() const
+    {
+        return max_elements_ * size_per_element_
+             + max_elements_ * sizeof(char *)
+             + high_level_link_bytes()
+             + element_levels_.capacity() * sizeof(int)
+             + iid_outermost_bits_.capacity() * sizeof(uint64_t)
+             + link_locks_.capacity() * sizeof(std::unique_ptr<std::mutex>)
+             + label_lookup_.bucket_count() * sizeof(void *)
+             + label_lookup_.size() * (sizeof(std::pair<const int, int>) + sizeof(void *))
+             + local_vids_.bucket_count() * sizeof(void *)
+             + local_vids_.size() * (sizeof(int) + sizeof(void *))
+             + local_vid_ring_.bucket_count() * sizeof(void *)
+             + local_vid_ring_.size() * (sizeof(std::pair<const int, int>) + sizeof(void *));
+    }
+
+    static std::string format_bytes(size_t bytes)
+    {
+        const double gib = (double)bytes / (1024.0 * 1024.0 * 1024.0);
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2) << gib << " GiB (" << bytes << " B)";
+        return oss.str();
+    }
+
+    void log_memory_breakdown(const std::string &prefix) const
+    {
+        size_t data_level0_bytes = max_elements_ * size_per_element_;
+        size_t link_ptr_bytes = max_elements_ * sizeof(char *);
+        size_t high_link_bytes = high_level_link_bytes();
+        size_t levels_bytes = element_levels_.capacity() * sizeof(int);
+        size_t iid_outermost_bits_bytes = iid_outermost_bits_.capacity() * sizeof(uint64_t);
+        size_t lock_ptr_bytes = link_locks_.capacity() * sizeof(std::unique_ptr<std::mutex>);
+        size_t label_bucket_bytes = label_lookup_.bucket_count() * sizeof(void *);
+        size_t label_node_bytes = label_lookup_.size() * (sizeof(std::pair<const int, int>) + sizeof(void *));
+        size_t local_vid_bucket_bytes = local_vids_.bucket_count() * sizeof(void *);
+        size_t local_vid_node_bytes = local_vids_.size() * (sizeof(int) + sizeof(void *));
+        size_t local_ring_bucket_bytes = local_vid_ring_.bucket_count() * sizeof(void *);
+        size_t local_ring_node_bytes = local_vid_ring_.size() * (sizeof(std::pair<const int, int>) + sizeof(void *));
+        size_t visited_per_thread_bytes = max_elements_ * sizeof(unsigned short);
+        size_t total = data_level0_bytes + link_ptr_bytes + high_link_bytes + levels_bytes + iid_outermost_bits_bytes + lock_ptr_bytes
+                     + label_bucket_bytes + label_node_bytes + local_vid_bucket_bytes + local_vid_node_bytes
+                     + local_ring_bucket_bytes + local_ring_node_bytes;
+
+        LOG_INFO_STREAM(prefix << " HNSW memory estimate: total=" << format_bytes(total)
+                        << ", elements=" << cur_element_count_.load() << "/" << max_elements_
+                        << ", dim=" << dim << ", sizeof(T)=" << sizeof(T)
+                        << ", compacted=" << (is_compacted_graph_ ? "true" : "false")
+                        << ", global_pull=" << (is_global_pull_mode_ ? "true" : "false"));
+        LOG_INFO_STREAM(prefix << " HNSW memory detail: data_level0=" << format_bytes(data_level0_bytes)
+                        << ", link_ptrs=" << format_bytes(link_ptr_bytes)
+                        << ", high_links=" << format_bytes(high_link_bytes)
+                        << ", element_levels=" << format_bytes(levels_bytes)
+                        << ", iid_outermost_bits=" << format_bytes(iid_outermost_bits_bytes)
+                        << ", link_lock_ptrs=" << format_bytes(lock_ptr_bytes));
+        LOG_INFO_STREAM(prefix << " HNSW map memory detail: label_lookup=" << format_bytes(label_bucket_bytes + label_node_bytes)
+                        << " entries=" << label_lookup_.size() << " buckets=" << label_lookup_.bucket_count()
+                        << ", local_vids=" << format_bytes(local_vid_bucket_bytes + local_vid_node_bytes)
+                        << " entries=" << local_vids_.size() << " buckets=" << local_vids_.bucket_count()
+                        << ", local_vid_ring=" << format_bytes(local_ring_bucket_bytes + local_ring_node_bytes)
+                        << " entries=" << local_vid_ring_.size() << " buckets=" << local_vid_ring_.bucket_count());
+        LOG_INFO_STREAM(prefix << " HNSW visited estimate: per active query thread=" << format_bytes(visited_per_thread_bytes));
     }
 
     // ========================================================

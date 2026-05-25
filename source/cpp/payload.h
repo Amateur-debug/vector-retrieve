@@ -23,6 +23,15 @@ struct PayloadHeader {
     int pull_cnt;
     uint64_t pull_data;
     int backtrack_cnt;
+    double query_start_ms;
+    double total_ms;
+    double search_ms;
+    double serialize_ms;
+    double deserialize_ms;
+    double send_ms;
+    double recv_ms;
+    double queue_ms;
+    double result_ms;
 };
 
 // 通用 PQHack：直接访问 priority_queue 的底层 vector 容器（protected 成员 c）。
@@ -64,6 +73,16 @@ struct Payload {
     // 折返次数累计：target_node_id 命中 recent_nodes 的次数。
     int backtrack_cnt = 0;
 
+    double query_start_ms = 0.0;
+    double total_ms = 0.0;
+    double search_ms = 0.0;
+    double serialize_ms = 0.0;
+    double deserialize_ms = 0.0;
+    double send_ms = 0.0;
+    double recv_ms = 0.0;
+    double queue_ms = 0.0;
+    double result_ms = 0.0;
+
     // 跨节点序列化传输的已访问向量 vid 列表（外部 ID），表示距离已计算。
     // 选用 vector<int> 而非 set：序列化走单次 bulk memcpy，成本最低。
     // 节点内部本地向量的 visited 判重仍由 VisitedListPool（基于 internal_id）独立管理；
@@ -89,7 +108,9 @@ struct Payload {
     PayloadHeader to_header() const {
         return {continue_search, origin_node_id, require_id, start_level,
                 entry_point_id, remote_transfer_cnt, remote_transfer_data,
-                send_timestamp, distance_cnt, pull_cnt, pull_data, backtrack_cnt};
+                send_timestamp, distance_cnt, pull_cnt, pull_data, backtrack_cnt,
+                query_start_ms, total_ms, search_ms, serialize_ms, deserialize_ms,
+                send_ms, recv_ms, queue_ms, result_ms};
     }
 
     // 从 PayloadHeader 恢复标量字段
@@ -106,6 +127,15 @@ struct Payload {
         pull_cnt = h.pull_cnt;
         pull_data = h.pull_data;
         backtrack_cnt = h.backtrack_cnt;
+        query_start_ms = h.query_start_ms;
+        total_ms = h.total_ms;
+        search_ms = h.search_ms;
+        serialize_ms = h.serialize_ms;
+        deserialize_ms = h.deserialize_ms;
+        send_ms = h.send_ms;
+        recv_ms = h.recv_ms;
+        queue_ms = h.queue_ms;
+        result_ms = h.result_ms;
     }
 
     void clear() {

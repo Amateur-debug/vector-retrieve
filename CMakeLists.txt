@@ -110,8 +110,14 @@ set(OPT_FLAGS
     -ffast-math                   # Fast math (safe for distance computations)
 )
 
-# Enable architecture-specific optimizations if supported
-if(COMPILER_SUPPORTS_MARCH_NATIVE)
+# PORTABLE_BUILD=1 时构建跨 Intel/AMD 通用的二进制：用 -march=x86-64-v3
+# （AVX2+FMA 基线，无 AVX-512），让 binary 既能在 Xeon 也能在 EPYC 上跑。
+# 否则用 -march=native + 启用 AVX-512（如可用），获得本机最优性能。
+if(DEFINED ENV{PORTABLE_BUILD} AND "$ENV{PORTABLE_BUILD}" STREQUAL "1")
+    list(APPEND OPT_FLAGS -march=x86-64-v3)
+    message(STATUS "Enabled: -march=x86-64-v3 (portable AVX2 baseline)")
+    set(SKIP_AVX512 TRUE)
+elseif(COMPILER_SUPPORTS_MARCH_NATIVE)
     list(APPEND OPT_FLAGS -march=native)
     message(STATUS "Enabled: -march=native")
 endif()
@@ -120,12 +126,12 @@ endif()
 # SIMD instruction set flags (priority: AVX-512 > AVX2 > AVX > SSE)
 # -----------------------------------------------------------------------------
 
-if(COMPILER_SUPPORTS_AVX512F)
+if(COMPILER_SUPPORTS_AVX512F AND NOT SKIP_AVX512)
     # AVX-512: 512-bit vectors, 16 floats per operation
     list(APPEND OPT_FLAGS -mavx512f -mavx512dq -mavx512vl)
     list(APPEND OPT_FLAGS -DUSE_AVX512)
     message(STATUS "Enabled: AVX-512 SIMD instructions")
-    
+
 elseif(COMPILER_SUPPORTS_AVX2 AND COMPILER_SUPPORTS_FMA)
     # AVX2 + FMA: 256-bit vectors, 8 floats per operation with fused multiply-add
     list(APPEND OPT_FLAGS -mavx2 -mfma)
