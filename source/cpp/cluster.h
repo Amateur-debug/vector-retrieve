@@ -10,13 +10,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <map>
 #include <mutex>
 #include <deque>
@@ -1979,6 +1982,165 @@ public:
         return kmeans_core(ptrs, n, dim, k, max_iters, seed, num_threads);
     }
 
+    // Fennel 流式图分区（Tsourakakis et al., WSDM 2014），单遍 + restreaming。
+    // 直接零拷贝读 HNSW linklist，额外内存仅 O(n) 标签数组（~4 字节/顶点），永不 OOM。
+    // members 为空 => 全图（level 0，local idx == internal_id）；非空 => 该层子图（用 level 层 linklist）。
+    // 返回 labels：members 为空时按 internal_id 0..n-1，非空时按 members 顺序，取值 [0, k)。
+    // 参数：passes restream 遍数；gamma Fennel 指数（默认 1.5）；nu 平衡硬上限系数（每分区 <= nu*n/k）。
+    // seed_labels（可选）：初始标签种子（大小须 == n,取值 [0,k)）。用于 kmeans-fennel：
+    //   以 k-means 结果作初始分区,再用 Fennel restream 沿图边精修。nullptr=冷启动(纯 fennel)。
+    static std::vector<int> fennel_partition(const HNSWGraph<T> *hnsw,
+                                             const std::vector<int> &members,
+                                             int level, int k,
+                                             int passes = 3, double gamma = 1.5,
+                                             double nu = 1.1, int seed = 123,
+                                             const std::vector<int> *seed_labels = nullptr)
+    {
+        // 环境变量覆盖（VR_FENNEL_PASSES / VR_FENNEL_BALANCE）
+        if (const char *e = std::getenv("VR_FENNEL_PASSES")) { int v = std::atoi(e); if (v > 0) passes = v; }
+        if (const char *e = std::getenv("VR_FENNEL_BALANCE")) { double v = std::atof(e); if (v >= 1.0) nu = v; }
+
+        const bool full_graph = members.empty();
+        const int n = full_graph ? (int)hnsw->get_cur_element_count() : (int)members.size();
+        std::vector<int> labels(n, -1);
+        if (n == 0 || k <= 0)
+            return labels;
+        if (k == 1)
+        {
+            std::fill(labels.begin(), labels.end(), 0);
+            return labels;
+        }
+
+        // 种子初始化（kmeans-fennel）：用 k-means 标签作为 Fennel 的起点（clamp 到 [0,k)）
+        const bool seeded = (seed_labels != nullptr && (int)seed_labels->size() == n);
+        if (seeded)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                int v = (*seed_labels)[i];
+                labels[i] = (v >= 0 && v < k) ? v : 0;
+            }
+            LOG_INFO_STREAM("[fennel] seeded with k-means labels (kmeans-fennel), n=" << n << " k=" << k);
+        }
+
+        // internal_id -> 本地下标（仅子图需要；全图为 identity）
+        std::unordered_map<int, int> id2local;
+        if (!full_graph)
+        {
+            id2local.reserve(n * 2);
+            for (int i = 0; i < n; i++)
+                id2local[members[i]] = i;
+        }
+        auto local_of = [&](int internal_id) -> int {
+            if (full_graph) return internal_id;
+            auto it = id2local.find(internal_id);
+            return it == id2local.end() ? -1 : it->second;
+        };
+        auto internal_of = [&](int i) -> int { return full_graph ? i : members[i]; };
+        auto get_links = [&](int internal_id, int &sz) -> const int * {
+            const int *ll = (level == 0) ? hnsw->get_linklist0(internal_id)
+                                         : hnsw->get_linklist(internal_id, level);
+            sz = hnsw->get_list_count(ll);
+            return ll + 1;
+        };
+
+        // 统计有向边数 m，用于 alpha = m * k^(gamma-1) / n^gamma
+        long long m = 0;
+        for (int i = 0; i < n; i++)
+        {
+            int sz;
+            get_links(internal_of(i), sz);
+            m += sz;
+        }
+        const double alpha = (double)m * std::pow((double)k, gamma - 1.0) / std::pow((double)n, gamma);
+        const double cap = nu * (double)n / (double)k; // 每分区硬平衡上限
+        const bool gamma_is_1_5 = std::fabs(gamma - 1.5) < 1e-9;
+
+        LOG_INFO_STREAM("[fennel] n=" << n << " k=" << k << " m(directed)=" << m
+                        << " alpha=" << alpha << " passes=" << passes << " gamma=" << gamma
+                        << " nu=" << nu << " cap=" << cap << " seed=" << seed
+                        << " scope=" << (full_graph ? "full" : "layer") << " level=" << level);
+
+        std::vector<long long> psize(k, 0);
+        // psize 初始化为当前 labels 的分布：冷启动全 -1 => 全 0；种子启动 => k-means 分布
+        // （这样 restream 的「先减回旧标签」逻辑对种子启动也成立）
+        for (int i = 0; i < n; i++)
+            if (labels[i] >= 0 && labels[i] < k)
+                psize[labels[i]]++;
+        std::vector<int> cnt(k, 0); // 复用缓冲，避免每顶点堆分配
+
+        for (int pass = 0; pass < passes; pass++)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                const int internal_id = internal_of(i);
+                if (labels[i] >= 0) // restream：先把旧标签计数减回
+                    psize[labels[i]]--;
+
+                std::fill(cnt.begin(), cnt.end(), 0);
+                int sz;
+                const int *nb = get_links(internal_id, sz);
+                for (int j = 0; j < sz; j++)
+                {
+                    int li = local_of(nb[j]);
+                    if (li < 0)
+                        continue;
+                    int p = labels[li];
+                    if (p >= 0)
+                        cnt[p]++;
+                }
+
+                // argmax score(p) = cnt[p] - alpha*gamma*psize[p]^(gamma-1)，受 cap 约束
+                double best_score = -std::numeric_limits<double>::infinity();
+                int best_p = -1;
+                for (int p = 0; p < k; p++)
+                {
+                    if ((double)psize[p] >= cap)
+                        continue;
+                    double pg = gamma_is_1_5 ? std::sqrt((double)psize[p])
+                                             : std::pow((double)psize[p], gamma - 1.0);
+                    double score = (double)cnt[p] - alpha * gamma * pg;
+                    if (score > best_score)
+                    {
+                        best_score = score;
+                        best_p = p;
+                    }
+                }
+                if (best_p < 0) // 所有分区都达 cap（极少见）→ 放当前最小的
+                    best_p = (int)(std::min_element(psize.begin(), psize.end()) - psize.begin());
+
+                labels[i] = best_p;
+                psize[best_p]++;
+            }
+        }
+
+        // 质量日志：各分区大小 + 跨分区边数（cut）
+        long long pmin = psize[0], pmax = psize[0];
+        for (int p = 0; p < k; p++)
+        {
+            pmin = std::min(pmin, psize[p]);
+            pmax = std::max(pmax, psize[p]);
+        }
+        long long cut = 0;
+        for (int i = 0; i < n; i++)
+        {
+            int sz;
+            const int *nb = get_links(internal_of(i), sz);
+            int pi = labels[i];
+            for (int j = 0; j < sz; j++)
+            {
+                int li = local_of(nb[j]);
+                if (li >= 0 && labels[li] != pi)
+                    cut++;
+            }
+        }
+        LOG_INFO_STREAM("[fennel] done: psize_min=" << pmin << " psize_max=" << pmax
+                        << " balance=" << (n > 0 ? (double)pmax * k / n : 0.0)
+                        << " edge_cut(directed)=" << cut
+                        << " cut_ratio=" << (m > 0 ? (double)cut / m : 0.0));
+        return labels;
+    }
+
     int outer_ring(vector<unordered_map<int, vector<T>>> &local_vectors)
     {
         // 缓存全局邻居关系和向量数据用于 outer_ring 操作
@@ -2168,6 +2330,34 @@ public:
                 add_local_vid(target, vid, 0);
             }
         }
+        else if (mode == "fennel")
+        {
+            LOG_INFO_STREAM("[partition] Running Fennel streaming partition on " << cur_count << " vectors (zero-copy from HNSW)...");
+            auto labels = fennel_partition(hnsw, {}, 0, node_num, 3, 1.5, 1.1, hnsw->seed);
+            // fennel_partition 全图模式按 internal_id 0..n-1 顺序返回 labels
+            for (size_t i = 0; i < cur_count; i++)
+            {
+                int vid = hnsw->get_external_label((int)i);
+                int target = labels[i];
+                vector_node_map[0][vid] = {target};
+                add_local_vid(target, vid, 0);
+            }
+        }
+        else if (mode == "kmeans-fennel")
+        {
+            // 先 k-means 得到初始分区(向量局部性),再用 Fennel restream 沿图边精修
+            LOG_INFO_STREAM("[partition] Running k-means seed for kmeans-fennel on " << cur_count << " vectors...");
+            auto seed_labels = kmeans_hnsw(hnsw, node_num, 100, hnsw->seed, num_threads);
+            LOG_INFO_STREAM("[partition] Refining k-means seed with Fennel restream...");
+            auto labels = fennel_partition(hnsw, {}, 0, node_num, 3, 1.5, 1.1, hnsw->seed, &seed_labels);
+            for (size_t i = 0; i < cur_count; i++)
+            {
+                int vid = hnsw->get_external_label((int)i);
+                int target = labels[i];
+                vector_node_map[0][vid] = {target};
+                add_local_vid(target, vid, 0);
+            }
+        }
         else if (mode == "outer_ring")
         {
             // 先用 k-means 分配
@@ -2267,8 +2457,56 @@ public:
                             vid_partition_map[subset_vids[i]] = labels[i];
                     }
                 }
+                else if (!is_replicate_level && layer_partition_mode == "fennel" && target_nodes.size() > 1)
+                {
+                    // 用该层 internal_id 作 members，按 level 层 linklist 跑 Fennel 流式分区（零拷贝）
+                    std::vector<int> members;
+                    std::vector<int> subset_vids;
+                    members.reserve(vids_at_level.size());
+                    subset_vids.reserve(vids_at_level.size());
+                    for (const auto &p : vids_at_level)
+                    {
+                        members.push_back(p.first);      // internal_id
+                        subset_vids.push_back(p.second); // vid
+                    }
 
-                LOG_INFO_STREAM("[layer partition] level=" << level << " vids=" << vids_at_level.size() << " mode=" << (is_replicate_level ? "replicate" : "split") << " target_nodes=[" << [&]{ std::string s; for(int n:target_nodes) s+=std::to_string(n)+","; return s; }() << "]");
+                    int sub_cnt = (int)members.size();
+                    if (sub_cnt > 0)
+                    {
+                        int k = std::min((int)target_nodes.size(), sub_cnt);
+                        auto labels = fennel_partition(hnsw, members, level, k, 3, 1.5, 1.1, hnsw->seed);
+                        for (int i = 0; i < sub_cnt; i++)
+                            vid_partition_map[subset_vids[i]] = labels[i];
+                    }
+                }
+                else if (!is_replicate_level && layer_partition_mode == "kmeans-fennel" && target_nodes.size() > 1)
+                {
+                    // 该层先 k-means(向量)播种,再 Fennel(图边)restream 精修
+                    std::vector<int> members;
+                    std::vector<int> subset_vids;
+                    std::vector<const T*> subset_ptrs;
+                    members.reserve(vids_at_level.size());
+                    subset_vids.reserve(vids_at_level.size());
+                    subset_ptrs.reserve(vids_at_level.size());
+                    for (const auto &p : vids_at_level)
+                    {
+                        members.push_back(p.first);
+                        subset_vids.push_back(p.second);
+                        subset_ptrs.push_back((const T*)hnsw->get_data_by_id(p.first));
+                    }
+
+                    int sub_cnt = (int)members.size();
+                    if (sub_cnt > 0)
+                    {
+                        int k = std::min((int)target_nodes.size(), sub_cnt);
+                        auto seed_labels = kmeans_core(subset_ptrs, sub_cnt, hnsw->dim, k, 100, hnsw->seed, num_threads);
+                        auto labels = fennel_partition(hnsw, members, level, k, 3, 1.5, 1.1, hnsw->seed, &seed_labels);
+                        for (int i = 0; i < sub_cnt; i++)
+                            vid_partition_map[subset_vids[i]] = labels[i];
+                    }
+                }
+
+                LOG_INFO_STREAM("[layer partition] level="<< level << " vids=" << vids_at_level.size() << " mode=" << (is_replicate_level ? "replicate" : "split") << " target_nodes=[" << [&]{ std::string s; for(int n:target_nodes) s+=std::to_string(n)+","; return s; }() << "]");
                 for (const auto &p : vids_at_level)
                 {
                     int vid = p.second;
@@ -2350,12 +2588,64 @@ public:
             LOG_INFO_STREAM("[partition] Adding replication (direct HNSW traversal)... n=" << n
                             << " num_threads=" << num_threads << " nthreads=" << nthreads);
 
+            // 复制策略：VR_REPL_BUDGET>0 启用加权(targeted)复制——按 cross-in-degree
+            // (该节点本地有多少向量指向该候选 = 复制它能消除多少潜在 transfer)排序,
+            // 仅取 top-(budget*|local|) 个高价值候选;未设/<=0 则均匀复制(原行为)。
+            // VR_REPL_FULL_ROUNDS：前 N 轮仍全量复制(1-hop ring 几乎全必需),只对之后的
+            // 高跳(2-hop+)轮做预算加权。默认 1 = 保 rep1 完整 + 只对 2-hop 切片加权。
+            double repl_budget = 0.0;
+            if (const char *e = std::getenv("VR_REPL_BUDGET")) repl_budget = std::atof(e);
+            int full_rounds = 1;
+            if (const char *e = std::getenv("VR_REPL_FULL_ROUNDS")) full_rounds = std::atoi(e);
+            const bool weighted_repl = repl_budget > 0.0;
+            // VR_REPL_INDEG_THRESH=τ：全局阈值模式(repN-wM 的实现)——复制所有 cross-in-degree>=τ
+            // 的候选,不分跳;连通由逐跳 frontier 保证。这是"整体按价值挑"的等价物,优先级最高。
+            int global_thresh = 0;
+            if (const char *e = std::getenv("VR_REPL_INDEG_THRESH")) global_thresh = std::atoi(e);
+            // VR_REPL_W=M：repN-wM 的全局预算(0<M<1)。在 round0 扫候选 cross-in-degree 直方图,
+            // 自动选 τ 使保留 ≈ top M%(整数 τ 粒度,取 frac>=M 的最小 τ),再对各跳统一用该 τ。
+            double repl_w = 0.0;
+            if (const char *e = std::getenv("VR_REPL_W")) repl_w = std::atof(e);
+            const bool w_mode = repl_w > 0.0 && repl_w < 1.0 && global_thresh == 0;
+            // VR_REPL_BUDGETS="0.85,0.1"：每跳独立预算(>=1.0 即该跳全量),优先于上面单值逻辑。
+            // 表达"两层都部分",如 rep0.85-0.1。被丢的低价值点会作为已复制点的邻居在下一轮
+            // 重新成为候选(=「下一轮可再争取」语义,非严格 frontier)。
+            std::vector<double> repl_budgets;
+            if (const char *e = std::getenv("VR_REPL_BUDGETS"))
+            {
+                std::string s(e), tok;
+                std::stringstream ss(s);
+                while (std::getline(ss, tok, ','))
+                    if (!tok.empty()) repl_budgets.push_back(std::atof(tok.c_str()));
+            }
+            {
+                std::ostringstream bs;
+                for (size_t x = 0; x < repl_budgets.size(); x++) bs << (x ? "," : "") << repl_budgets[x];
+                LOG_INFO_STREAM("[partition] replication mode="
+                                << (weighted_repl || !repl_budgets.empty() ? "weighted" : "uniform")
+                                << " budget_ratio=" << repl_budget << " full_rounds=" << full_rounds
+                                << " per_round_budgets=[" << bs.str() << "] rounds=" << replication);
+            }
+
             // 外层 replication 轮串行（下一轮依赖上一轮扩张后的 local_vids/vector_node_map）；
-            // 内层 vid 维度并行：每线程持有 per-thread 局部累加缓冲，循环结束归约合并到全局，无需加锁。
+            // 内层 vid 维度并行：每线程持有 per-thread 计数缓冲(候选 -> cross-in-degree)，循环结束归约。
             for (int r = 0; r < replication; r++)
             {
-                std::vector<std::vector<std::unordered_set<int>>> thread_updates(
-                    nthreads, std::vector<std::unordered_set<int>>(node_num));
+                // 本轮预算:优先用 VR_REPL_BUDGETS[r](每跳独立);否则回退 full_rounds+单值。
+                double round_budget;
+                bool round_weighted;
+                if (!repl_budgets.empty())
+                {
+                    round_budget = repl_budgets[std::min((size_t)r, repl_budgets.size() - 1)];
+                    round_weighted = round_budget < 1.0 - 1e-9; // >=1.0 即该跳全量
+                }
+                else
+                {
+                    round_budget = repl_budget;
+                    round_weighted = weighted_repl && (r >= full_rounds);
+                }
+                std::vector<std::vector<std::unordered_map<int, int>>> thread_counts(
+                    nthreads, std::vector<std::unordered_map<int, int>>(node_num));
                 std::vector<std::vector<std::unordered_map<int, std::vector<int>>>> thread_route_updates(
                     nthreads, std::vector<std::unordered_map<int, std::vector<int>>>(vector_node_map.size()));
 
@@ -2368,7 +2658,7 @@ public:
                         size_t end = std::min(start + chunk, n);
                         if (start >= n) break;
                         threads.emplace_back([&, t, start, end]() {
-                            auto &my_updates = thread_updates[t];
+                            auto &my_counts = thread_counts[t];
                             auto &my_route = thread_route_updates[t];
                             for (size_t i = start; i < end; i++)
                             {
@@ -2396,10 +2686,12 @@ public:
                                         for (int j = 0; j < sz; j++)
                                         {
                                             int neighbor_vid = hnsw->get_external_label(data[j]);
-                                            if (!local_vids[node_id].count(neighbor_vid) &&
-                                                !my_updates[node_id].count(neighbor_vid))
+                                            if (local_vids[node_id].count(neighbor_vid))
+                                                continue; // 已在该节点,无需复制
+                                            // cross-in-degree：每条 (本地向量 -> 该远程候选) 边计 1 次
+                                            int prev = my_counts[node_id][neighbor_vid]++;
+                                            if (prev == 0)
                                             {
-                                                my_updates[node_id].insert(neighbor_vid);
                                                 auto &route = my_route[level][neighbor_vid];
                                                 if (std::find(route.begin(), route.end(), node_id) == route.end())
                                                     route.push_back(node_id);
@@ -2413,50 +2705,112 @@ public:
                     for (auto &th : threads) th.join();
                 }
 
-                // 归约：跨线程去重，仅当全局 updates 真正新增时才递增 replication_num
-                vector<unordered_set<int>> updates(node_num);
+                // 归约：合并每节点候选计数(cross-in-degree) + 路由候选
+                std::vector<std::unordered_map<int, int>> counts(node_num);
                 vector<unordered_map<int, std::vector<int>>> route_updates(vector_node_map.size());
                 for (int t = 0; t < nthreads; t++)
                 {
                     for (int node_id = 0; node_id < node_num; node_id++)
-                    {
-                        for (int vid : thread_updates[t][node_id])
-                        {
-                            if (updates[node_id].insert(vid).second)
-                                replication_num++;
-                        }
-                    }
+                        for (const auto &kv : thread_counts[t][node_id])
+                            counts[node_id][kv.first] += kv.second;
                     for (size_t lvl = 0; lvl < thread_route_updates[t].size(); lvl++)
-                    {
                         for (const auto &kv : thread_route_updates[t][lvl])
                         {
                             auto &route = route_updates[lvl][kv.first];
                             for (int node_id : kv.second)
-                            {
                                 if (std::find(route.begin(), route.end(), node_id) == route.end())
                                     route.push_back(node_id);
-                            }
                         }
-                    }
                 }
 
+                // VR_REPL_W：用 round0 候选直方图自动标定全局阈值 τ(只标定一次,后续轮沿用)
+                if (w_mode && global_thresh == 0)
+                {
+                    std::map<int, long long> hist; // cross-in-degree -> 候选数
+                    long long tot = 0;
+                    for (int node_id = 0; node_id < node_num; node_id++)
+                        for (const auto &kv : counts[node_id]) { hist[kv.second]++; tot++; }
+                    long long target = (long long)(repl_w * (double)tot);
+                    long long acc = 0; int tau = 1;
+                    for (auto it = hist.rbegin(); it != hist.rend(); ++it)
+                    {
+                        acc += it->second;
+                        tau = it->first;
+                        if (acc >= target) break;
+                    }
+                    global_thresh = std::max(1, tau);
+                    LOG_INFO_STREAM("[partition] VR_REPL_W=" << repl_w << " → global τ=" << global_thresh
+                                    << " (round0 calib: keep value>=τ, achieved_frac≈"
+                                    << (tot ? (double)acc / tot : 0.0) << ")");
+                }
+
+                // 选择：均匀=全选；加权=每节点按 count 降序取 top-(budget*|local|)
+                std::vector<std::unordered_set<int>> selected(node_num);
+                size_t total_sel = 0, total_cand = 0;
+                for (int node_id = 0; node_id < node_num; node_id++)
+                {
+                    auto &cmap = counts[node_id];
+                    total_cand += cmap.size();
+                    if (global_thresh > 0)
+                    {
+                        // 全局阈值：复制所有 cross-in-degree >= τ 的候选(整体按价值,跨跳统一)
+                        for (const auto &kv : cmap)
+                            if (kv.second >= global_thresh)
+                                selected[node_id].insert(kv.first);
+                    }
+                    else if (!round_weighted)
+                    {
+                        for (const auto &kv : cmap)
+                            selected[node_id].insert(kv.first);
+                    }
+                    else
+                    {
+                        // budget = 保留该跳候选中价值最高的比例(rep0.85 = top 85% 候选)
+                        size_t B = std::max<size_t>(1, (size_t)(round_budget * (double)cmap.size()));
+                        if (cmap.size() <= B)
+                        {
+                            for (const auto &kv : cmap)
+                                selected[node_id].insert(kv.first);
+                        }
+                        else
+                        {
+                            std::vector<std::pair<int, int>> cand; // (count, vid)
+                            cand.reserve(cmap.size());
+                            for (const auto &kv : cmap)
+                                cand.emplace_back(kv.second, kv.first);
+                            std::partial_sort(cand.begin(), cand.begin() + B, cand.end(),
+                                              [](const std::pair<int, int> &a, const std::pair<int, int> &b)
+                                              { return a.first > b.first; });
+                            for (size_t x = 0; x < B; x++)
+                                selected[node_id].insert(cand[x].second);
+                        }
+                    }
+                    total_sel += selected[node_id].size();
+                }
+
+                // 提交：加本地 + 仅为 selected 的候选写路由
                 int new_ring = r + 1;
                 for (int node_id = 0; node_id < node_num; node_id++)
-                    for (int vid : updates[node_id])
+                    for (int vid : selected[node_id])
+                    {
                         add_local_vid(node_id, vid, new_ring);
-
+                        replication_num++;
+                    }
                 for (size_t lvl = 0; lvl < route_updates.size(); lvl++)
-                {
                     for (const auto &kv : route_updates[lvl])
                     {
                         int vid = kv.first;
-                        const auto &nodes = kv.second;
-                        for (int node_id : nodes)
-                            append_route_owner((int)lvl, vid, node_id);
+                        for (int node_id : kv.second)
+                            if (selected[node_id].count(vid))
+                                append_route_owner((int)lvl, vid, node_id);
                     }
-                }
 
-                LOG_INFO_STREAM("[partition] Redundancy round " << r << " done, replication_num=" << replication_num);
+                LOG_INFO_STREAM("[partition] Redundancy round " << r << " done, mode="
+                                << (global_thresh > 0 ? "thresh" : (round_weighted ? "weighted" : "uniform"))
+                                << " thresh=" << global_thresh
+                                << " selected=" << total_sel << "/" << total_cand
+                                << " frac=" << (total_cand ? (double)total_sel / total_cand : 0.0)
+                                << " replication_num=" << replication_num);
             }
         }
 

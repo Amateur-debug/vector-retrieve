@@ -53,6 +53,35 @@ option(VR_DEBUG "Enable verbose DEBUG-level logging (LOG_DEBUG_STREAM)" OFF)
 # Find pybind11 for Python bindings
 find_package(pybind11 REQUIRED)
 
+# -----------------------------------------------------------------------------
+# GKlib — utility library required by METIS
+# -----------------------------------------------------------------------------
+# Enable C compilation for GKlib/METIS
+enable_language(C)
+set(GKLIB_PATH ${CMAKE_CURRENT_SOURCE_DIR}/third_party/GKlib)
+add_subdirectory(${GKLIB_PATH} ${CMAKE_BINARY_DIR}/GKlib)
+
+# -----------------------------------------------------------------------------
+# METIS — graph partitioning library (source-level integration)
+# -----------------------------------------------------------------------------
+# Generate metis.h wrapper with 64-bit index type (required for >2.1B edges)
+set(METIS_XINCLUDE_DIR ${CMAKE_BINARY_DIR}/metis_xinclude)
+file(MAKE_DIRECTORY ${METIS_XINCLUDE_DIR})
+file(WRITE ${METIS_XINCLUDE_DIR}/metis.h
+     "#define IDXTYPEWIDTH 64\n#define REALTYPEWIDTH 32\n#include \"${CMAKE_CURRENT_SOURCE_DIR}/third_party/METIS/include/metis.h\"\n")
+
+set(METIS_LIBMETIS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/METIS/libmetis)
+file(GLOB METIS_SOURCES ${METIS_LIBMETIS_DIR}/*.c)
+add_library(metis STATIC ${METIS_SOURCES})
+target_include_directories(metis PRIVATE
+    ${METIS_XINCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/METIS/include
+    ${METIS_LIBMETIS_DIR})
+target_link_libraries(metis PUBLIC GKlib)
+target_compile_definitions(metis PRIVATE LINUX _POSIX_C_SOURCE=200809L)
+target_compile_options(metis PRIVATE -fPIC
+    -Wno-sign-compare -Wno-unused-variable -Wno-unused-but-set-variable)
+
 # =============================================================================
 # RDMA Support Detection
 # =============================================================================
@@ -184,6 +213,10 @@ endif()
 # Uncomment the following lines if you need to link against additional libraries
 # find_package(OpenMP REQUIRED)
 # target_link_libraries(vector_retrieve PRIVATE OpenMP::OpenMP_CXX)
+
+# Link METIS for graph partitioning support
+target_link_libraries(vector_retrieve PRIVATE metis)
+target_include_directories(vector_retrieve PRIVATE ${METIS_XINCLUDE_DIR})
 
 # =============================================================================
 # Build Information

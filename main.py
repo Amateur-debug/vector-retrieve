@@ -18,16 +18,18 @@ import argparse
 import numpy as np
 import json
 import subprocess
+import shlex
 from tqdm import tqdm
 import threading
-import multiprocessing as mp
-from collections import defaultdict
 
 import sys
 sys.setrecursionlimit(5000)
 
-# 集群部署参数统一从 config.json 读取；新环境只需编辑 config.json（ALL_IPS、HOST_IP、BASE_PORT、USER_NAME）
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# 集群部署参数统一从 config.json 读取；并行 Slurm job 可通过 VR_CONFIG_PATH 隔离配置文件
+_CONFIG_PATH = os.environ.get(
+    "VR_CONFIG_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
+)
 with open(_CONFIG_PATH, "r") as _f:
     _CLUSTER_CONFIG = json.load(_f)
 
@@ -63,36 +65,42 @@ DATASET_PRESETS = {
         "query_path":       os.path.join(_dataset_root, "siftsmall/siftsmall_query.fvecs"),
         "groundtruth_path": os.path.join(_dataset_root, "siftsmall/siftsmall_groundtruth.ivecs"),
         "dtype":            "float",
+        "dim":              128,
     },
     "sift": {
         "data_path":        os.path.join(_dataset_root, "sift/sift_base.fvecs"),
         "query_path":       os.path.join(_dataset_root, "sift/sift_query.fvecs"),
         "groundtruth_path": os.path.join(_dataset_root, "sift/sift_groundtruth.ivecs"),
         "dtype":            "float",
+        "dim":              128,
     },
     "sift100m": {
         "data_path":        os.path.join(_dataset_root, "sift100m/base.u8bin"),
         "query_path":       os.path.join(_dataset_root, "sift100m/queries.u8bin"),
         "groundtruth_path": os.path.join(_dataset_root, "sift100m/gt_100.bin"),
         "dtype":            "float",
+        "dim":              128,
     },
     "sift100m-u8": {
         "data_path":        os.path.join(_dataset_root, "sift100m/base.u8bin"),
         "query_path":       os.path.join(_dataset_root, "sift100m/queries.u8bin"),
         "groundtruth_path": os.path.join(_dataset_root, "sift100m/gt_100.bin"),
         "dtype":            "uint8",
+        "dim":              128,
     },
     "deep100m": {
         "data_path":        os.path.join(_dataset_root, "deep100m/base.fbin"),
         "query_path":       os.path.join(_dataset_root, "deep100m/queries.fbin"),
         "groundtruth_path": os.path.join(_dataset_root, "deep100m/gt_100.bin"),
         "dtype":            "float",
+        "dim":              96,
     },
     "uint8_test": {
         "data_path":        os.path.join(_dataset_root, "uint8_test/base.u8bin"),
         "query_path":       os.path.join(_dataset_root, "uint8_test/queries.u8bin"),
         "groundtruth_path": os.path.join(_dataset_root, "uint8_test/gt_100.bin"),
         "dtype":            "uint8",
+        "dim":              128,
     },
 }
 
@@ -251,6 +259,10 @@ class VectorRetrieveRunner:
         self.num_threads = args.num_threads  # 服务端每 node 搜索线程数（msg_pool_size）
         self.num_cpu = args.num_cpu
         self.query_worker_rss_samples = []
+        self.run_id = os.environ.get("SLURM_JOB_ID") or f"manual-{os.getpid()}"
+        self.runtime_dir = os.path.abspath(os.path.join(project_root, "tmp", f"run-{self.run_id}"))
+        os.makedirs(self.runtime_dir, exist_ok=True)
+        self.worker_dim = args.dim or self._resolve_worker_dim(args)
 
         # 集群拓扑从 config.json 读取。约定：
         #   host_node — 运行 main.py 的机器（可不在 work_nodes 中，此时仅作协调器）
@@ -353,6 +365,10 @@ class VectorRetrieveRunner:
         self.partition_mode = args.partition_mode
         self.partition_distribution = args.partition_distribution
         self.use_layer = args.layer
+        # 可选分区路径标签（VR_PART_TAG）：区分同 (mode,rep) 但不同复制策略的分区
+        # 例如加权复制 weighted budget=0.05 -> VR_PART_TAG=w005，避免覆盖 uniform 分区
+        _pt = os.environ.get("VR_PART_TAG", "").strip()
+        self._part_tag_sfx = f"-{_pt}" if _pt else ""
 
         # layer_config 与 layer_replicate_flags 从 config.json 读取，缺失时回退默认
         _default_layer_config = {l: list(range(self.node_num)) for l in range(self.limited_level + 1)}
@@ -371,6 +387,8 @@ class VectorRetrieveRunner:
             self.layer_replicate_flags = _default_layer_flags
 
         self.replication = args.replication
+        # 格式化为文件名友好的字符串，避免 f"rep{2.0}" 变成 "rep2.0"
+        self._rep_fmt = str(int(self.replication)) if self.replication == int(self.replication) else str(self.replication)
 
         # 通信模式参数
         self.comm_mode = getattr(args, 'comm_mode', 'tcp')
@@ -386,6 +404,21 @@ class VectorRetrieveRunner:
         self.sdk_config = None
         self.worker_processes = []
         self.num_queries = 0
+
+    @staticmethod
+    def _resolve_worker_dim(args):
+        ext = os.path.splitext(args.data_path or "")[1].lower()
+        if ext in ('.fbin', '.u8bin', '.ibin', '.bin'):
+            with open(args.data_path, 'rb') as f:
+                header = np.frombuffer(f.read(8), dtype=np.uint32)
+            if header.size == 2:
+                return int(header[1])
+        if ext in ('.fvecs', '.ivecs'):
+            with open(args.data_path, 'rb') as f:
+                header = np.frombuffer(f.read(4), dtype=np.int32)
+            if header.size == 1:
+                return int(header[0])
+        return 128
 
     def setup_distributed_nodes(self):
         """在集群各节点启动 worker 进程。
@@ -403,6 +436,7 @@ class VectorRetrieveRunner:
             return
 
         print(f"Distributed mode enabled. Node IPs: {self.node_ips}")
+        print(f"Using cluster config: {_CONFIG_PATH}")
 
         # Clean up old worker processes on all remote nodes and the local host
         print("Cleaning up old worker processes...")
@@ -479,11 +513,14 @@ class VectorRetrieveRunner:
                 print(f"Host machine identified as node {self.host_id} with IP {self.host_ip}.")
                 # Launch local worker
                 print(f"Launching worker node {i} on localhost...")
-                log_file = f"{current_dir}/worker_{i}.log"
+                log_file = os.path.join(self.runtime_dir, f"worker_{i}.log")
 
                 distributed_flag = "--distributed" if self.args.distributed else ""
                 shard_flag = "--shard" if self.args.shard else ""
                 global_pull_flag = "--global-pull" if self.args.is_global_pull else ""
+
+                config_env = os.environ.copy()
+                config_env["VR_CONFIG_PATH"] = _CONFIG_PATH
 
                 # Build local command
                 local_cmd = [
@@ -495,6 +532,7 @@ class VectorRetrieveRunner:
                     "--ef_construction", str(self.args.ef_construction),
                     "--ef_search", str(self.ef_search),
                     "--limited_level", str(self.args.limited_level),
+                    "--dim", str(self.worker_dim),
                     "--comm_mode", self.comm_mode,
                     "--num_threads", str(self.num_threads),
                     "--max_track_num", str(self.max_track_num),
@@ -510,11 +548,11 @@ class VectorRetrieveRunner:
 
                 # Launch local worker in background
                 with open(log_file, 'w') as log_f:
-                    proc = subprocess.Popen(local_cmd, stdout=log_f, stderr=log_f)
+                    proc = subprocess.Popen(local_cmd, stdout=log_f, stderr=log_f, env=config_env)
                 worker_processes.append(proc)
             else:
                 # Launch remote worker
-                log_file = f"{current_dir}/worker_{i}.log"
+                log_file = os.path.join(self.runtime_dir, f"worker_{i}.log")
 
                 distributed_flag = "--distributed" if self.args.distributed else ""
                 shard_flag = "--shard" if self.args.shard else ""
@@ -534,12 +572,15 @@ class VectorRetrieveRunner:
                         "-o", log_file,
                         "-e", log_file,
                         "bash", "-lc",
-                        f"cd {current_dir} && eval \"$(conda shell.bash hook)\" && conda activate vector-retrieve && "
+                        f"export VR_CONFIG_PATH={shlex.quote(_CONFIG_PATH)} && "
+                        + (f"export VR_DROP_OUTER_LINKS={shlex.quote(os.environ['VR_DROP_OUTER_LINKS'])} && " if os.environ.get('VR_DROP_OUTER_LINKS') else "")
+                        + f"cd {current_dir} && eval \"$(conda shell.bash hook)\" && conda activate vector-retrieve && "
                         f"{cpu_prefix}python -u node_start.py "
                         f"--node_id {i} --node_ips {node_ips_str} "
                         f"--dtype {_active_dtype} "
                         f"--m {self.args.m} --ef_construction {self.args.ef_construction} "
                         f"--ef_search {self.ef_search} --limited_level {self.args.limited_level} "
+                        f"--dim {self.worker_dim} "
                         f"--comm_mode {self.comm_mode} "
                         f"--num_threads {self.num_threads} "
                         f"--max_track_num {self.max_track_num} "
@@ -552,6 +593,7 @@ class VectorRetrieveRunner:
                     # SSH 方式启动远程 worker
                     print(f"Launching worker node {i} on {self.node_user_names[i]}@{ip}...")
                     remote_cmd = (
+                        f"export VR_CONFIG_PATH={shlex.quote(_CONFIG_PATH)} && "
                         f"cd {current_dir} && "
                         f"conda activate vector-retrieve && "
                         f"nohup {cpu_prefix}python -u node_start.py "
@@ -559,6 +601,7 @@ class VectorRetrieveRunner:
                         f"--dtype {_active_dtype} "
                         f"--m {self.args.m} --ef_construction {self.args.ef_construction} "
                         f"--ef_search {self.ef_search} --limited_level {self.args.limited_level} "
+                        f"--dim {self.worker_dim} "
                         f"--comm_mode {self.comm_mode} "
                         f"--num_threads {self.num_threads} "
                         f"--max_track_num {self.max_track_num} "
@@ -715,6 +758,71 @@ class VectorRetrieveRunner:
             except Exception as e:
                 print(f"  Node {i}: (error: {e})")
 
+    def _parallel_build(self, add_fn, data, num_elements, num_threads, build_desc):
+        """多线程建图/建簇的公共循环：按线程切分数据，逐条调用 add_fn(vid, vec) 添加，
+        并用 tqdm 显示进度。add_fn 传入 self.hnsw.add_vector（传统模式）或
+        self.cluster.add_vector（shard 模式）。build_desc 为日志前缀。"""
+        print(f"{build_desc} with {num_threads} threads...")
+        start_time = time.time()
+
+        # 准备数据：(id, vector) pairs（直接传numpy数组，避免需要GIL的类型转换）
+        data_with_ids = [(idx, vector) for idx, vector in enumerate(data[:num_elements])]
+
+        chunk_size = (len(data_with_ids) + num_threads - 1) // num_threads
+        threads = []
+
+        # 使用列表存储计数器（避免nonlocal作用域问题）
+        progress_counter = [0]
+        progress_lock = threading.Lock()
+
+        def add_chunk(chunk, counter, lock):
+            local_count = 0
+            for vid, vec in chunk:
+                add_fn(vid, vec)
+                local_count += 1
+                # 更频繁更新，提高速度显示准确性
+                if local_count % 10 == 0:
+                    with lock:
+                        counter[0] += 10
+                    local_count = 0
+            # 更新剩余的
+            if local_count > 0:
+                with lock:
+                    counter[0] += local_count
+
+        # 启动所有线程
+        for t in range(num_threads):
+            start_idx = t * chunk_size
+            end_idx = min(start_idx + chunk_size, len(data_with_ids))
+            if start_idx >= len(data_with_ids):
+                break
+            chunk = data_with_ids[start_idx:end_idx]
+            thread = threading.Thread(target=add_chunk, args=(chunk, progress_counter, progress_lock))
+            thread.start()
+            threads.append(thread)
+
+        # 显示进度条
+        with tqdm(total=len(data_with_ids), desc="Building", unit="vec") as pbar:
+            last_value = 0
+            while any(t.is_alive() for t in threads):
+                with progress_lock:
+                    current = progress_counter[0]
+                pbar.update(current - last_value)
+                last_value = current
+                time.sleep(0.1)
+
+            # 等待所有线程完成
+            for thread in threads:
+                thread.join()
+
+            # 确保进度条到达100%
+            with progress_lock:
+                current = progress_counter[0]
+            pbar.update(current - last_value)
+
+        build_time = time.time() - start_time
+        print(f"Building Machine Time: {build_time:.4f} seconds (using {num_threads} threads).")
+
     def prepare(self):
         """准备阶段：加载/构建 HNSW 图并分区。
 
@@ -770,11 +878,11 @@ class VectorRetrieveRunner:
                 elif self.graph_path and os.path.isdir(self.graph_path):
                     cluster_base = os.path.join(self.graph_path,
                         f"m{self.m}-efc{self.ef_construction}-ll{self.limited_level}-"
-                        f"{self.partition_mode}-rep{self.replication}{layer_sfx}")
+                        f"{self.partition_mode}-rep{self._rep_fmt}{layer_sfx}{self._part_tag_sfx}")
                 else:
                     cluster_base = (f"./save/{self.data_name}/node{self.node_num}/"
                         f"m{self.m}-efc{self.ef_construction}-ll{self.limited_level}-"
-                        f"{self.partition_mode}-rep{self.replication}{layer_sfx}")
+                        f"{self.partition_mode}-rep{self._rep_fmt}{layer_sfx}{self._part_tag_sfx}")
                 self.cluster_path = cluster_base
 
                 # 检查是否已有分区文件（优先加载，跳过建图和分区）
@@ -798,7 +906,7 @@ class VectorRetrieveRunner:
                     if ef_client.connect():
                         ef_client.set_hnsw_params(ef_search=self.ef_search)
                         ef_client.disconnect()
-            elif self.graph_path is not None and os.path.exists(self.graph_path) and not self.args.shard and not self.args.build_only:
+            elif self.graph_path is not None and os.path.exists(self.graph_path) and not self.args.shard:
                 # shard 模式需要每个节点独立建图，不能复用统一的 HNSW 图
                 print(f"Loading HNSW graph via SDK from {self.graph_path}...")
                 sdk_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
@@ -836,6 +944,11 @@ class VectorRetrieveRunner:
                         print(f"Full HNSW saved: {os.path.abspath(self.graph_path)}")
                     finally:
                         sdk_client.disconnect()
+
+                if self.args.build_only and not os.path.exists(self.graph_path):
+                    print("[build_only] Built and saved full HNSW graph; skipping partition.")
+                    return
+                # graph existed before, proceed to partition below
 
                 # 需要分区：发送 partition 命令到 worker
                 partition_client = ClusterSDKClient(ip=self.sdk_config['ip'], port=self.sdk_config['port'], comm_mode=self.comm_mode)
@@ -899,11 +1012,15 @@ class VectorRetrieveRunner:
             if self.args.is_global_pull:
                 self.cluster.is_global_pull = True
 
+            layer_sfx = "-layer" if self.use_layer else ""
+            cluster_base = (f"./save/{self.data_name}/node{self.node_num}/"
+                f"m{self.m}-efc{self.ef_construction}-ll{self.limited_level}-"
+                f"{self.partition_mode}-rep{self._rep_fmt}{layer_sfx}{self._part_tag_sfx}")
             start_time = time.time()
             if self.use_layer:
-                self.cluster.partition(mode="layer", replication=self.replication, layer_config=self.layer_config, layer_partition_mode=self.partition_mode, layer_replicate_flags=self.layer_replicate_flags, num_threads=self.num_construction_threads)
+                self.cluster.partition(mode="layer", replication=int(self.replication), layer_config=self.layer_config, layer_partition_mode=self.partition_mode, layer_replicate_flags=self.layer_replicate_flags, num_threads=self.num_construction_threads, partition_distribution="nfs-load", partition_base=cluster_base)
             else:
-                self.cluster.partition(mode=self.partition_mode, replication=self.replication, layer_config=self.layer_config, num_threads=self.num_construction_threads)
+                self.cluster.partition(mode=self.partition_mode, replication=int(self.replication), layer_config=self.layer_config, num_threads=self.num_construction_threads, partition_distribution="nfs-load", partition_base=cluster_base)
             partition_time = time.time() - start_time
             print(f"Partitioning Time: {partition_time:.4f} seconds.")
         else:
@@ -927,67 +1044,8 @@ class VectorRetrieveRunner:
                 num_threads = self.num_construction_threads
 
                 if num_threads > 1:
-                    print(f"Building cluster in shard mode with {num_threads} threads...")
-                    start_time = time.time()
-
-                    # 准备数据（直接传numpy数组，避免需要GIL的类型转换）
-                    data_with_ids = [(idx, vector) for idx, vector in enumerate(data[:num_elements])]
-
-                    import threading
-                    chunk_size = (len(data_with_ids) + num_threads - 1) // num_threads
-                    threads = []
-
-                    # 使用列表存储计数器（避免nonlocal作用域问题）
-                    progress_counter = [0]
-                    progress_lock = threading.Lock()
-
-                    def add_chunk(chunk, counter, lock):
-                        local_count = 0
-                        for vid, vec in chunk:
-                            self.cluster.add_vector(vid, vec)
-                            local_count += 1
-                            # 更频繁更新，提高速度显示准确性
-                            if local_count % 10 == 0:
-                                with lock:
-                                    counter[0] += 10
-                                local_count = 0
-                        # 更新剩余的
-                        if local_count > 0:
-                            with lock:
-                                counter[0] += local_count
-
-                    # 启动所有线程
-                    for t in range(num_threads):
-                        start_idx = t * chunk_size
-                        end_idx = min(start_idx + chunk_size, len(data_with_ids))
-                        if start_idx >= len(data_with_ids):
-                            break
-                        chunk = data_with_ids[start_idx:end_idx]
-                        thread = threading.Thread(target=add_chunk, args=(chunk, progress_counter, progress_lock))
-                        thread.start()
-                        threads.append(thread)
-
-                    # 显示进度条（Reduce模式）
-                    with tqdm(total=len(data_with_ids), desc="Building", unit="vec") as pbar:
-                        last_value = 0
-                        while any(t.is_alive() for t in threads):
-                            with progress_lock:
-                                current = progress_counter[0]
-                            pbar.update(current - last_value)
-                            last_value = current
-                            time.sleep(0.1)
-
-                        # 等待所有线程完成
-                        for thread in threads:
-                            thread.join()
-
-                        # 确保进度条到达100%
-                        with progress_lock:
-                            current = progress_counter[0]
-                        pbar.update(current - last_value)
-
-                    build_time = time.time() - start_time
-                    print(f"Building Machine Time: {build_time:.4f} seconds (using {num_threads} threads).")
+                    self._parallel_build(self.cluster.add_vector, data, num_elements,
+                                         num_threads, "Building cluster in shard mode")
 
                     # 打印每个节点的向量数量
                     if not self.args.distributed:
@@ -1014,68 +1072,8 @@ class VectorRetrieveRunner:
                 num_threads = self.num_construction_threads
 
                 if num_threads > 1:
-                    print(f"Building HNSW index with {num_threads} threads...")
-                    start_time = time.time()
-
-                    # 准备数据：(id, vector) pairs（直接传numpy数组，避免需要GIL的类型转换）
-                    data_with_ids = [(idx, vector) for idx, vector in enumerate(data[:num_elements])]
-
-                    # 使用多线程建图
-                    import threading
-                    chunk_size = (len(data_with_ids) + num_threads - 1) // num_threads
-                    threads = []
-
-                    # 使用列表存储计数器（避免nonlocal作用域问题）
-                    progress_counter = [0]
-                    progress_lock = threading.Lock()
-
-                    def add_chunk(chunk, counter, lock):
-                        local_count = 0
-                        for vid, vec in chunk:
-                            self.hnsw.add_vector(vid, vec)
-                            local_count += 1
-                            # 更频繁更新，提高速度显示准确性
-                            if local_count % 10 == 0:
-                                with lock:
-                                    counter[0] += 10
-                                local_count = 0
-                        # 更新剩余的
-                        if local_count > 0:
-                            with lock:
-                                counter[0] += local_count
-
-                    # 启动所有线程
-                    for t in range(num_threads):
-                        start_idx = t * chunk_size
-                        end_idx = min(start_idx + chunk_size, len(data_with_ids))
-                        if start_idx >= len(data_with_ids):
-                            break
-                        chunk = data_with_ids[start_idx:end_idx]
-                        thread = threading.Thread(target=add_chunk, args=(chunk, progress_counter, progress_lock))
-                        thread.start()
-                        threads.append(thread)
-
-                    # 显示进度条（HNSW建图模式）
-                    with tqdm(total=len(data_with_ids), desc="Building", unit="vec") as pbar:
-                        last_value = 0
-                        while any(t.is_alive() for t in threads):
-                            with progress_lock:
-                                current = progress_counter[0]
-                            pbar.update(current - last_value)
-                            last_value = current
-                            time.sleep(0.1)
-
-                        # 等待所有线程完成
-                        for thread in threads:
-                            thread.join()
-
-                        # 确保进度条到达100%
-                        with progress_lock:
-                            current = progress_counter[0]
-                        pbar.update(current - last_value)
-
-                    build_time = time.time() - start_time
-                    print(f"Building Machine Time: {build_time:.4f} seconds (using {num_threads} threads).")
+                    self._parallel_build(self.hnsw.add_vector, data, num_elements,
+                                         num_threads, "Building HNSW index")
 
                     # 打印每个节点的向量数量
                     if not self.args.distributed:
@@ -1100,9 +1098,9 @@ class VectorRetrieveRunner:
                 print("Partitioning data across cluster nodes...")
                 start_time = time.time()
                 if self.use_layer:
-                    self.cluster.partition(mode="layer", replication=self.replication, layer_config=self.layer_config, layer_partition_mode=self.partition_mode, layer_replicate_flags=self.layer_replicate_flags, num_threads=self.num_construction_threads)
+                    self.cluster.partition(mode="layer", replication=int(self.replication), layer_config=self.layer_config, layer_partition_mode=self.partition_mode, layer_replicate_flags=self.layer_replicate_flags, num_threads=self.num_construction_threads)
                 else:
-                    self.cluster.partition(mode=self.partition_mode, replication=self.replication, layer_config=self.layer_config, num_threads=self.num_construction_threads)
+                    self.cluster.partition(mode=self.partition_mode, replication=int(self.replication), layer_config=self.layer_config, num_threads=self.num_construction_threads)
                 partition_time = time.time() - start_time
                 print(f"Partitioning Time: {partition_time:.4f} seconds.")
 
@@ -1178,9 +1176,9 @@ class VectorRetrieveRunner:
         per_rank_threads = max(1, self.num_query_threads // world_size)
         print(f"[orchestrate] Global query threads: {self.num_query_threads}, per-rank: {per_rank_threads}")
 
-        # 创建屏障目录 + 清理 tmp/query_results 旧文件
-        barrier_dir = os.path.abspath(os.path.join(project_root, "barrier"))
-        tmp_query_dir = os.path.abspath(os.path.join(project_root, "tmp", "query_results"))
+        # 创建 job-specific 屏障目录 + query 结果目录，避免并行 Slurm job 互相删除运行时文件
+        barrier_dir = os.path.join(self.runtime_dir, "barrier")
+        tmp_query_dir = os.path.join(self.runtime_dir, "query_results")
         import shutil
         if os.path.exists(barrier_dir):
             shutil.rmtree(barrier_dir)
@@ -1196,7 +1194,7 @@ class VectorRetrieveRunner:
             host = qnode["ip"]
             srun_target = qnode.get("hostname") or host  # srun -w 优先用 hostname
             user = qnode.get("user_name", self.host_user_name)
-            log_file = os.path.join(project_root, f"query_rank{rank}.log")
+            log_file = os.path.join(self.runtime_dir, f"query_rank{rank}.log")
             ready_timeout_value = 7200
             query_args = (
                 f"--data_name {self.data_name} "
@@ -1209,6 +1207,7 @@ class VectorRetrieveRunner:
                 f"--query_world_size {world_size} "
                 f"--comm_mode {self.comm_mode} "
                 f"--barrier_dir {barrier_dir} "
+                f"--results_dir {tmp_query_dir} "
                 f"--barrier_timeout {ready_timeout_value} "
                 f"--query_path {self.query_path} "
                 f"--groundtruth_path {self.groundtruth_path} "
@@ -1225,6 +1224,7 @@ class VectorRetrieveRunner:
                     "-o", log_file,
                     "-e", log_file,
                     "bash", "-lc",
+                    f"export VR_CONFIG_PATH={shlex.quote(_CONFIG_PATH)} && "
                     f"cd {project_root} && eval \"$(conda shell.bash hook)\" && conda activate vector-retrieve && "
                     f"python -u query.py {query_args}"
                 ]
@@ -1235,6 +1235,7 @@ class VectorRetrieveRunner:
                                         stderr=subprocess.PIPE)
             else:
                 cmd_str = (
+                    f"export VR_CONFIG_PATH={shlex.quote(_CONFIG_PATH)} && "
                     f"cd {project_root} && conda activate vector-retrieve && "
                     f"python -u query.py {query_args} > {log_file} 2>&1"
                 )
@@ -1386,7 +1387,7 @@ class VectorRetrieveRunner:
 
         # 聚合每个 rank 的结果（从 tmp 临时目录读取，聚合完后删除临时目录）
         print(f"[orchestrate] Aggregating results from {world_size} ranks...")
-        tmp_dir = os.path.join(project_root, "tmp", "query_results")
+        tmp_dir = tmp_query_dir
 
         # 合并 per-query 字典
         recall = {}
@@ -1562,7 +1563,8 @@ class VectorRetrieveRunner:
 
         effective_partition_mode = info_partition_mode or ("layer" if self.use_layer else self.partition_mode)
         effective_layer_partition_mode = info_layer_partition_mode or (self.partition_mode if effective_partition_mode == "layer" else "")
-        effective_replication_level = info_replication_level if info_replication_level not in (None, 0) else self.replication
+        import math
+        effective_replication_level = info_replication_level if info_replication_level not in (None, 0) else int(math.ceil(self.replication))
         effective_replication_num = info_replication_num if info_replication_num is not None else 0
         effective_layer_config = self.layer_config
         effective_layer_replicate_flags = self.layer_replicate_flags
@@ -1641,12 +1643,12 @@ class VectorRetrieveRunner:
         # 与原 save_results 文件名格式完全一致
         results_dir = "./results/cpp" if self.use_cpp else "./results/python"
         os.makedirs(results_dir, exist_ok=True)
-        is_node1_baseline = self.args.distributed and self.node_num == 1 and self.loaded_full_graph_direct
-        distributed_suffix = "-distributed" if self.args.distributed and not is_node1_baseline else ""
+        is_node1 = self.node_num == 1
+        distributed_suffix = "-distributed" if self.args.distributed and not is_node1 else ""
         cpu_suffix = f"-cpus{self.args.num_cpu}" if self.args.distributed and self.args.num_cpu != 0 else ""
         shard_suffix = "-shard" if self.args.shard else ""
         global_pull_suffix = "-global_pull" if self.args.is_global_pull else ""
-        layer_suffix = "-layer" if self.use_layer and not is_node1_baseline else ""
+        layer_suffix = "-layer" if self.use_layer and not is_node1 else ""
         # 文件名里的 query_threads 用全局总数（各 rank 之和）
         qt_suffix = f"-query_threads{total_query_threads}"
 
@@ -1660,13 +1662,19 @@ class VectorRetrieveRunner:
         elif self.args.is_global_pull:
             results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
                             f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
-                            f"node{self.node_num}-{self.partition_mode}-rep{self.replication}-"
+                            f"node{self.node_num}-{self.partition_mode}-rep{self._rep_fmt}-"
                             f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{global_pull_suffix}.json")
         else:
-            results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
-                            f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
-                            f"node{self.node_num}-{self.partition_mode}-rep{self.replication}-"
-                            f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{layer_suffix}.json")
+            if is_node1:
+                results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
+                                f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
+                                f"node{self.node_num}-"
+                                f"threads{self.num_threads}{qt_suffix}{cpu_suffix}.json")
+            else:
+                results_path = (f"{results_dir}/results-{self.data_name}-m{self.m}-"
+                                f"efc{self.ef_construction}-efs{self.ef_search}-ll{self.limited_level}-"
+                                f"node{self.node_num}-{self.partition_mode}-rep{self._rep_fmt}{self._part_tag_sfx}-"
+                                f"threads{self.num_threads}{qt_suffix}{distributed_suffix}{cpu_suffix}{layer_suffix}.json")
 
         with open(results_path, 'w') as f:
             json.dump(stats, f, indent=4)
@@ -1779,11 +1787,12 @@ if __name__ == "__main__":
     parser.add_argument("--ef_construction", type=int, default=200, help="Size of the dynamic candidate list for construction")
     parser.add_argument("--ef_search", type=int, default=15, help="Size of the dynamic candidate list for search")
     parser.add_argument("--limited_level", type=int, default=5, help="Level limit for HNSW")
+    parser.add_argument("--dim", type=int, default=None, help="Vector dimension; defaults to the dataset preset")
     parser.add_argument("--node_num", type=int, default=6, help="Number of cluster nodes")
     parser.add_argument("--partition_mode", type=str, default="k-means", help="Data partition mode across nodes")
     parser.add_argument("--partition_distribution", type=str, default="nfs-load", choices=["nfs-load", "network-send"], help="How fresh distributed partitions are materialized: write files to shared storage then load them, or send graph payloads over the network")
     parser.add_argument("--layer", action='store_true', default=False, help="Enable layer-based partitioning")
-    parser.add_argument("--replication", type=int, default=2, help="Replication level for data replication across nodes")
+    parser.add_argument("--replication", type=float, default=2.0, help="Replication level for data replication across nodes (supports fractional values like 0.4, 1.5)")
     parser.add_argument("--distributed", default=False, action='store_true', help="Enable distributed mode")
     parser.add_argument("--shard", default=False, action='store_true', help="Enable shard mode (independent graphs per node)")
     parser.add_argument("--global-pull", dest="is_global_pull", default=False, action='store_true', help="Enable global-pull mode: every node holds the full graph skeleton, only vector data is partitioned; remote vectors are pulled on demand during search")
@@ -1817,6 +1826,8 @@ if __name__ == "__main__":
             args.query_path = preset["query_path"]
         if args.groundtruth_path is None:
             args.groundtruth_path = preset["groundtruth_path"]
+        if args.dim is None:
+            args.dim = preset.get("dim")
     else:
         missing = [k for k in ("data_path", "query_path", "groundtruth_path") if getattr(args, k) is None]
         if missing:
@@ -1895,7 +1906,7 @@ if __name__ == "__main__":
             print("  To run queries, either add 'query_nodes' to config.json (multi-machine via query.py)")
             print("  or run query.py manually on each query machine.")
     except (QueryStallError, RuntimeError) as e:
-        if os.environ.get('NO_RESTART'):
+        if os.environ.get('NO_RESTART') or args.build_only:
             print(f"[NO_RESTART] {type(e).__name__}: {e}. Skipping auto-restart for debugging.")
             print("Worker logs preserved for inspection.")
             sys.exit(2)

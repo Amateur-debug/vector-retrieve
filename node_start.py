@@ -15,7 +15,7 @@ project_root = os.path.abspath(os.path.dirname(__file__))
 build_dir = os.path.join(project_root, 'build')
 
 # 从 config.json 读取部署参数（与 main.py 共用同一文件）
-_CONFIG_PATH = os.path.join(project_root, "config.json")
+_CONFIG_PATH = os.environ.get("VR_CONFIG_PATH", os.path.join(project_root, "config.json"))
 with open(_CONFIG_PATH, "r") as _f:
     _CLUSTER_CONFIG = json.load(_f)
 # IP -> port 映射（任一参与过集群的节点都必须在 config.json 的 nodes 列表里）
@@ -63,6 +63,7 @@ if __name__ == "__main__":
     parser.add_argument("--ef_construction", type=int, default=16)
     parser.add_argument("--ef_search", type=int, default=8)
     parser.add_argument("--limited_level", type=int, default=5)
+    parser.add_argument("--dim", type=int, default=128, help="Vector dimension for the initial worker HNSW graph")
 
     parser.add_argument("--distributed", default=False, action='store_true', help="Enable distributed mode")
     parser.add_argument("--shard", default=False, action='store_true', help="Enable shard mode (independent graphs per node)")
@@ -94,11 +95,9 @@ if __name__ == "__main__":
             sys.exit(1)
     
     safe_print(f"[Node {node_id}] Starting worker node on {node_ips[node_id]}...")
+    safe_print(f"[Node {node_id}] Using cluster config: {_CONFIG_PATH}")
 
-    # Initialize dummy HNSW (will be replaced/populated by graph partition)
-    # Dim is hardcoded to 128 for sift/siftsmall, but ideally should be passed or generic.
-    # However, the C++ side deserialize will handle the actual data.
-    hnsw = HNSWGraph(dim=128, m=args.m, ef_construction=args.ef_construction, 
+    hnsw = HNSWGraph(dim=args.dim, m=args.m, ef_construction=args.ef_construction,
                      ef_search=args.ef_search, limited_level=args.limited_level)
 
     cluster = Cluster(hnsw, node_num, comm_mode=args.comm_mode, ib_dev=args.ib_dev, ib_port=args.ib_port, gid_index=args.gid_index, max_track_num=args.max_track_num)

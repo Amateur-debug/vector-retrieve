@@ -35,6 +35,7 @@ parser.add_argument("--query_rank", type=int, default=0)
 parser.add_argument("--query_world_size", type=int, default=1)
 parser.add_argument("--comm_mode", type=str, default="tcp", choices=["tcp","rdma"])
 parser.add_argument("--barrier_dir", type=str, default=None)
+parser.add_argument("--results_dir", type=str, default=None)
 parser.add_argument("--barrier_timeout", type=int, default=600)
 args = parser.parse_args()
 
@@ -47,9 +48,10 @@ if args.groundtruth_path is None:
     args.groundtruth_path = DATASET_PRESETS[args.data_name]["groundtruth_path"]
 
 # ---------- 读取 config.json ----------
-_CONFIG_PATH = os.path.join(project_root, "config.json")
+_CONFIG_PATH = os.environ.get("VR_CONFIG_PATH", os.path.join(project_root, "config.json"))
 with open(_CONFIG_PATH, "r") as f:
     _CFG = json.load(f)
+print(f"[query_rank={args.query_rank}] Using cluster config: {_CONFIG_PATH}", flush=True)
 
 nodes = _CFG["work_nodes"]
 # 按 rank 分散入口节点，避免所有 query rank 的连接集中打到 nodes[0]。
@@ -87,6 +89,7 @@ def _payload_network_ms(payload):
         - getattr(payload, "search_ms", 0.0)
         - getattr(payload, "serialize_ms", 0.0)
         - getattr(payload, "deserialize_ms", 0.0)
+        - getattr(payload, "queue_ms", 0.0)
         - getattr(payload, "result_ms", 0.0)
     )
     return max(0.0, residual)
@@ -376,7 +379,7 @@ if __name__ == '__main__':
 
     last_query_time = query_times_list[-1] if query_times_list else 0.0
 
-    results_dir = os.path.join(project_root, "tmp", "query_results")
+    results_dir = args.results_dir or os.path.join(project_root, "tmp", "query_results")
     os.makedirs(results_dir, exist_ok=True)
     results_path = f"{results_dir}/rank{args.query_rank}-of{args.query_world_size}.json"
 

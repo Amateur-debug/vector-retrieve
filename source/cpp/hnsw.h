@@ -115,6 +115,14 @@ public:
     std::vector<uint64_t> iid_outermost_bits_;
     int replication_level_ = 0;
 
+    // === 两段式存储(VR_DROP_OUTER_LINKS):最外圈副本只在本地算距离、永不本地展开,
+    // 其链表是死重。compact 时把元素分两段:非最外圈在 data_level0_(full slot,
+    // internal_id [0,n_full_)),最外圈在 data_outer_(仅 vec+label,无链表,id [n_full_,cur)). ===
+    bool two_region_ = false;
+    char *data_outer_ = nullptr;          // 最外圈块:每元素 = [vec | label],无 links
+    size_t size_per_element_outer_ = 0;   // = dim*sizeof(T) + sizeof(int)
+    int n_full_ = 0;                      // 非最外圈元素数(= 两段分界 internal_id)
+
     // === global-pull 模式：完整图骨架 + 按需远程拉取向量 ===
     // 开启后跳过 compact()，label_lookup_ 保留所有 vid；邻居列表全部为正数 internal_id。
     // 搜索时若目标 vid 不在 local_vids_ 中，通过 pull_fetcher_ 同步拉取向量数据计算距离。
@@ -200,6 +208,13 @@ public:
             free(data_level0_);
             data_level0_ = nullptr;
         }
+        if (data_outer_)
+        {
+            free(data_outer_);
+            data_outer_ = nullptr;
+        }
+        two_region_ = false;
+        n_full_ = 0;
         if (link_lists_)
         {
             for (size_t i = 0; i < max_elements_; i++)
@@ -237,20 +252,30 @@ public:
     // ========================================================
 
     // 获取指定 internal_id 对应的向量数据起始指针（指向 data_level0_ 中的对应位置）
+    // 两段式:id >= n_full_ 落在 data_outer_(vec 在块首)。
     inline char *get_data_by_id(int internal_id) const
     {
+        if (two_region_ && internal_id >= n_full_)
+            return data_outer_ + (size_t)(internal_id - n_full_) * size_per_element_outer_;
         return data_level0_ + (size_t)internal_id * size_per_element_ + data_offset_;
     }
 
     // 获取指定 internal_id 对应的外部标签 (vid)，从 data_level0_ 的 label 区域读取
     inline int get_external_label(int internal_id) const
     {
+        if (two_region_ && internal_id >= n_full_)
+            return *(int *)(data_outer_ + (size_t)(internal_id - n_full_) * size_per_element_outer_ + (size_t)dim * sizeof(T));
         return *(int *)(data_level0_ + (size_t)internal_id * size_per_element_ + label_offset_);
     }
 
     // 设置指定 internal_id 的外部标签 (vid)，写入 data_level0_ 的 label 区域
     inline void set_external_label(int internal_id, int label)
     {
+        if (two_region_ && internal_id >= n_full_)
+        {
+            *(int *)(data_outer_ + (size_t)(internal_id - n_full_) * size_per_element_outer_ + (size_t)dim * sizeof(T)) = label;
+            return;
+        }
         *(int *)(data_level0_ + (size_t)internal_id * size_per_element_ + label_offset_) = label;
     }
 
@@ -301,6 +326,8 @@ public:
     {
         if (iid < 0)
             return false;
+        if (two_region_)
+            return iid >= n_full_;  // 两段式:最外圈即 id >= n_full_
         size_t idx = (size_t)iid / 64;
         if (idx >= iid_outermost_bits_.size())
             return false;
@@ -366,6 +393,123 @@ public:
 
         size_t old_count = cur_element_count_.load();
         size_t local_count = local_vids_.size();
+
+        // ===== 两段式 compact(VR_DROP_OUTER_LINKS):最外圈副本去链表,省内存,无 recall 损失 =====
+        bool want_two_region = false;
+        if (const char *e = std::getenv("VR_DROP_OUTER_LINKS")) want_two_region = (std::atoi(e) != 0);
+        if (want_two_region && replication_level_ > 0)
+        {
+            std::vector<int> old_to_new(old_count, -1);
+            std::vector<char> is_outer(old_count, 0);
+            int n_full = 0, n_outer = 0;
+            for (size_t i = 0; i < old_count; i++)
+            {
+                int vid = get_external_label((int)i);
+                if (!local_vids_.count(vid)) continue;
+                auto it = local_vid_ring_.find(vid);
+                if (it != local_vid_ring_.end() && it->second == replication_level_) { is_outer[i] = 1; n_outer++; }
+                else n_full++;
+            }
+            // 两遍分配 new id:非最外圈 [0,n_full),最外圈 [n_full, n_full+n_outer)
+            int next_full = 0, next_outer = n_full;
+            for (size_t i = 0; i < old_count; i++)
+            {
+                int vid = get_external_label((int)i);
+                if (!local_vids_.count(vid)) continue;
+                old_to_new[i] = is_outer[i] ? (next_outer++) : (next_full++);
+            }
+            size_t total = (size_t)n_full + (size_t)n_outer;
+            size_t outer_stride = (size_t)dim * sizeof(T) + sizeof(int); // vec + label,无 links
+
+            char *nf = (n_full > 0) ? (char *)malloc((size_t)n_full * size_per_element_) : nullptr;
+            char *no = (n_outer > 0) ? (char *)malloc((size_t)n_outer * outer_stride) : nullptr;
+            if ((n_full > 0 && !nf) || (n_outer > 0 && !no))
+                throw std::runtime_error("compact(two-region): malloc failed");
+            if (nf) memset(nf, 0, (size_t)n_full * size_per_element_);
+            char **new_links = (char **)malloc(sizeof(char *) * std::max<size_t>(total, 1));
+            memset(new_links, 0, sizeof(char *) * std::max<size_t>(total, 1));
+            std::vector<int> new_levels(std::max<size_t>(total, 1), 0);
+
+            for (size_t i = 0; i < old_count; i++)
+            {
+                if (old_to_new[i] < 0) continue;
+                int nid = old_to_new[i];
+                if (is_outer[i])
+                {
+                    char *dst = no + (size_t)(nid - n_full) * outer_stride;
+                    memcpy(dst, data_level0_ + i * size_per_element_ + data_offset_, (size_t)dim * sizeof(T));
+                    *(int *)(dst + (size_t)dim * sizeof(T)) = get_external_label((int)i);
+                }
+                else
+                {
+                    memcpy(nf + (size_t)nid * size_per_element_, data_level0_ + i * size_per_element_, size_per_element_);
+                    if (element_levels_[i] > 0)
+                    {
+                        size_t link_size = size_links_per_element_ * element_levels_[i];
+                        new_links[nid] = (char *)malloc(link_size);
+                        memcpy(new_links[nid], link_lists_[i], link_size);
+                    }
+                    new_levels[nid] = element_levels_[i];
+                }
+            }
+
+            // 重映射非最外圈链表(本地→new,远程→-(vid+1));最外圈无链表
+            auto remap2 = [&](int *ll) {
+                int cnt = ll[0]; int *ids = ll + 1;
+                for (int j = 0; j < cnt; j++)
+                {
+                    int oid = ids[j];
+                    if (old_to_new[oid] >= 0) ids[j] = old_to_new[oid];
+                    else ids[j] = -(get_external_label(oid) + 1);
+                }
+            };
+            for (int nid = 0; nid < n_full; nid++)
+            {
+                remap2((int *)(nf + (size_t)nid * size_per_element_));
+                for (int lv = 1; lv <= new_levels[nid]; lv++)
+                    remap2((int *)(new_links[nid] + (size_t)(lv - 1) * size_links_per_element_));
+            }
+
+            int best_entry = 0, best_level = (n_full > 0) ? new_levels[0] : 0;
+            for (int nid = 1; nid < n_full; nid++)
+                if (new_levels[nid] > best_level) { best_level = new_levels[nid]; best_entry = nid; }
+
+            free(data_level0_);
+            for (size_t i = 0; i < old_count; i++) if (link_lists_[i]) free(link_lists_[i]);
+            free(link_lists_);
+            data_level0_ = nf;
+            data_outer_ = no;
+            link_lists_ = new_links;
+            size_per_element_outer_ = outer_stride;
+            n_full_ = n_full;
+            two_region_ = true;
+            element_levels_ = std::move(new_levels);
+            entry_point_id = best_entry;
+            max_level = best_level;
+            std::vector<uint64_t>().swap(iid_outermost_bits_); // 两段式用 n_full_ 判定
+
+            std::unordered_map<int, int> new_lookup;
+            new_lookup.reserve(total);
+            for (int nid = 0; nid < (int)total; nid++) new_lookup[get_external_label(nid)] = nid;
+            label_lookup_.swap(new_lookup);
+
+            cur_element_count_ = total;
+            max_elements_ = total;
+
+            std::vector<std::unique_ptr<std::mutex>> new_locks(std::max<size_t>(total, 1));
+            for (size_t i = 0; i < new_locks.size(); i++) new_locks[i] = std::make_unique<std::mutex>();
+            link_locks_.swap(new_locks);
+            visited_pool_ = std::make_unique<VisitedListPool>(1, std::max<size_t>(total, 1));
+
+            is_compacted_graph_ = true;
+            std::unordered_set<int>().swap(local_vids_);
+            std::unordered_map<int, int>().swap(local_vid_ring_);
+            release_link_locks();
+            LOG_INFO_STREAM("[compact two-region] n_full=" << n_full << " n_outer=" << n_outer
+                            << " dropped_outer_links≈" << format_bytes((size_t)n_outer * links_level0_size_));
+            log_memory_breakdown("[compact]");
+            return;
+        }
 
         // 1. 构建 old_id -> new_id 映射（仅本地向量）
         std::vector<int> old_to_new(old_count, -1);  // -1 表示非本地
@@ -508,7 +652,15 @@ public:
         is_compacted_graph_ = true;
         std::unordered_set<int>().swap(local_vids_);
         std::unordered_map<int, int>().swap(local_vid_ring_);
+        release_link_locks();
         log_memory_breakdown("[compact]");
+    }
+
+    // 释放建图阶段的锁资源（仅当图只读查询时调用，省 ~600 MB）
+    void release_link_locks()
+    {
+        link_locks_.clear();
+        link_locks_.shrink_to_fit();
     }
 
     // ========================================================
@@ -1260,7 +1412,7 @@ public:
 
         // ---- 搜索主循环：堆内 (dist, key) 以 iid 编码 ----
         DistT lower_bound = payload.results.empty() ? std::numeric_limits<DistT>::max() : payload.results.top().first;
-        const bool ring_transfer_enabled = replication_level_ > 0 && is_compacted && !iid_outermost_bits_.empty();
+        const bool ring_transfer_enabled = replication_level_ > 0 && is_compacted && (two_region_ || !iid_outermost_bits_.empty());
 
         auto expand_local_node = [&](int cur_node) -> bool {
             int *ll_cur;
@@ -1553,7 +1705,10 @@ public:
 
     size_t estimated_owned_bytes() const
     {
-        return max_elements_ * size_per_element_
+        size_t data_bytes = two_region_
+            ? ((size_t)n_full_ * size_per_element_ + (size_t)(cur_element_count_.load() - (size_t)n_full_) * size_per_element_outer_)
+            : (max_elements_ * size_per_element_);
+        return data_bytes
              + max_elements_ * sizeof(char *)
              + high_level_link_bytes()
              + element_levels_.capacity() * sizeof(int)
@@ -1577,7 +1732,9 @@ public:
 
     void log_memory_breakdown(const std::string &prefix) const
     {
-        size_t data_level0_bytes = max_elements_ * size_per_element_;
+        size_t data_level0_bytes = two_region_
+            ? ((size_t)n_full_ * size_per_element_ + (size_t)(cur_element_count_.load() - (size_t)n_full_) * size_per_element_outer_)
+            : (max_elements_ * size_per_element_);
         size_t link_ptr_bytes = max_elements_ * sizeof(char *);
         size_t high_link_bytes = high_level_link_bytes();
         size_t levels_bytes = element_levels_.capacity() * sizeof(int);
@@ -1822,6 +1979,7 @@ public:
             }
         }
 
+        g->release_link_locks();
         return g;
     }
 };

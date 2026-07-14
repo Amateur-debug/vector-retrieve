@@ -3,7 +3,6 @@ import os
 import itertools
 import time
 import argparse
-import concurrent.futures
 
 SCRIPT_PATH = "main.py"
 DATASET_ROOT = "/hpc2hdd/home/xchen740/workspace/vector-retrieve/dataset"
@@ -50,8 +49,8 @@ def _get_query_threads(node_num, num_threads):
 
 PARAM_GRID = {
     "node_num":           [8, 16],
-    "partition_mode":     ["k-means"],
-    "replication":        [1, 0],
+    "partition_mode":     ["k-means", "fennel", "kmeans-fennel"],
+    "replication":        [2, 1.5, 1, 0],
     "m":                  [20, 25, 30, 35, 40],
     "ef_construction":    [200],
     "ef_search":          [20, 25, 30, 35, 40, 45, 55, 60],
@@ -68,7 +67,8 @@ PARAM_GRID = {
     "dtype":              [None],      # None = 使用 DATASETS 中的默认 dtype
 }
 
-# 仅跑 rep2 sweep 中接近 recall=0.80/0.85/0.90/0.95 的最高 QPS 配置（覆盖 node8/16 × layer T/F 的 union）
+# 仅跑接近 recall=0.80/0.85/0.90/0.95 的最高 QPS 配置（覆盖 node8/16 × layer T/F 的 union）
+# 置空集合 set() 可关闭过滤，跑全部 (m, ef_search) 组合
 ALLOWED_M_EFS = {
     (20, 35), (25, 40), (25, 55), (30, 25),
     (30, 45), (35, 30), (40, 20), (40, 60),
@@ -140,7 +140,7 @@ def resolve_query_nodes(node_num):
         return 4
 
 
-def build_command(dataset, params, skip_prepare=False, no_cleanup=False, use_slurm=False):
+def build_command(dataset, params, skip_prepare=False, no_cleanup=False, use_slurm=False, save=False):
     """构建命令行参数"""
     data_name = effective_data_name(dataset, params)
     data_path = os.path.join(DATASET_ROOT, dataset['base'])
@@ -181,7 +181,13 @@ def build_command(dataset, params, skip_prepare=False, no_cleanup=False, use_slu
     if params.get('num_cpu'):
         cmd += ['--num_cpu', str(params['num_cpu'])]
     cmd += ['--dtype', effective_dtype(dataset, params)]
-    cmd += ['--num_runs', str(NUM_RUNS)]
+    cmd += ['--num_runs', str(params.get('num_runs', NUM_RUNS))]
+    cmd += ['--num_construction_threads', str(params.get('num_construction_threads', 64))]
+    cmd += ['--partition_distribution', params.get('partition_distribution', 'nfs-load')]
+    if params.get('graph_path'):
+        cmd += ['--graph_path', params['graph_path']]
+    if save:
+        cmd.append('--save')
     if skip_prepare:
         cmd.append('--skip_prepare')
     if no_cleanup:
@@ -222,7 +228,8 @@ def all_partitions_exist(dataset, params):
 def get_result_path(dataset, params):
     """生成结果文件路径（与 main.py 的 save_results 对齐）"""
     data_name = effective_data_name(dataset, params)
-    distributed_suffix = "-distributed" if params.get('distributed') else ""
+    is_node1 = params.get('node_num') == 1
+    distributed_suffix = "-distributed" if params.get('distributed') and not is_node1 else ""
     cpus = params.get('num_cpu', 0)
     cpu_suffix = f"-cpus{cpus}" if params.get('distributed') and cpus != 0 else ""
     qt_suffix = f"-query_threads{resolve_query_threads(params)}"
@@ -238,11 +245,17 @@ def get_result_path(dataset, params):
                     f"node{params['node_num']}-{params['partition_mode']}-rep{params['replication']}-"
                     f"threads{params['num_threads']}{qt_suffix}{distributed_suffix}{cpu_suffix}-global_pull.json")
     else:
-        layer_suffix = "-layer" if params.get('layer') else ""
-        filename = (f"results-{data_name}-m{params['m']}-efc{params['ef_construction']}-"
-                    f"efs{params['ef_search']}-ll{params['limited_level']}-"
-                    f"node{params['node_num']}-{params['partition_mode']}-rep{params['replication']}-"
-                    f"threads{params['num_threads']}{qt_suffix}{distributed_suffix}{cpu_suffix}{layer_suffix}.json")
+        if is_node1:
+            filename = (f"results-{data_name}-m{params['m']}-efc{params['ef_construction']}-"
+                        f"efs{params['ef_search']}-ll{params['limited_level']}-"
+                        f"node{params['node_num']}-"
+                        f"threads{params['num_threads']}{qt_suffix}{cpu_suffix}.json")
+        else:
+            layer_suffix = "-layer" if params.get('layer') else ""
+            filename = (f"results-{data_name}-m{params['m']}-efc{params['ef_construction']}-"
+                        f"efs{params['ef_search']}-ll{params['limited_level']}-"
+                        f"node{params['node_num']}-{params['partition_mode']}-rep{params['replication']}-"
+                        f"threads{params['num_threads']}{qt_suffix}{distributed_suffix}{cpu_suffix}{layer_suffix}.json")
 
     return os.path.join(".", "results", "cpp", filename)
 
@@ -271,7 +284,8 @@ def get_group_key(dataset, params):
 
 
 def run_batch():
-    """批量运行实验，相同分区配置的任务复用服务端，只变 ef_search"""
+    """批量运行实验，相同分区配置的任务复用服务端，只变 ef_search。
+    在一个 Slurm allocation 内串行执行 PARAM_GRID 的笛卡尔积组合。"""
     parser = argparse.ArgumentParser()
     parser.add_argument('--skip', action='store_true', help='跳过已有结果文件的任务')
     parser.add_argument('--offset', type=int, default=0, help='跳过前N个任务')
@@ -285,7 +299,7 @@ def run_batch():
 
     # 按分组键聚合任务
     from collections import OrderedDict
-    groups = OrderedDict()  # group_key -> [(dataset, params, efs), ...]
+    groups = OrderedDict()  # group_key -> [(dataset, params), ...]
     built_graphs = set()
     skipped = 0
 

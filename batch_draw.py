@@ -13,6 +13,7 @@ DATASET_NODE_CONFIG = {
     "sift":        [(5, 40)],
     "sift100m":    [(4, 32), (5, 40), (8, 64)],
     "sift100m-u8": [(8, 64), (16, 128)],
+    "deep100m":    [(1, 8), (8, 64), (16, 128)],
 }
 
 # ============================================================
@@ -29,7 +30,7 @@ PER_NODE_TASKS = [
     {
         "chart": "bar", "mode": "compare",
         "grid": {"x": ["avg_recall@10"], "y": ["qps"],
-                 "replication": [2], "threads": [8]},
+                 "replication": [0, 1, 2], "threads": [8]},
     },
     # --- compare: recall vs avg_distance_cnt (shard + global)
     #     layer (k-means) 当作 'Global'，no-layer 排除；cotra/weaviate 不画 ---
@@ -103,7 +104,7 @@ PER_NODE_TASKS = [
     {
         "chart": "bar", "mode": "compare",
         "grid": {"x": ["replication"], "y": ["avg_remote_transfer_cnt"],
-                 "m": [10], "ef_construction": [200], "ef_search": [15],
+                 "m": [20], "ef_construction": [200], "ef_search": [35],
                  "limited_level": [5], "threads": [8]},
     },
     # --- compare: replication vs qps，按 recall 取最近实验（每个 recall 一张图）---
@@ -135,6 +136,36 @@ PER_NODE_TASKS = [
                  "group_by": ["replication"], "threads": [8],
                  "layer": [True, False]},
     },
+    # --- compare: replication vs memory ---
+    {
+        "chart": "bar", "mode": "compare",
+        "grid": {"x": ["replication"], "y": ["avg_query_worker_rss_gib"],
+                 "m": [60], "ef_construction": [200], "limited_level": [5],
+                 "threads": [8]},
+    },
+    # --- compare: recall vs memory (line) ---
+    {
+        "chart": "line", "mode": "compare",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_query_worker_rss_gib"],
+                 "m": [60], "ef_construction": [200], "limited_level": [5],
+                 "threads": [8]},
+    },
+    # --- compare: recall vs memory (bar) ---
+    {
+        "chart": "bar", "mode": "compare",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_query_worker_rss_gib"],
+                 "m": [60], "ef_construction": [200], "limited_level": [5],
+                 "threads": [8]},
+    },
+    # --- group: recall vs memory by replication ---
+    {
+        "chart": "line", "mode": "group",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_query_worker_rss_gib"],
+                 "group_by": ["replication"],
+                 "m": [60], "ef_construction": [200], "limited_level": [5],
+                 "threads": [8],
+                 "layer": [True, False]},
+    },
 ]
 
 # ============================================================
@@ -155,7 +186,7 @@ NODE_COMPARE_TASKS = [
         "chart": "bar", "mode": "group",
         "grid": {"x": ["avg_recall@10"], "y": ["qps"],
                  "group_by": ["node_num"],
-                 "replication": [2], "threads": [8], "layer": [True, False]},
+                 "replication": [0, 1, 2], "threads": [8], "layer": [True, False]},
     },
     # --- node compare: recall vs avg_distance_cnt (line) ---
     {
@@ -184,6 +215,61 @@ NODE_COMPARE_TASKS = [
         "grid": {"x": ["avg_recall@10"], "y": ["avg_remote_transfer_cnt"],
                  "group_by": ["node_num"],
                  "replication": [2], "layer": [True, False]},
+    },
+    # --- node compare: node_num vs memory (bar) ---
+    {
+        "chart": "bar", "mode": "group",
+        "grid": {"x": ["node_num"], "y": ["avg_query_worker_rss_gib"],
+                 "group_by": ["node_num"],
+                 "m": [60], "ef_construction": [200], "limited_level": [5],
+                 "replication": [2], "layer": [True, False]},
+    },
+    # --- node compare: recall vs qps_per_gib by node_num (bar) ---
+    {
+        "chart": "bar", "mode": "group",
+        "grid": {"x": ["avg_recall@10"], "y": ["qps_per_gib"],
+                 "group_by": ["node_num"],
+                 "replication": [0, 1, 2], "layer": [True, False]},
+    },
+    # --- config compare: recall vs memory, layer / no-layer / 1-node ---
+    {
+        "chart": "bar", "mode": "group",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_query_worker_rss_gib"],
+                 "group_by": ["config"],
+                 "node_num": [8],
+                 "replication": [2],
+                 "threads": [8], "num_query_threads": [64]},
+    },
+    # --- node compare: node_num vs memory at recall (bar) ---
+    {
+        "chart": "bar", "mode": "compare",
+        "grid": {"x": ["node_num"], "y": ["avg_query_worker_rss_gib"],
+                 "replication": [0, 1, 2],
+                 "recall": [0.8, 0.85, 0.9, 0.95]},
+    },
+    # --- node compare: node_num vs qps at recall (bar) ---
+    {
+        "chart": "bar", "mode": "compare",
+        "grid": {"x": ["node_num"], "y": ["qps"],
+                 "replication": [0, 1, 2],
+                 "recall": [0.8, 0.85, 0.9, 0.95],
+                 "cotra": [True]},
+    },
+    # --- node compare: recall vs memory by node_num (line) ---
+    {
+        "chart": "line", "mode": "group",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_query_worker_rss_gib"],
+                 "group_by": ["node_num"],
+                 "m": [60], "ef_construction": [200], "limited_level": [5],
+                 "replication": [2], "layer": [True, False]},
+    },
+    # --- node compare: recall vs memory by node_num (bar) ---
+    {
+        "chart": "bar", "mode": "group",
+        "grid": {"x": ["avg_recall@10"], "y": ["avg_query_worker_rss_gib"],
+                 "group_by": ["node_num"],
+                 "m": [60], "ef_construction": [200], "limited_level": [5],
+                 "replication": [0, 1, 2], "layer": [True, False]},
     },
 ]
 
@@ -249,17 +335,20 @@ DEFAULTS = {
 
 
 def make_args(chart, mode, params, debug=False):
-    """构建 SimpleNamespace 参数对象（直接传给 run_draw）"""
+    """构建 SimpleNamespace 参数对象（直接传给 run_draw）。
+
+    DEFAULTS 提供基值，params 覆盖；partition_mode / layer 在 params 中时，
+    同时设置对应的 filter_* 属性（用于 compare 模式的精确筛选）。
+    """
     d = dict(DEFAULTS)
     d["chart"] = chart
     d["mode"] = mode
     d["debug"] = debug
-    if "partition_mode" in params:
-        d["filter_partition_mode"] = params["partition_mode"]
-    if "layer" in params:
-        d["filter_layer"] = params["layer"]
+    # 将 task grid 中的 partition_mode / layer 透传为筛选属性
+    for key in ("partition_mode", "layer"):
+        if key in params:
+            d[f"filter_{key}"] = params[key]
     d.update(params)
-    # Route output to ./plot/<data_name>/{pdf,png}
     if d.get("data_name"):
         d["output_dir"] = os.path.join(DEFAULTS["output_dir"], d["data_name"])
     return SimpleNamespace(**d)
@@ -274,6 +363,9 @@ def run_batch(args):
         if task_list is None:
             print(f"[WARN] no task list for dataset '{data_name}', skipping")
             continue
+        # 计算该数据集的最大 node_num（用于 scale node1）
+        node_configs = DATASET_NODE_CONFIG.get(data_name, [])
+        max_node = max((n for n, _ in node_configs), default=0)
         for task_def in task_list:
             chart = task_def["chart"]
             mode = task_def["mode"]
@@ -286,6 +378,10 @@ def run_batch(args):
                 params = dict(zip(keys, combo))
                 params["data_name"] = data_name
                 draw_args = make_args(chart, mode, params, debug=args.debug)
+                # 涉及 node_num 对比的图：单机数据 scale 到数据集最大 node 数
+                if (getattr(draw_args, 'group_by', None) == 'node_num'
+                        or draw_args.x == 'node_num'):
+                    draw_args.scale_node1_to = max_node
                 desc = f"[{data_name}] {chart}/{mode} | " + " | ".join(
                     f"{k}={v}" for k, v in params.items() if k in ("x", "y"))
                 tasks.append((draw_args, desc))

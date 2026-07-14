@@ -416,7 +416,7 @@ public:
         }
     }
 
-    void partition(const std::string &mode, int redundancy = 1, const std::unordered_map<int, std::vector<int>> &layer_config = {}, const std::string &layer_partition_mode = "round_robin", const std::vector<bool> &layer_replicate_flags = {}, int num_threads = 0, const std::string &partition_distribution = "network-send", const std::string &partition_base = "")
+    void partition(const std::string &mode, float redundancy = 1.0f, const std::unordered_map<int, std::vector<int>> &layer_config = {}, const std::string &layer_partition_mode = "round_robin", const std::vector<bool> &layer_replicate_flags = {}, int num_threads = 0, const std::string &partition_distribution = "network-send", const std::string &partition_base = "")
     {
         if (!connected && !connect()) {
             throw std::runtime_error("Failed to connect to cluster");

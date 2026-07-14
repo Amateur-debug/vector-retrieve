@@ -81,6 +81,55 @@ python batch.py
 python run_cotra.py --node_ips <IP1,IP2,...> --index_save_dir <path>
 ```
 
+## SLURM 作业脚本
+
+仓库根目录只保留 **4 个** SLURM 脚本，覆盖四类任务。每个脚本均：自包含（不互相 source）、
+先 `conda activate vector-retrieve` → 按需编译 C++ → 写**独立** `config.*.json` 并 `export VR_CONFIG_PATH`
+（main.py/node_start.py/query.py 在 import 期就 `json.load(VR_CONFIG_PATH)`，所以**每个 job 必须有自己的 config**）→ 运行。
+所有参数通过**环境变量覆盖**（`KEY=value sbatch script.sh`）。
+
+| 脚本 | 任务 | 节点 | 入口 |
+|------|------|------|------|
+| `slurm_build_full.sh` | 建**完整图** | 单 node 64 核 | `main.py --build_only --save`（非分布式，`node_num=1`） |
+| `slurm_build_partition.sh` | 建**分区图** | 单 node 64 核 | `main.py --skip_queries --save`（非分布式，`node_num=N`） |
+| `slurm_query.sh` | 普通 **query** | 多机分布式 | `main.py --distributed --slurm` |
+| `slurm_batch.sh` | **batch query** | 多机，单 allocation 内串行 | `batch.py --slurm`（PARAM_GRID 笛卡尔积） |
+
+```bash
+# 1) 建完整图：产物 ./save/hnsw-{DATA_NAME}-m{M}-efc{EF_CONST}-ll{LIMITED_LEVEL}.bin
+#    并行：不同 M/数据集 -> 不同 graph 文件 + 独立 config，可同时提交多个
+DATA_NAME=deep100m M=30 sbatch slurm_build_full.sh
+DATA_NAME=sift100m-u8 DTYPE=uint8 M=20 sbatch slurm_build_full.sh
+#    关键 env: DATA_NAME DTYPE M EF_CONST(200) LIMITED_LEVEL(5) BUILD_THREADS(64)
+
+# 2) 建分区图：产物 ./save/{DATA_NAME}/node{NODE_NUM}/...-{0..N-1}.bin
+#    完整图不存在时 main.py 会先建图再分区。并行：不同 (M,rep,layer,node_num) 互不冲突
+NODE_NUM=8  M=30 REPLICATION=2 LAYER=True  sbatch slurm_build_partition.sh
+NODE_NUM=16 M=30 REPLICATION=1 LAYER=False sbatch slurm_build_partition.sh
+#    关键 env: DATA_NAME DTYPE M NODE_NUM REPLICATION PART_MODE(k-means) LAYER(True) BUILD_THREADS(64)
+
+# 3) 普通 query：产物 results/cpp/results-*.json
+#    总节点数 = 1(host) + NUM_QUERY_NODES + NODE_NUM(worker)
+#    并行：每个 job 用唯一 BASE_PORT + 独立 config，可同时提交多个
+M=30 EF_SEARCH=45 NODE_NUM=8  NUM_QUERY_NODES=2 BASE_PORT=18080 sbatch -N11 slurm_query.sh
+M=30 EF_SEARCH=45 NODE_NUM=16 NUM_QUERY_NODES=4 BASE_PORT=19080 sbatch -N21 slurm_query.sh
+#    关键 env: DATA_NAME DTYPE K M EF_CONST EF_SEARCH LIMITED_LEVEL NODE_NUM NUM_QUERY_NODES
+#             REPLICATION PART_MODE LAYER COMM_MODE SVR_THREADS(8) NUM_RUNS(5) BASE_PORT USE_SLURM(1)
+#             FORCE_REPARTITION(0=复用已有分区图; 1=删除后重分区)
+
+# 4) batch query：一个 allocation 内串行跑 batch.py PARAM_GRID 的所有组合
+#    约束：PARAM_GRID["node_num"] 最大值 <= WORKER_COUNT；总节点 = 1 + NUM_QUERY_NODES + WORKER_COUNT
+sbatch slurm_batch.sh                                       # 默认 grid, --skip
+WORKER_COUNT=16 NUM_QUERY_NODES=4 BASE_PORT=38320 sbatch -N21 slurm_batch.sh
+#    关键 env: BASE_PORT NUM_QUERY_NODES WORKER_COUNT BATCH_ARGS(--skip)
+#    实验矩阵在 batch.py 顶部的 PARAM_GRID / ALLOWED_M_EFS 里改（不再用一次性 --deep100m-* 预设）
+```
+
+注意事项：
+- **多个 job 可能重叠时必须设置不同 `BASE_PORT`**（query/batch），避免端口冲突。
+- 提交 query/batch 时默认 `USE_SLURM=1`，main.py 用 `srun` 而非 ssh 启动 worker/query。
+- 分区/完整图已存在时脚本会自动 skip；query 复用已有分区图，需重分区用 `FORCE_REPARTITION=1`。
+
 ## 核心类（自研系统 source/cpp/）
 
 | 类名 | 文件 | 说明 |
@@ -171,6 +220,28 @@ python run_cotra.py --node_ips <IP1,IP2,...> --index_save_dir <path>
 - **命名**: 函数/变量用 `snake_case`，类用 `PascalCase`，常量用 `UPPER_SNAKE_CASE`
 - **私有方法**: 前导下划线（`_private_method`）
 - **引入顺序**: 标准库 → 第三方库 → 本地模块
+
+## 运行与报告约定
+
+### 图保存路径
+
+- **Full graph** 保存路径形如 `./save/hnsw-{data_name}-m{M}-efc{EF_CONST}-ll{LIMITED_LEVEL}.bin`，例如 `./save/hnsw-sift100m-u8-m10-efc200-ll5.bin`。
+  - 这是从原始数据构建出的完整 HNSW 图，用于之后重新 partition。
+  - 分布式 partition/save 之后不要把 node0 的分区图覆盖写回这个路径。
+  - 如果这个 full graph 被错误覆盖，必须从原始数据重新建图，不能用它继续 repartition。
+- **分区图** 保存路径形如 `./save/{data_name}/node{N}/m{M}-efc{EF_CONST}-ll{LIMITED_LEVEL}-{partition_mode}-rep{replication}[-layer]-{node_id}.bin`，例如 `./save/sift100m-u8/node8/m10-efc200-ll5-k-means-rep2-layer-0.bin` 到 `...-7.bin`。
+  - 这是每个 worker 的本地图和本地裁剪 routing map。
+  - 需要覆盖旧分区图时，只覆盖这些 node 分区文件，不覆盖 full graph。
+  - 如果这些分区图都存在，`main.py` 会优先直接 load 并跳过 partition；需要强制重分区时必须删除旧分区图或使用明确的 force-repartition 逻辑。
+
+### Report 规则
+
+- 所有实验/验证报告放在 `report/` 目录。
+- report 文件名必须按“任务/目标”命名，可以加时间戳；不要只按 Slurm job id 命名，因为一次需求可能包含多次 job。
+- **每完成一个关键步骤就必须立即更新 report**，不要等全部任务结束后再统一补写。
+- 每份 report 必须有 “What was done” 或等价章节，按时间顺序逐项写清楚实际做过的事情。
+- report 必须记录关键命令、Slurm job id、文件路径、代码/脚本修改点、保存输出、当前状态、失败原因和下一步。
+- 如果实验未完成或结果不可信，必须明确写成中间状态，不能写成最终通过。
 
 ## 架构要点
 

@@ -17,10 +17,10 @@ matplotlib.rcParams['mathtext.fontset'] = 'stix'
 # ============================================================
 PLOT_CONFIG = {
     # 字体大小
-    'font_axis_label': 14,      # 坐标轴标签 (xlabel / ylabel)
-    'font_tick_label': 12,      # 刻度标签
-    'font_legend': 14,          # 图例
-    'font_title': 16,           # 子图标题 (split 模式)
+    'font_axis_label': 12,      # 坐标轴标签 (xlabel / ylabel)
+    'font_tick_label': 10,      # 刻度标签
+    'font_legend': 12,          # 图例
+    'font_title': 14,           # 子图标题 (split 模式)
 
     # 图尺寸 (inch)
     'fig_height_ratio': 0.4,    # 图高度 = 宽度 × 此比例
@@ -62,11 +62,16 @@ def load_json(path):
 _summary_cache = {}
 
 
-def load_json_summary(path, max_bytes=4096):
+def load_json_summary(path, max_bytes=16384):
     """快速加载 JSON 文件的汇总信息（跳过大数组字段）。
     只读取文件前 max_bytes 字节，用正则提取 key-value 对。
     适用于 compare/merge 模式，不需要逐查询数据。
     结果会缓存，同一文件只读一次。
+
+    注：layer 结果文件在汇总标量前多出 per-layer 字段，
+    avg_query_worker_rss_gib 可能落在 ~4.3KB 处（旧的 4096 上限会漏读，
+    导致 qps_per_gib=0）。汇总标量都排在 per-query 大字典（每个 1 万条）之前，
+    16KB 足以覆盖且远未触及大字典。
     """
     if path in _summary_cache:
         return _summary_cache[path]
@@ -128,9 +133,9 @@ def parse_filename_params(filename):
     if match:
         params['partition_mode'] = match.group(1)
 
-    match = re.search(r'-rep(\d+)', filename)
+    match = re.search(r'-rep(\d+(?:\.\d+)?)', filename)
     if match:
-        params['replication'] = int(match.group(1))
+        params['replication'] = float(match.group(1))
 
     match = re.search(r'-threads(\d+)', filename)
     if match:
@@ -201,17 +206,24 @@ def classify_mode(filepath, data=None, is_weaviate=False, is_global=False):
         return 'no-layer', f'No-Layer ({pm})'
 
 
-def get_y_value(data, y_key, data_name):
+def get_y_value(data, y_key, data_name, file_params=None):
     """根据 y_key 从 data 中提取 y 值（支持自定义派生指标）"""
     if y_key == "rep_per_node":
         replication_num = get_param_value(data, "replication_num")
         node_num = get_param_value(data, "node_num")
         return replication_num / node_num if node_num else 0
     elif y_key == "data_per_node":
-        total_data = {'siftsmall': 10000, 'sift': 1000000, 'gist': 1000000, 'deep': 1000000}.get(data_name, 0)
+        total_data = {'siftsmall': 10000, 'sift': 1000000, 'gist': 1000000, 'deep': 1000000, 'deep100m': 100000000}.get(data_name, 0)
         total_data_redundant = total_data + (get_param_value(data, "replication_num") or 0)
         node_num = get_param_value(data, "node_num")
         return total_data_redundant / node_num if node_num else 0
+    elif y_key == "qps_per_gib":
+        qps = get_param_value(data, "qps")
+        rss = get_param_value(data, "avg_query_worker_rss_gib")
+        nn = (get_param_value(data, "node_num")
+              or (file_params.get('node_num') if file_params else None)
+              or 1)
+        return qps / (nn * rss) if rss else 0
     else:
         return get_param_value(data, y_key)
 
@@ -221,11 +233,11 @@ def make_output_filename(prefix, args, extra_keys=None):
     def _label(s):
         return filename_label(s)
 
-    # group_by 的参数本身在该图里是变化维度，不应固化到文件名中
+    # group_by / x 轴参数在该图里是变化维度，不应固化到文件名中
     group_by = getattr(args, 'group_by', None)
 
     def _skip(name):
-        return group_by is not None and group_by == name
+        return (group_by is not None and group_by == name) or name == args.x
 
     parts = [
         prefix,
@@ -235,9 +247,9 @@ def make_output_filename(prefix, args, extra_keys=None):
         parts.append(f"m{args.m}")
     if args.ef_construction is not None and not _skip('ef_construction'):
         parts.append(f"efc{args.ef_construction}")
-    # efs: 没有固定 recall 且 y 轴是 qps 时才写入文件名
+    # efs: 没有固定 recall 时写入文件名
     if args.ef_search is not None and getattr(args, 'recall', None) is None \
-            and args.y == 'qps' and not _skip('ef_search'):
+            and not _skip('ef_search'):
         parts.append(f"efs{args.ef_search}")
     if args.limited_level is not None and not _skip('limited_level'):
         parts.append(f"ll{args.limited_level}")
@@ -252,7 +264,8 @@ def make_output_filename(prefix, args, extra_keys=None):
     _thread_independent = {"replication_num", "rep_per_node", "data_per_node",
                            "avg_remote_transfer_cnt", "avg_distance_cnt",
                            "avg_remote_transfer_data_per_transfer",
-                           "avg_remote_transfer_data_per_query"}
+                           "avg_remote_transfer_data_per_query",
+                           "avg_query_worker_rss_gib", "qps_per_gib"}
     if args.threads is not None and args.y not in _thread_independent and not _skip('threads'):
         parts.append(f"threads{args.threads}")
     if getattr(args, 'num_query_threads', None) is not None \
@@ -262,10 +275,14 @@ def make_output_filename(prefix, args, extra_keys=None):
         parts.append(f"recall{args.recall}")
     if extra_keys:
         parts.extend(extra_keys)
-    if getattr(args, 'mode', None) != 'compare' and getattr(args, 'layer', None) is True:
-        parts.append("layer")
-    if getattr(args, 'filter_layer', None) is True:
-        parts.append("layer")
+    # layer 标签：layer 用作过滤器时添加（含 group_by='node_num'）；
+    # group_by='config' 按 layer 分组而非过滤，不加该标签。
+    if group_by != 'config':
+        if (getattr(args, 'mode', None) != 'compare'
+                and getattr(args, 'layer', None) is True):
+            parts.append("layer")
+        elif getattr(args, 'filter_layer', None) is True:
+            parts.append("layer")
     if group_by is not None:
         parts.append(f"by-{group_by}")
     output_tag = getattr(args, 'output_tag', None)
@@ -284,6 +301,8 @@ DISPLAY_NAMES = {
     'replication': 'Replication',
     'replication_num': 'Replication Num',
     'avg_recall@10': 'Recall@10',
+    'avg_query_worker_rss_gib': 'Memory (GiB)',
+    'qps_per_gib': 'QPS / GiB',
 }
 
 # 文件名用短名，不带单位和特殊字符
@@ -293,6 +312,8 @@ FILENAME_NAMES = {
     'avg_remote_transfer_data_per_transfer': 'data_per_transfer',
     'avg_remote_transfer_data_per_query': 'data_per_query',
     'avg_recall@10': 'recall@10',
+    'avg_query_worker_rss_gib': 'memory',
+    'qps_per_gib': 'qps_per_gib',
 }
 
 
@@ -322,10 +343,18 @@ def style_ax(ax, x_label, y_label, title=None, tick_axis='both', grid_axis='both
     ax.grid(True, linestyle='--', alpha=0.7, axis=grid_axis)
 
 
-def setup_legend(ax, n_labels):
-    """图例统一放在图上方，水平排列"""
-    ax.legend(fontsize=PLOT_CONFIG['font_legend'], loc='lower center',
-              bbox_to_anchor=(0.5, 1.02), ncol=n_labels, frameon=True, fancybox=True)
+def setup_legend(ax, n_labels, handles=None, labels=None):
+    """图例统一放在图上方，水平排列。
+
+    传入 handles/labels 可固定图例顺序（默认沿用 matplotlib 的 artist 添加顺序，
+    在 bar-compare 里会随各系列首次出现的 x 档位而变，导致不同数据集顺序不一致）。
+    """
+    kwargs = dict(fontsize=PLOT_CONFIG['font_legend'], loc='lower center',
+                  bbox_to_anchor=(0.5, 1.02), ncol=n_labels, frameon=True, fancybox=True)
+    if handles is not None and labels is not None:
+        ax.legend(handles, labels, **kwargs)
+    else:
+        ax.legend(**kwargs)
 
 
 def calc_fig_width(n_items, per_item=None, min_width=None, max_width=None, base=None):
@@ -401,6 +430,49 @@ def bucket_recall_points(points_list, min_recall=None, max_recall=0.95):
 
 
 # ============================================================
+# 筛选与数据加载辅助函数
+# ============================================================
+
+# group_by 模式下允许加载单机（非 distributed）结果的模式集合
+_GROUP_ALLOWS_SINGLE_NODE = {'node_num', 'config'}
+
+
+def _skip_param_in_filter(param_name, args, group_by):
+    """判断某个参数是否应在筛选时跳过。
+    - group_by 参数本身不筛（由分组逻辑处理）
+    - config 模式下不筛 node_num / query_threads（跨节点对比需要）
+    - compare 模式（group_by=None）下 x 轴变量不筛
+    """
+    if group_by and param_name == group_by:
+        return True
+    if group_by in _GROUP_ALLOWS_SINGLE_NODE and param_name in ('node_num', 'query_threads'):
+        return True
+    if group_by is None and param_name == args.x:
+        return True
+    return False
+
+
+def _compute_config_label(file_params, args):
+    """group_by='config' 时计算分组标签：Layer / No-Layer / 1-Node。"""
+    if not file_params.get('distributed'):
+        return '1-Node'
+    nn = file_params.get('node_num') or getattr(args, 'node_num', None) or 8
+    suffix = f' (k-means, {nn}-Node)'
+    return ('Layer' if file_params.get('layer') else 'No-Layer') + suffix
+
+
+def _apply_scale_node1(y_val, file_params, args):
+    """单机 node1 数据 scale 到 N-node 等效吞吐/内存。"""
+    scale_to = getattr(args, 'scale_node1_to', 0)
+    if (scale_to and not file_params.get('distributed')
+            and args.y in ('qps', 'avg_query_worker_rss_gib')):
+        file_nn = file_params.get('node_num', 1)
+        if file_nn and file_nn != scale_to:
+            return y_val * (scale_to / file_nn)
+    return y_val
+
+
+# ============================================================
 # CoTra 实测结果查表（无缩放，缺数据则不画）
 # Key: metric -> (data_name, node_num) -> {recall_bucket: value}
 # recall_bucket 与 RECALL_BUCKET_SIZE=0.05 对齐
@@ -425,6 +497,16 @@ COTRA_HARDCODED = {
             0.85: 203828,
             0.90: 161811,
             0.95: 90637,
+        },
+        ('deep100m', 8): {
+            0.85: 77000,
+            0.90: 56000,
+            0.95: 31000,
+        },
+        ('deep100m', 16): {
+            0.85: 142000,
+            0.90: 103000,
+            0.95: 56000,
         },
     },
     'avg_remote_transfer_cnt': {
@@ -501,52 +583,47 @@ def collect_compare(args):
         try:
             file_params = parse_filename_params(os.path.basename(f))
 
-            # 先用文件名筛选，避免加载大文件
+            # 文件名参数筛选
+            param_list = [
+                ('data_name', args.data_name),
+                ('m', args.m),
+                ('ef_construction', args.ef_construction),
+                ('ef_search', args.ef_search),
+                ('limited_level', args.limited_level),
+                ('node_num', args.node_num),
+                ('threads', args.threads),
+                ('query_threads', args.num_query_threads),
+            ]
             if is_weaviate:
-                skip = False
-                for param_name, arg_val in [
-                    ('data_name', args.data_name),
-                    ('m', args.m),
-                    ('ef_construction', args.ef_construction),
-                    ('ef_search', args.ef_search),
-                    ('node_num', args.node_num),
-                    ('threads', args.threads),
-                    ('query_threads', args.num_query_threads),
-                ]:
-                    if arg_val is not None and file_params.get(param_name) != arg_val:
-                        skip = True
-                        break
-            else:
-                skip = False
-                for param_name, arg_val in [
-                    ('data_name', args.data_name),
-                    ('m', args.m),
-                    ('ef_construction', args.ef_construction),
-                    ('ef_search', args.ef_search),
-                    ('limited_level', args.limited_level),
-                    ('node_num', args.node_num),
-                    ('threads', args.threads),
-                    ('query_threads', args.num_query_threads),
-                ]:
-                    if arg_val is not None and file_params.get(param_name) != arg_val:
-                        skip = True
-                        break
+                param_list = [p for p in param_list
+                              if p[0] not in ('limited_level',)]
+
+            skip = False
+            for param_name, arg_val in param_list:
+                if _skip_param_in_filter(param_name, args, group_by=None):
+                    continue
+                if arg_val is not None and file_params.get(param_name) != arg_val:
+                    skip = True
+                    break
             if skip:
                 continue
 
-            if not is_weaviate and not file_params.get('shard') and args.replication is not None:
-                if file_params.get('replication') != args.replication:
-                    continue
+            # replication / partition_mode / layer 筛选（仅自研系统）
+            if not is_weaviate and not file_params.get('shard'):
+                if args.replication is not None:
+                    file_rep = file_params.get('replication')
+                    if file_rep is not None and file_rep != args.replication:
+                        continue
 
-            filter_partition_mode = getattr(args, 'filter_partition_mode', None)
-            if not is_weaviate and not file_params.get('shard') and filter_partition_mode is not None:
-                if file_params.get('partition_mode') != filter_partition_mode:
-                    continue
+                pm_filter = getattr(args, 'filter_partition_mode', None)
+                if pm_filter is not None:
+                    if file_params.get('partition_mode') != pm_filter:
+                        continue
 
-            filter_layer = getattr(args, 'filter_layer', None)
-            if not is_weaviate and not file_params.get('shard') and filter_layer is not None:
-                if file_params.get('layer') != filter_layer:
-                    continue
+                layer_filter = getattr(args, 'filter_layer', None)
+                if layer_filter is not None:
+                    if file_params.get('layer') != layer_filter:
+                        continue
 
             # --global 模式：排除 layer 文件，no-layer 数据归为 global
             is_global = getattr(args, 'global', False)
@@ -561,7 +638,9 @@ def collect_compare(args):
             x_val = get_param_value(data, args.x)
             if x_val is None:
                 x_val = file_params.get(args.x)
-            y_val = get_y_value(data, args.y, args.data_name)
+            y_val = _apply_scale_node1(
+                get_y_value(data, args.y, args.data_name, file_params),
+                file_params, args)
 
             if x_val is None or y_val is None:
                 continue
@@ -602,10 +681,7 @@ def collect_compare(args):
         mode_debug = defaultdict(dict)
         for mode_key, x_candidates in mode_candidates.items():
             for x_val, candidates in x_candidates.items():
-                # 先按 recall 距离分组，取最近的一批，再从中选 y 最大的
-                min_dist = min(abs(c[0] - target_recall) for c in candidates)
-                nearest = [c for c in candidates if abs(c[0] - target_recall) - min_dist < 0.025]
-                best = max(nearest, key=lambda c: c[1])
+                best = min(candidates, key=lambda c: abs(c[0] - target_recall))
                 mode_points[mode_key][x_val] = best[1]
                 mode_debug[mode_key][x_val] = (best[0], best[2])  # (recall, filename)
                 label = mode_labels.get(mode_key, mode_key)
@@ -715,14 +791,15 @@ def collect_merge(args):
                 args.limited_level is not None and get_param_value(data, "limited_level") != args.limited_level or
                 args.node_num is not None and get_param_value(data, "node_num") != args.node_num or
                 args.partition_mode is not None and get_param_value(data, "partition_mode") != args.partition_mode or
-                args.replication is not None and get_param_value(data, "replication_level") != args.replication or
+                args.replication is not None and get_param_value(data, "replication_level") != args.replication and get_param_value(data, "requested_replication") != args.replication or
                 args.threads is not None and get_param_value(data, "num_threads") != args.threads or
                 args.num_query_threads is not None and get_param_value(data, "num_query_threads") != args.num_query_threads
             ):
                 continue
 
             x_val = get_param_value(data, args.x)
-            y_val = get_y_value(data, args.y, args.data_name)
+            file_params_single = parse_filename_params(os.path.basename(f))
+            y_val = get_y_value(data, args.y, args.data_name, file_params_single)
 
             if x_val is None or y_val is None:
                 continue
@@ -742,9 +819,7 @@ def collect_merge(args):
 
     if target_recall is not None:
         for x_val, cands in candidates.items():
-            min_dist = min(abs(c[0] - target_recall) for c in cands)
-            nearest = [c for c in cands if abs(c[0] - target_recall) - min_dist < 0.025]
-            best = max(nearest, key=lambda c: c[1])
+            best = min(cands, key=lambda c: abs(c[0] - target_recall))
             points[x_val] = best[1]
             print(f"{best[2]} | {args.x}={x_val} | {args.y}={best[1]} "
                   f"| recall={best[0]:.4f} (target={target_recall})")
@@ -788,7 +863,7 @@ def collect_group(args):
         try:
             file_params = parse_filename_params(os.path.basename(f))
 
-            # 筛选：跳过不匹配的文件
+            # 文件名参数筛选
             skip = False
             for param_name, arg_val in [
                 ('data_name', args.data_name),
@@ -800,8 +875,7 @@ def collect_group(args):
                 ('threads', args.threads),
                 ('query_threads', args.num_query_threads),
             ]:
-                # group_by 参数不做筛选
-                if param_name == group_by:
+                if _skip_param_in_filter(param_name, args, group_by):
                     continue
                 if arg_val is not None and file_params.get(param_name) != arg_val:
                     skip = True
@@ -809,34 +883,47 @@ def collect_group(args):
             if skip:
                 continue
 
+            # replication / partition_mode / layer / distributed 筛选
             if args.replication is not None and not file_params.get('shard'):
-                if file_params.get('replication') != args.replication:
+                file_rep = file_params.get('replication')
+                if file_rep is not None and file_rep != args.replication:
                     continue
 
-            # 按 partition_mode 筛选
             if getattr(args, 'partition_mode', None) is not None and group_by != 'partition_mode':
-                if file_params.get('partition_mode') != args.partition_mode:
+                file_pm = file_params.get('partition_mode')
+                if file_pm is not None and file_pm != args.partition_mode:
                     continue
 
-            # 按 layer 筛选
-            if getattr(args, 'layer', None) is not None:
-                if file_params.get('layer') != args.layer:
-                    continue
-
-            # 只取非 shard、非 weaviate 的分布式结果
-            if file_params.get('shard') or not file_params.get('distributed'):
+            if file_params.get('shard'):
                 continue
+            allow_single = group_by in _GROUP_ALLOWS_SINGLE_NODE
+            if not file_params.get('distributed') and not allow_single:
+                continue
+
+            # layer 过滤：group_by='config' 时按 Layer/No-Layer 分组，不能过滤；
+            # 其余（含 group_by='node_num'）都按 args.layer 过滤分布式文件，
+            # 但单机 node1 数据无 layer 概念，由 is_single 放行，layer/no-layer 两张图都保留。
+            if getattr(args, 'layer', None) is not None and group_by != 'config':
+                is_single = not file_params.get('distributed') and allow_single
+                if not is_single and file_params.get('layer') != args.layer:
+                    continue
 
             data = load_json_summary(f)
 
             x_val = get_param_value(data, args.x)
             if x_val is None:
                 x_val = file_params.get(args.x)
-            y_val = get_y_value(data, args.y, args.data_name)
+            y_val = _apply_scale_node1(
+                get_y_value(data, args.y, args.data_name, file_params),
+                file_params, args)
 
             group_val = file_params.get(group_by)
             if group_val is None:
                 group_val = get_param_value(data, group_by)
+
+            # group_by='config': 按系统配置分组
+            if group_by == 'config':
+                group_val = _compute_config_label(file_params, args)
 
             if x_val is None or y_val is None or group_val is None:
                 continue
@@ -979,7 +1066,9 @@ def draw_bar_compare(mode_points, mode_labels, args, mode_debug=None):
 
     fig, ax = make_fig(calc_fig_width(n_groups * max_bars_per_group), debug)
 
-    legend_added = set()
+    # 记录每个 mode 首次绘制的 bar handle，图例顺序固定为 active_modes（即 MODE_ORDER），
+    # 不随各系列首次出现的 recall 档位而变（否则不同数据集图例顺序会不一致）。
+    legend_handles = {}
     for g, x_val in enumerate(all_x_vals):
         present_modes = [m for m in active_modes if x_val in mode_points.get(m, {})]
         n_present = len(present_modes)
@@ -987,17 +1076,19 @@ def draw_bar_compare(mode_points, mode_labels, args, mode_debug=None):
             offset = (i - (n_present - 1) / 2) * bar_width
             bstyle = BAR_STYLES[mode_key]
             val = mode_points[mode_key][x_val]
-            label = mode_labels[mode_key] if mode_key not in legend_added else None
-            legend_added.add(mode_key)
-            ax.bar(x_indices[g] + offset, val, bar_width,
-                   label=label,
-                   color=bstyle['color'], hatch=bstyle['hatch'],
-                   edgecolor='black', alpha=0.85)
+            bars = ax.bar(x_indices[g] + offset, val, bar_width,
+                          color=bstyle['color'], hatch=bstyle['hatch'],
+                          edgecolor='black', alpha=0.85)
+            if mode_key not in legend_handles:
+                legend_handles[mode_key] = bars[0]
 
     ax.set_xticks(x_indices)
     ax.set_xticklabels(x_labels, fontsize=C['font_tick_label'])
     style_ax(ax, display_label(args.x), display_label(args.y), tick_axis='y', grid_axis='y')
-    setup_legend(ax, len(active_modes))
+    ordered = [m for m in active_modes if m in legend_handles]
+    setup_legend(ax, len(active_modes),
+                 handles=[legend_handles[m] for m in ordered],
+                 labels=[mode_labels[m] for m in ordered])
     apply_layout(fig)
 
     save_figure(fig, args, "bar-compare")
@@ -1139,6 +1230,7 @@ def draw_scatter_compare_split(mode_points, mode_labels, args, mode_debug=None):
 
 _GROUP_LABEL_FMT = {
     'node_num': lambda v: f"{v} Nodes (Ours)",
+    'config': lambda v: v,
 }
 
 
@@ -1159,6 +1251,8 @@ def draw_line_single(series_data, args, prefix="line"):
     multi = len(series_data) > 1
     sys_idx = cotra_idx = 0
     for label, pts in series_data.items():
+        if not pts:
+            continue
         xs, ys = zip(*pts)
         all_xs.extend(xs)
         if multi:
@@ -1195,6 +1289,8 @@ def draw_scatter_single(series_data, args, prefix="scatter"):
 
     all_xs = []
     for label, pts in series_data.items():
+        if not pts:
+            continue
         xs, ys = zip(*pts)
         all_xs.extend(xs)
         s = 1 if n_points > 500 else 20
@@ -1251,11 +1347,13 @@ def draw_bar_single(series_data, args, prefix="bar"):
                    color=color, hatch=hatch, alpha=0.85, edgecolor='black')
     else:
         bar_width = min(0.6, max(0.2, 6.0 / max(n_groups, 1)))
+        bstyle = BAR_STYLES['no-layer']
         for label, pts in series_data.items():
             d = dict(pts)
             ys = [d.get(x, 0) for x in all_xs]
             ax.bar(x_indices, ys, width=bar_width,
-                   color=GROUP_COLORS[1], alpha=0.85, label=label)
+                   color=bstyle['color'], hatch=bstyle['hatch'],
+                   alpha=0.85, edgecolor='black', label=label)
 
     ax.set_xticks(x_indices)
     ax.set_xticklabels([str(x) for x in all_xs], fontsize=C['font_tick_label'],
@@ -1299,7 +1397,7 @@ if __name__ == "__main__":
     parser.add_argument("--partition_mode", type=str, default="k-means", help="Partition mode (for detail/merge)")
     parser.add_argument("--layer", action='store_true', default=None, help="Filter for layer partition mode")
     parser.add_argument("--no_layer", action='store_true', default=None, help="Filter for non-layer partition mode")
-    parser.add_argument("--replication", type=int, default=None, help="Redundancy level")
+    parser.add_argument("--replication", type=float, default=None, help="Redundancy level (supports fractional values like 1.5)")
     parser.add_argument("--threads", "--num_threads", type=int, default=None, dest="threads",
                         help="Number of server-side search threads per node (num_threads)")
     parser.add_argument("--num_query_threads", type=int, default=None,
